@@ -198,6 +198,7 @@ Internal Blue Origin toolset. See company policies for usage and distribution gu
 ## Authors
 
 - **Kyle Brooker** - Initial development and orthogrid automation workflows
+- **Ethan Iglehart** - Gauginator development
 
 ---
 
