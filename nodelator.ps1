@@ -1,30 +1,61 @@
-# This location on the network drive
-# \\blueorigin\fs\ProEAdmin\Creo_Developer\vbs\playMacro\
- 
-# Visual Studio Code
-# https://code.visualstudio.com/
- 
-# VB API Documentation
-# C:/PTC/Creo 6.0.4.0/Common Files/vbapi/vbapidoc/index.html
-# https://wiki.blueorigin.com/x/mAHdB
- 
-# Set environment variables before connecting in
+<#
+.SYNOPSIS
+    Automates duplication of node features at multiple datum point locations in Creo Parametric
+
+.DESCRIPTION
+    This script connects to an active Creo session, uses an example node feature and target datum points,
+    generates custom mapkeys, and executes them to copy the node feature to each datum point location.
+    Part of the NGS Orthogrid Automation toolkit.
+
+    The script uses the Creo VB API to gather selections, then generates mapkeys that:
+    1. Copy the example node feature
+    2. Use Paste Special with by-reference assembly operations
+    3. Position each copy at the target datum point locations
+
+.PREREQUISITES
+    - Active Creo Parametric session (Part or Assembly mode)
+    - Pre-existing "example node" feature (typically an extruded solid body that creates new body)
+    - Datum points created at desired node locations
+    - VB API COM components registered
+    - User working_folder directory exists (C:\Users\[username]\working_folder\)
+
+.USAGE
+    1. Create an example node feature (extrude set to create new body)
+    2. Create datum points at all desired node locations
+    3. Run nodelator_RUN.bat or execute this script directly
+    4. Select the example node feature when prompted
+    5. Select all target datum points when prompted
+
+.AUTHOR
+    Kyle Brooker - Blue Origin
+
+.REFERENCES
+    VB API Documentation: C:/PTC/Creo [version]/Common Files/vbapi/vbapidoc/index.html
+    Development Wiki: https://wiki.blueorigin.com/x/mAHdB
+    Development Tools: https://code.visualstudio.com/
+#>
+
+# Set environment variables for VB API connection
 try {
+    # Find running Creo process (xtop.exe) to determine installation paths
     $proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
     if ($null -eq $proc) {
         throw "Running Creo process (xtop) not found"
     }
+
+    # Set required environment variables for VB API communication
     $pc_path = $proc.Path -replace "xtop.exe", "pro_comm_msg.exe"
-    # $Env:PRO_COMM_MSG_EXE = "C:\PTC\Creo 3.0\M120\Common Files\x86e_win64\obj\pro_comm_msg.exe"
     $Env:PRO_DIRECTORY = $proc.Path.TrimEnd("xtop.exe")
     $Env:PRO_COMM_MSG_EXE = $pc_path
 }
 catch {
+    # Display error and exit gracefully if Creo process not found
     $_
     exit
 }
- 
-# Check if VB API is registered
+
+# Check if VB API COM components are registered
+# First-time setup automatically runs registration batch file if needed
 try {
     New-Object -ComObject pfcls.pfcAsyncConnection | Out-Null
 }
@@ -33,6 +64,8 @@ catch {
     $vb_path = $proc.Path -replace "Common Files(.*)$", "Parametric\bin\vb_api_register.bat"
     Start-Process -Wait -FilePath $vb_path
 }
+
+# Establish connection to active Creo session
 try {
     $async = New-Object -ComObject pfcls.pfcAsyncConnection
     $connection = $async.Connect($null, $null, $null, $null)
@@ -44,43 +77,50 @@ catch {
     Write-Output "Press any key to continue..."
 }
  
+# Optional: Set regeneration failure handling (commented out)
 # $session.SetConfigOption("regen_failure_handling", "resolve_mode")
 $model = $session.GetActiveModel()
 
-#------------- Start Sandbox ---------------------
-# Set script name
+#------------- NODELATOR AUTOMATION LOGIC ---------------------
+
+# Set script name for mapkey generation
 $name = "nodelator"
 
-# Collect current selection
+# Collect current selection from Creo's selection buffer
 $node = ($session.CurrentSelectionBuffer()).Contents
 
-# Prompt the user if selection was empty
-if ($node -eq $null) 
+# Prompt the user if selection was empty - provide clear prerequisites
+if ($node -eq $null)
 {
-    Write-Output "This tool requires a single existing node to be built manually"
-    Write-Output "Ensure that extrude feature is set to create a new body"
+    Write-Output "PREREQUISITES:"
+    Write-Output "1. Create an example node feature (extrude that creates new body)"
+    Write-Output "2. Create datum points at desired node locations"
+    Write-Output "3. Select the example node feature when prompted"
     Read-Host -Prompt "Select feature of the example node, return to this window, and press enter"
     $node = ($session.CurrentSelectionBuffer()).Contents
 }
+# Extract the node feature ID for copying
 $nodeID = $node[0].SelItem.Id
 
+# Collect target datum point locations
 Read-Host -Prompt "Select the datum points for the nodes, return to this window, and press enter"
 $points = ($session.CurrentSelectionBuffer()).Contents
 
-# Collect feature and body ids of selected bodies
+# Extract datum point IDs from selection
 $pointIDs=@()
 foreach ($item in $points)
 {
     $pointIDs += $item.SelItem.Id
 }
 
-# Create a new StringBuilder object
+# Use StringBuilder for efficient string concatenation when building large mapkeys
+# [void] casting prevents console output of AppendLine return values
 $StringBuilder = New-Object System.Text.StringBuilder
 
-# Set Visible Mapkeys to No (Speeds up execution and have seen issues if not set to No)
+# Set Visible Mapkeys to No (speeds up execution and prevents display issues)
 [void]$StringBuilder.AppendLine("visible_mapkeys no")
 
-# Start $main mapkey
+# Start main mapkey - begins with copying the example node feature
 [void]$StringBuilder.AppendLine("mapkey $name @MAPKEY_LABEL$name;\")
 [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
 [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
@@ -92,7 +132,10 @@ $StringBuilder = New-Object System.Text.StringBuilder
 [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``CancelButton``;\")
 [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdEditCopy``;\")
 
-#Iterate through all points
+# Generate mapkey that iterates through each datum point:
+# 1. Paste Special with by-reference assembly operations
+# 2. Configure external reference table for node placement
+# 3. Select target datum point for positioning
 foreach ($item in $pointIDs)
 {
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
@@ -100,6 +143,11 @@ foreach ($item in $pointIDs)
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``paste_special`` ``makecopyiesPB`` 0;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``paste_special`` ``pastebyrefPB`` 1;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``paste_special`` ``okPB``;\")
+
+    # Configure Paste Special dialog for by-reference copying:
+    # - Navigate through external reference table
+    # - Enable body creation option
+    # - Select target datum point for node placement
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``4`` ``ext_ref_list``;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``4`` ``ext_ref_list``;\")
@@ -110,6 +158,8 @@ foreach ($item in $pointIDs)
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ```` ````;\")
+
+    # Select target datum point by ID for node positioning
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Open ``selspecdlg0`` ``SelOptionRadio``;~ Close ``selspecdlg0`` ``SelOptionRadio``;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;\")
@@ -121,14 +171,18 @@ foreach ($item in $pointIDs)
 }
 
 
-# end main mapkey
+# End main mapkey
 [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;")
 
-# Write the mapkey to its own .pro file
+# Write the generated mapkey to user's working folder
 $username = $env:USERNAME
 $StringBuilder.ToString() | Out-File "C:\Users\$username\working_folder\$name.pro"
 
-# Import new .pro file and run the mapkey
+# Import generated mapkey file into Creo configuration:
+# 1. Open Ribbon Options dialog
+# 2. Navigate to Configuration page
+# 3. Load the generated .pro file
+# 4. Accept configuration changes
 $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
 $session.RunMacro(" ~ Command ``ProCmdRibbonOptionsDlg``")
 $session.RunMacro(" ~ Select ``ribbon_options_dialog`` ``PageSwitcherPageList`` 1 ``ConfigLayout``")
@@ -139,7 +193,8 @@ $session.RunMacro(" ~ Activate ``ribbon_options_dialog`` ``OkPshBtn``")
 $session.RunMacro(" ~ FocusIn ``UITools Msg Dialog Future`` ``no``")
 $session.RunMacro(" ~ Activate ``UITools Msg Dialog Future`` ``no``")
 
+# Execute the generated mapkey
 $session.RunMacro("%$name")
 
-# Disconnect session
+# Clean up VB API connection
 $connection.Disconnect($null)
