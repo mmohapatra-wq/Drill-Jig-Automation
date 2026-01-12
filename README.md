@@ -4,7 +4,7 @@ A collection of PowerShell scripts that leverage the Creo Parametric VB API to a
 
 ## Overview
 
-This repository contains four specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. Each tool uses the Creo VB API COM interface to gather user selections and model data, then generates and executes custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually.
+This repository contains five specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. Most tools use the Creo VB API COM interface to gather user selections and model data, then generate and execute custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually. One tool focuses on data extraction and analysis.
 
 ### Key Innovation: License-Free Automation
 
@@ -60,6 +60,24 @@ This approach provides powerful automation capabilities using only a standard Cr
 - Converts surface quilts to solid bodies for structural analysis
 
 **Usage:** Create surface quilts, run [thickenator_RUN.bat](thickenator_RUN.bat), select quilts to thicken
+
+### 5. Gauginator ([gauginator.ps1](gauginator.ps1))
+**Purpose:** Extract geometric dimensions and properties from all solid bodies in the active model
+
+- Analyzes all solid bodies in the current Creo model automatically (no user selection required)
+- Extracts dimensional information from each body's feature parameters
+- Captures mass properties including center of gravity coordinates
+- Exports  data to CSV format for analysis and reporting
+
+**Key Data Extracted:**
+- Body ID for model reference
+- Dimension types (Linear, Radial, Diameter, Angular)
+- Dimension names and values from feature parameters
+- Center of gravity coordinates (X, Y, Z) relative to default coordinate system
+
+**Usage:** Run [gauginator_RUN.bat](gauginator_RUN.bat) with your model open - no selections needed. CSV file will be created in the script directory with filename based on the active model name.
+
+**Output:** `[ModelName]_dimensions.csv` containing tabular data suitable for spreadsheet analysis
 
 ## Requirements
 
@@ -155,6 +173,23 @@ All scripts include robust error handling for:
 - Check Creo message log for additional error details
 - Ensure all prerequisite geometry exists before running scripts
 - Try running scripts on simple test geometry first
+
+## File Structure
+
+```
+ngs-orthogrid-automation/
+├── flipenator.ps1              # Flip/mirror automation script
+├── flipenator_RUN.bat          # Batch wrapper for flipenator
+├── nodelator.ps1               # Node duplication script
+├── nodelator_RUN.bat           # Batch wrapper for nodelator
+├── surfenator.ps1              # Surface generation script
+├── surfenator_RUN.bat          # Batch wrapper for surfenator
+├── thickenator.ps1             # Surface thickening script
+├── thickenator_RUN.bat         # Batch wrapper for thickenator
+├── gauginator.ps1              # Geometric data extraction script
+├── gauginator_RUN.bat          # Batch wrapper for gauginator
+├── README.md                   # This documentation
+```
 
 ## License
 
