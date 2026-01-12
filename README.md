@@ -1,93 +1,169 @@
 # NGS Orthogrid Automation
 
+A collection of PowerShell scripts that leverage the Creo Parametric VB API to automate complex modeling operations through dynamic mapkey generation. These tools enable advanced Creo automation without requiring additional software licenses beyond standard Creo Parametric.
 
+## Overview
 
-## Getting started
+This repository contains four specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. Each tool uses the Creo VB API COM interface to gather user selections and model data, then generates and executes custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+### Key Innovation: License-Free Automation
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Rather than using the VB API to directly execute modeling commands (which would require additional software licenses), these scripts:
 
-## Add your files
+1. **Connect** to the active Creo session via VB API COM interface
+2. **Collect** user selections and model information
+3. **Generate** custom Creo mapkeys (.pro files) based on the collected data
+4. **Import and execute** the mapkeys within Creo to perform the actual modeling operations
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+This approach provides powerful automation capabilities using only a standard Creo Parametric license.
 
+## Tools
+
+### 1. Flipenator ([flipenator.ps1](flipenator.ps1))
+**Purpose:** Batch flip/mirror operations for selected geometric bodies
+
+- Prompts user to select multiple solid bodies in Creo
+- Generates mapkey that iterates through each selected body
+- Applies flip operation to each body using Creo's built-in Flip feature
+- Useful for creating mirrored components in orthogrid structures
+
+**Usage:** Run [flipenator_RUN.bat](flipenator_RUN.bat) and select bodies to flip in Creo
+
+### 2. Nodelator ([nodelator.ps1](nodelator.ps1))
+**Purpose:** Duplicate node features at multiple datum point locations
+
+- Requires pre-existing "example node" feature (typically an extruded solid body)
+- User selects the example feature, then multiple datum points
+- Generates mapkey that copies the node feature to each datum point location
+- Uses Creo's Paste Special functionality with by-reference assembly operations
+- Essential for creating node patterns in orthogrid structures
+
+**Usage:** Create an example node feature, run [nodelator_RUN.bat](nodelator_RUN.bat), select the example and target datum points
+
+### 3. Surfenator ([surfenator.ps1](surfenator.ps1))
+**Purpose:** Create surfaces by extruding 3D curves between datum planes
+
+- Collects user-selected 3D curves and three datum planes (midplane, top plane, bottom plane)
+- For each curve: projects it onto the midplane, creates extrude feature extending from top to bottom plane
+- Handles plane-based depth constraints and offset calculations
+- Generates the surface structure between orthogrid planes
+
+**Usage:** Create 3D curves and datum planes, run [surfenator_RUN.bat](surfenator_RUN.bat), select curves and planes as prompted
+
+### 4. Thickenator ([thickenator.ps1](thickenator.ps1))
+**Purpose:** Apply consistent thickness to multiple surface quilts
+
+- Prompts user to select multiple quilt surfaces
+- Generates mapkey with reusable sub-routine for thicken operations
+- Applies consistent thickness (0.1 units) to each selected quilt
+- Includes options for thickness direction and body creation
+- Converts surface quilts to solid bodies for structural analysis
+
+**Usage:** Create surface quilts, run [thickenator_RUN.bat](thickenator_RUN.bat), select quilts to thicken
+
+## Requirements
+
+### Software Prerequisites
+- **Creo Parametric** (any recent version with VB API support)
+- **Windows PowerShell** 5.1 or later
+- **Active Creo session** running before script execution
+
+### Creo VB API Setup
+The scripts automatically handle VB API connection, but ensure:
+- Creo VB API COM components are registered (happens during Creo installation)
+- No additional Creo licenses required beyond standard Parametric license
+- User must have appropriate Creo modeling rights for the operations being performed
+
+## Usage Instructions
+
+### Method 1: Double-Click Execution (Recommended)
+Each PowerShell script has a corresponding batch file wrapper:
+- Double-click the `*_RUN.bat` file for the desired tool
+- Follow the prompts in the PowerShell window
+- Switch to Creo when prompted to make selections
+- Return to PowerShell window to continue
+
+### Method 2: Direct PowerShell Execution
+```powershell
+# Navigate to script directory
+cd "path\to\ngs-orthogrid-automation"
+
+# Execute desired script
+.\flipenator.ps1
+.\nodelator.ps1
+.\surfenator.ps1
+.\thickenator.ps1
 ```
-cd existing_repo
-git remote add origin https://gitlab.blueorigin.com/kbrooker/ngs-orthogrid-automation.git
-git branch -M main
-git push -uf origin main
-```
 
-## Integrate with your tools
+### General Workflow
+1. **Open Creo** and load your model
+2. **Run desired script** (via batch file or PowerShell)
+3. **Follow prompts** to select geometry in Creo
+4. **Wait for completion** - script will generate and execute mapkey automatically
+5. **Review results** in Creo model
 
-- [ ] [Set up project integrations](https://gitlab.blueorigin.com/kbrooker/ngs-orthogrid-automation/-/settings/integrations)
+## Technical Details
 
-## Collaborate with your team
+### Mapkey Generation Process
+Each script follows this pattern:
+1. Establish COM connection to active Creo process (`xtop.exe`)
+2. Retrieve current session and model information
+3. Prompt user for selections using Creo's selection buffer
+4. Generate custom mapkey commands based on selections
+5. Write mapkey to `C:\Users\[username]\working_folder\[toolname].pro`
+6. Import mapkey via `session.RunMacro()`
+7. Execute mapkey to perform modeling operations
+8. Clean up connections and temporary files
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### Error Handling
+All scripts include robust error handling for:
+- Missing or multiple Creo processes
+- VB API COM registration issues
+- Invalid user selections
+- File system access problems
+- Creo session connectivity
 
-## Test and Deploy
+### Safety Features
+- **No auto-save**: Scripts never automatically save models
+- **User confirmation**: Critical operations require user interaction
+- **Trail file cleanup**: Temporary files are cleaned up after execution
 
-Use the built-in continuous integration in GitLab.
+## Troubleshooting
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+### Common Issues
 
-***
+**"Cannot find Creo process"**
+- Ensure Creo Parametric is running before executing scripts
+- Only one Creo process should be active
+- Try restarting Creo if connection fails
 
-# Editing this README
+**"VB API registration error"**
+- VB API COM components may need re-registration
+- Run Creo installation repair, or contact IT for COM registration
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+**"Access denied to working folder"**
+- Ensure `C:\Users\[username]\working_folder\` exists and is writable
+- Check Windows permissions for the folder
 
-## Suggestions for a good README
+**Script hangs during execution**
+- Switch to Creo window - script may be waiting for user selection
+- Check PowerShell window for prompts
+- Ensure model is in appropriate mode (Part/Assembly as required)
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+### Getting Help
+- Review script output in PowerShell window for specific error messages
+- Check Creo message log for additional error details
+- Ensure all prerequisite geometry exists before running scripts
+- Try running scripts on simple test geometry first
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Internal Blue Origin toolset. See company policies for usage and distribution guidelines.
+
+## Authors
+
+- **Kyle Brooker** - Initial development and orthogrid automation workflows
+
+---
+
+*These tools were developed to streamline orthogrid modeling workflows while working within standard Creo Parametric licensing constraints. The mapkey generation approach enables powerful automation without requiring additional software investments.*
