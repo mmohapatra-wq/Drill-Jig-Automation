@@ -1,0 +1,7 @@
+# Ignore Claude Code related files
+.claude/
+.mcp.json
+CREO_MAPKEY_AUTOMATION_GUIDE.md
+
+# Ignore CSV files
+*.csv
