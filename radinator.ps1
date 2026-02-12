@@ -360,7 +360,7 @@ for ($s = 0; $s -lt $surfaceArray.Count; $s++) {
                                     $type1 = [int]$surfType1
                                     $type2 = [int]$surfType2
 
-                                    # Check if surface 1 is cylinder (1) or plane (0)
+                                    # Check if surface 1 is cylinder (1) or plane-like (0=Plane, 9=Ruled surface)
                                     # For cylinders, check orientation (1 = convex/node, 2 = concave/fillet)
                                     if ($type1 -eq 1) {
                                         $orient1 = $surf1.GetOrientation()
@@ -368,18 +368,18 @@ for ($s = 0; $s -lt $surfaceArray.Count; $s++) {
                                         $surf1IsConvex = ([int]$orient1 -eq 1)
                                         try { $cylinderRadius = $desc1.Radius } catch {}
                                     }
-                                    elseif ($type1 -eq 0) {
+                                    elseif ($type1 -eq 0 -or $type1 -eq 9) {
                                         $surf1IsPlane = $true
                                     }
 
-                                    # Check if surface 2 is cylinder (1) or plane (0)
+                                    # Check if surface 2 is cylinder (1) or plane-like (0=Plane, 9=Ruled surface)
                                     if ($type2 -eq 1) {
                                         $orient2 = $surf2.GetOrientation()
                                         $surf2IsCylinder = $true
                                         $surf2IsConvex = ([int]$orient2 -eq 1)
                                         try { $cylinderRadius = $desc2.Radius } catch {}
                                     }
-                                    elseif ($type2 -eq 0) {
+                                    elseif ($type2 -eq 0 -or $type2 -eq 9) {
                                         $surf2IsPlane = $true
                                     }
 
