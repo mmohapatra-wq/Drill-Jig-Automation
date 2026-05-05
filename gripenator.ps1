@@ -241,9 +241,12 @@ function New-FindToolMapkey {
     [void]$stringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
 
     # Disable GUI highlighting during batch search for performance
+    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Component``;\")
     [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``CascadeButton1``;\")
     [void]$stringBuilder.AppendLine("mapkey(continued) ~ Close ``selspecdlg0`` ``CascadeButton1``;\")
     [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``HiliteScreenCheckBtn`` 0;\")
+    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;\")
+    
 
     # For each component ID, search and apply without closing the dialog
     $idCount = @($ComponentIds).Count
@@ -252,8 +255,8 @@ function New-FindToolMapkey {
         $idIndex++
         $isLast = ($idIndex -eq $idCount)
 
-        [void]$stringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` \")
-        [void]$stringBuilder.AppendLine("mapkey(continued) ``$id``;~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
+        [void]$stringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$id``;\")
+        [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
 
         if ($isLast) {
             [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;~ Activate ``selspecdlg0`` ``CancelButton``;")
@@ -477,14 +480,12 @@ function Invoke-ChangeFunction {
         # Group nuts by coating
         $nutsByCoating = $selection.Nuts | Group-Object -Property Coating
 
-        Write-Host "DEBUG: Nuts grouped by coating:" -ForegroundColor Cyan
         foreach ($group in $nutsByCoating) {
             Write-Host "  Group Name='$($group.Name)' Count=$($group.Count)" -ForegroundColor Cyan
         }
 
         foreach ($coatingGroup in $nutsByCoating) {
             $coating = $coatingGroup.Name
-            Write-Host "DEBUG: Processing coating group: '$coating' (length: $($coating.Length))" -ForegroundColor Cyan
 
             # Filter out nuts that already have the target diameter
             $nutsToChange = $coatingGroup.Group | Where-Object { $_.Diameter -ne $newDiameter }
