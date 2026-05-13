@@ -328,6 +328,41 @@ function New-ReplaceMapkey {
     return $stringBuilder.ToString()
 }
 
+function Import-Mapkey {
+    param(
+        [string]$MapkeyContent,
+        [string]$MapkeyName
+    )
+
+    try {
+        $mapkeyFile = "$workingFolder\${scriptName}_${MapkeyName}.pro"
+        $MapkeyContent | Out-File -FilePath $mapkeyFile -Encoding ASCII
+
+        Write-Host "Importing mapkey: $MapkeyName from $mapkeyFile" -ForegroundColor Green
+
+        $filename = "${scriptName}_${MapkeyName}.pro"
+
+        # Close any open dialogs from previous mapkey execution
+        $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
+
+        # Import generated mapkey file into Creo configuration
+        # Use individual RunMacro calls for reliability
+        $session.RunMacro("~ Command ``ProCmdUtilMacros``")
+        $session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
+        $session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
+        $session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$filename``")
+        $session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
+        $session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
+        $session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
+
+        return $true
+    }
+    catch {
+        Write-Host "ERROR importing mapkey: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
 function Execute-Mapkey {
     param(
         [string]$MapkeyContent,
@@ -456,7 +491,9 @@ function Invoke-ChangeFunction {
 
         # Group fasteners by coating to handle multiple coatings in one selection
         $fastenersByCoating = $selection.Fasteners | Group-Object -Property Coating
+        $fastenerMapkeys = @()
 
+        # Phase 1: Import all fastener mapkeys
         foreach ($coatingGroup in $fastenersByCoating) {
             $coating = $coatingGroup.Name
             $fastenerIds = $coatingGroup.Group | ForEach-Object { $_.ID }
@@ -470,18 +507,22 @@ function Invoke-ChangeFunction {
 
             $mapkey = New-ReplaceMapkey -ComponentIds $fastenerIds -NewPartNumber $newFastenerPartNumber -MapkeyName $mapkeyName
 
-            if (Execute-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName) {
-                Write-Host "Changed $($fastenerIds.Count) fastener(s) with $coating coating" -ForegroundColor Green
+            # Store mapkey info for later execution
+            $fastenerMapkeys += @{
+                Name = $mapkeyName
+                Content = $mapkey
+                Count = $fastenerIds.Count
+                Coating = $coating
             }
+
+            # Import the mapkey (but don't execute yet)
+            [void](Import-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName)
         }
     }
 
     # Process nuts if present and diameter was changed
+    $nutMapkeys = @()
     if ($nutCount -gt 0 -and -not [string]::IsNullOrWhiteSpace($newDiameter)) {
-        # Wait if new fastener parts were pulled from server during first mapkey execution
-        Write-Host "Waiting for Creo to settle before importing nut changes..." -ForegroundColor Yellow
-        Start-Sleep -Milliseconds 2000
-
         $newDiameter = $newDiameter.Trim()
 
         # Group nuts by coating
@@ -491,6 +532,7 @@ function Invoke-ChangeFunction {
             Write-Host "  Group Name='$($group.Name)' Count=$($group.Count)" -ForegroundColor Cyan
         }
 
+        # Phase 1b: Import all nut mapkeys
         foreach ($coatingGroup in $nutsByCoating) {
             $coating = $coatingGroup.Name
 
@@ -513,9 +555,30 @@ function Invoke-ChangeFunction {
 
             $mapkey = New-ReplaceMapkey -ComponentIds $nutIds -NewPartNumber $newNutPartNumber -MapkeyName $mapkeyName
 
-            if (Execute-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName) {
-                Write-Host "Changed $($nutIds.Count) nut(s) with $coating coating" -ForegroundColor Green
+            # Store mapkey info for later execution
+            $nutMapkeys += @{
+                Name = $mapkeyName
+                Content = $mapkey
+                Count = $nutIds.Count
+                Coating = $coating
             }
+
+            # Import the mapkey (but don't execute yet)
+            [void](Import-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName)
+        }
+    }
+
+    # Phase 2: Execute all fastener mapkeys
+    foreach ($mapkeyInfo in $fastenerMapkeys) {
+        if (Execute-Mapkey -MapkeyContent $mapkeyInfo.Content -MapkeyName $mapkeyInfo.Name) {
+            Write-Host "Changed $($mapkeyInfo.Count) fastener(s) with $($mapkeyInfo.Coating) coating" -ForegroundColor Green
+        }
+    }
+
+    # Phase 3: Execute all nut mapkeys
+    foreach ($mapkeyInfo in $nutMapkeys) {
+        if (Execute-Mapkey -MapkeyContent $mapkeyInfo.Content -MapkeyName $mapkeyInfo.Name) {
+            Write-Host "Changed $($mapkeyInfo.Count) nut(s) with $($mapkeyInfo.Coating) coating" -ForegroundColor Green
         }
     }
 }
