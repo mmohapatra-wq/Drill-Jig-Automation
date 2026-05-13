@@ -341,33 +341,18 @@ function Execute-Mapkey {
         Write-Host "Importing mapkey: $MapkeyName from $mapkeyFile" -ForegroundColor Green
 
         $filename = "${scriptName}_${MapkeyName}.pro"
-        Write-Host "Selecting file in list: $filename" -ForegroundColor Yellow
 
         # Close any open dialogs from previous mapkey execution
-        Write-Host "[Step 0] Closing any open dialogs..." -ForegroundColor Gray
         $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
 
         # Import generated mapkey file into Creo configuration
         # Use individual RunMacro calls for reliability
-        Write-Host "[Step 1] Opening Mapkey Editor..." -ForegroundColor Gray
         $session.RunMacro("~ Command ``ProCmdUtilMacros``")
-
-        Write-Host "[Step 2] Activating import button..." -ForegroundColor Gray
         $session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
-
-        Write-Host "[Step 3] Triggering file open dialog..." -ForegroundColor Gray
         $session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
-
-        Write-Host "[Step 4] Selecting file: $filename..." -ForegroundColor Gray
         $session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$filename``")
-
-        Write-Host "[Step 5] Opening file for import..." -ForegroundColor Gray
         $session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
-
-        Write-Host "[Step 6] Closing mapkey editor..." -ForegroundColor Gray
         $session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
-
-        Write-Host "[Step 7] Saving mapkey..." -ForegroundColor Gray
         $session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
 
         Write-Host "Executing mapkey: %$MapkeyName" -ForegroundColor Green
