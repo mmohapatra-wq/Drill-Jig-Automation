@@ -6,17 +6,6 @@ A collection of PowerShell scripts that leverage the Creo Parametric VB API to a
 
 This repository contains five specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. Most tools use the Creo VB API COM interface to gather user selections and model data, then generate and execute custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually. One tool focuses on data extraction and analysis.
 
-### Key Innovation: License-Free Automation
-
-Rather than using the VB API to directly execute modeling commands (which would require additional software licenses), these scripts:
-
-1. **Connect** to the active Creo session via VB API COM interface
-2. **Collect** user selections and model information
-3. **Generate** custom Creo mapkeys (.pro files) based on the collected data
-4. **Import and execute** the mapkeys within Creo to perform the actual modeling operations
-
-This approach provides powerful automation capabilities using only a standard Creo Parametric license.
-
 ## Tools
 
 ### 1. Flipenator ([flipenator.ps1](flipenator.ps1))
@@ -79,6 +68,19 @@ This approach provides powerful automation capabilities using only a standard Cr
 
 **Output:** `[ModelName]_dimensions.csv` containing tabular data suitable for spreadsheet analysis
 
+### 6. Gripenator ([gripenator.ps1](gripenator.ps1))
+**Purpose:** Streamlines management of hi-lite fasteners
+- Filter: Isolate valid HST fasteners (HST12, HST13, HST54, HST59) from a mixed selection
+- Change: Modify fastener diameter and/or grip length, with automatic nut diameter updates
+- Grounding: Convert fastener coatings to GD (grounding) variant across multiple fastener families
+
+**SUPPORTED PART NUMBERS:**
+Fasteners: HST{12|13|54|59}
+Collars: HST1078
+
+**CAUTION:** Always exit using the "E" command. Closing the terminal directly will leave orphaned Creo COM connections and interfer with future sessions.
+
+
 ## Requirements
 
 ### Software Prerequisites
@@ -120,31 +122,6 @@ cd "path\to\ngs-orthogrid-automation"
 4. **Wait for completion** - script will generate and execute mapkey automatically
 5. **Review results** in Creo model
 
-## Technical Details
-
-### Mapkey Generation Process
-Each script follows this pattern:
-1. Establish COM connection to active Creo process (`xtop.exe`)
-2. Retrieve current session and model information
-3. Prompt user for selections using Creo's selection buffer
-4. Generate custom mapkey commands based on selections
-5. Write mapkey to `C:\Users\[username]\working_folder\[toolname].pro`
-6. Import mapkey via `session.RunMacro()`
-7. Execute mapkey to perform modeling operations
-8. Clean up connections and temporary files
-
-### Error Handling
-All scripts include robust error handling for:
-- Missing or multiple Creo processes
-- VB API COM registration issues
-- Invalid user selections
-- File system access problems
-- Creo session connectivity
-
-### Safety Features
-- **No auto-save**: Scripts never automatically save models
-- **User confirmation**: Critical operations require user interaction
-- **Trail file cleanup**: Temporary files are cleaned up after execution
 
 ## Troubleshooting
 
@@ -174,22 +151,6 @@ All scripts include robust error handling for:
 - Ensure all prerequisite geometry exists before running scripts
 - Try running scripts on simple test geometry first
 
-## File Structure
-
-```
-ngs-orthogrid-automation/
-├── flipenator.ps1              # Flip/mirror automation script
-├── flipenator_RUN.bat          # Batch wrapper for flipenator
-├── nodelator.ps1               # Node duplication script
-├── nodelator_RUN.bat           # Batch wrapper for nodelator
-├── surfenator.ps1              # Surface generation script
-├── surfenator_RUN.bat          # Batch wrapper for surfenator
-├── thickenator.ps1             # Surface thickening script
-├── thickenator_RUN.bat         # Batch wrapper for thickenator
-├── gauginator.ps1              # Geometric data extraction script
-├── gauginator_RUN.bat          # Batch wrapper for gauginator
-├── README.md                   # This documentation
-```
 
 ## License
 
@@ -199,7 +160,3 @@ Internal Blue Origin toolset. See company policies for usage and distribution gu
 
 - **Kyle Brooker** - Initial development and orthogrid automation workflows
 - **Ethan Iglehart** - Gauginator development
-
----
-
-*These tools were developed to streamline orthogrid modeling workflows while working within standard Creo Parametric licensing constraints. The mapkey generation approach enables powerful automation without requiring additional software investments.*

@@ -185,6 +185,9 @@ foreach ($item in $curves)
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;~ Activate ``selspecdlg0`` ``CancelButton``;\")
 
+    # Set extrude type to "Surface" (Creo 12 UI change)
+    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``main_dlg_cur`` ``maindashInst0.solid_surf_rg`` 1 ``Surface``;\")
+
     # Complete the extrude feature
     [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``dashInst0.Done``;\")
 }
@@ -201,15 +204,13 @@ $StringBuilder.ToString() | Out-File "C:\Users\$username\working_folder\$name.pr
 # 2. Navigate to Configuration page
 # 3. Load the generated .pro file
 # 4. Accept configuration changes
-$session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
-$session.RunMacro(" ~ Command ``ProCmdRibbonOptionsDlg``")
-$session.RunMacro(" ~ Select ``ribbon_options_dialog`` ``PageSwitcherPageList`` 1 ``ConfigLayout``")
-$session.RunMacro(" ~ Activate ``ribbon_options_dialog`` ``ConfigLayout.Open``")
-$session.RunMacro(" ~ Update ``file_open`` ``Inputname`` ``$name.pro``")
-$session.RunMacro(" ~ Activate ``file_open`` ``Inputname``")
-$session.RunMacro(" ~ Activate ``ribbon_options_dialog`` ``OkPshBtn``")
-$session.RunMacro(" ~ FocusIn ``UITools Msg Dialog Future`` ``no``")
-$session.RunMacro(" ~ Activate ``UITools Msg Dialog Future`` ``no``")
+$session.RunMacro("~ Command ``ProCmdUtilMacros``")
+$session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
+$session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
+$session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$name.pro``")
+$session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
+$session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
+$session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
 
 # Execute the generated mapkey
 $session.RunMacro("%$name")
