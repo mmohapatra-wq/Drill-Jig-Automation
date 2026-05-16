@@ -36,7 +36,7 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
@@ -404,7 +404,7 @@ for ($s = 0; $s -lt $allSurfaces.Count; $s++) {
     catch {}
 }
 
-Show-Progress 100 "Scanning edges ($totalEdgesScanned found, $($matchingEdges.Count) matched)"
+Show-Progress 100 "Scanning edges - ${totalEdgesScanned} found, $($matchingEdges.Count) matched"
 Write-Host ""
 
 # ============================================
@@ -445,11 +445,25 @@ if ($matchingEdges.Count -gt 0) {
         # Clear selection
         try {
             $session.RunMacro("~ Command ``ProCmdSelClear``;")
-            Start-Sleep -Milliseconds 300
         }
         catch {}
 
         # Select edges for this batch
+        # Part 1: Open and configure the find tool once
+        try {
+            $openFindTool = "~ Command ``ProCmdMdlTreeSearch``;" +
+                "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Edge``;" +
+                "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Edge``;" +
+                "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Attributes``;" +
+                "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+                "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``All``;" +
+                "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``ID``;"
+
+            $session.RunMacro($openFindTool)
+        }
+        catch {}
+
+        # Part 2: Loop through each edge, search and apply to selection buffer
         $selectCount = 0
         foreach ($edgeData in $batchEdges) {
             $edgeId = $edgeData.Id
@@ -460,28 +474,22 @@ if ($matchingEdges.Count -gt 0) {
             Show-Progress $pct "Batch ${batchNum}/${totalBatches}"
 
             try {
-                $selectMapkey = "~ Command ``ProCmdMdlTreeSearch``;" +
-                    "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
-                    "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
-                    "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Edge``;" +
-                    "~ Open ``selspecdlg0`` ``LookByOptionMenu``;" +
-                    "~ Close ``selspecdlg0`` ``LookByOptionMenu``;" +
-                    "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Edge``;" +
-                    "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Attributes``;" +
-                    "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
-                    "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``All``;" +
-                    "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``ID``;" +
-                    "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$edgeId``;" +
+                $searchAndApply = "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$edgeId``;" +
                     "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
-                    "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
-                    "~ Activate ``selspecdlg0`` ``CancelButton``;"
+                    "~ Activate ``selspecdlg0`` ``ApplyBtn``;"
 
-                $session.RunMacro($selectMapkey)
+                $session.RunMacro($searchAndApply)
             }
             catch {}
 
-            Start-Sleep -Milliseconds 100
         }
+
+        # Part 3: Close the find tool once
+        try {
+            $closeFindTool = "~ Activate ``selspecdlg0`` ``CancelButton``;"
+            $session.RunMacro($closeFindTool)
+        }
+        catch {}
 
         # Create round feature
         try {
@@ -500,7 +508,6 @@ if ($matchingEdges.Count -gt 0) {
             Write-Log "Batch $batchNum macro error: $($_.Exception.Message)" "Yellow"
         }
 
-        Start-Sleep -Seconds 2
     }
 
     Show-Progress 100 "Rounds complete"
