@@ -423,6 +423,30 @@ function Execute-Mapkey {
     }
 }
 
+function Run-Mapkey {
+    param(
+        [string]$MapkeyName
+    )
+
+    try {
+        Write-Host "Executing mapkey: %$MapkeyName" -ForegroundColor Green
+
+        # Close any open dialogs from previous mapkey execution
+        $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
+
+        # Execute the mapkey (assumes it's already been imported)
+        $session.RunMacro("%$MapkeyName")
+
+        Write-Host "Mapkey execution completed" -ForegroundColor Green
+
+        return $true
+    }
+    catch {
+        Write-Host "ERROR running mapkey: $_" -ForegroundColor Red
+        return $false
+    }
+}
+
 #================================================================
 # FILTER FUNCTION
 #================================================================
@@ -586,16 +610,16 @@ function Invoke-ChangeFunction {
         }
     }
 
-    # Phase 2: Execute all fastener mapkeys
+    # Phase 2: Execute all fastener mapkeys (already imported in Phase 1)
     foreach ($mapkeyInfo in $fastenerMapkeys) {
-        if (Execute-Mapkey -MapkeyContent $mapkeyInfo.Content -MapkeyName $mapkeyInfo.Name) {
+        if (Run-Mapkey -MapkeyName $mapkeyInfo.Name) {
             Write-Host "Changed $($mapkeyInfo.Count) fastener(s) with $($mapkeyInfo.Coating) coating" -ForegroundColor Green
         }
     }
 
-    # Phase 3: Execute all nut mapkeys
+    # Phase 3: Execute all nut mapkeys (already imported in Phase 1b)
     foreach ($mapkeyInfo in $nutMapkeys) {
-        if (Execute-Mapkey -MapkeyContent $mapkeyInfo.Content -MapkeyName $mapkeyInfo.Name) {
+        if (Run-Mapkey -MapkeyName $mapkeyInfo.Name) {
             Write-Host "Changed $($mapkeyInfo.Count) nut(s) with $($mapkeyInfo.Coating) coating" -ForegroundColor Green
         }
     }
