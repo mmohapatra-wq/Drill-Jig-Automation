@@ -1,14 +1,16 @@
 # NGS Orthogrid Automation
 
-A collection of PowerShell scripts that leverage the Creo Parametric VB API to automate complex modeling operations through dynamic mapkey generation. These tools enable advanced Creo automation without requiring additional software licenses beyond standard Creo Parametric.
+A collection of PowerShell automation tools that leverage the Creo Parametric VB API to automate complex modeling operations through dynamic mapkey generation. These tools enable advanced Creo automation without requiring additional software licenses beyond standard Creo Parametric.
 
 ## Overview
 
-This repository contains five specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. Most tools use the Creo VB API COM interface to gather user selections and model data, then generate and execute custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually. One tool focuses on data extraction and analysis.
+This repository contains specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. All tools are packaged as single-file .cmd executables that embed PowerShell code for ease of use. Most tools use the Creo VB API COM interface to gather user selections and model data, then generate and execute custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually. One tool focuses on data extraction and analysis.
+
+**Note:** All tools now use the .cmd format (hybrid batch/PowerShell) for simplified execution. Legacy .ps1 source files are archived in the `ps1 archive/` folder for reference.
 
 ## Tools
 
-### 1. Flipenator ([flipenator.ps1](flipenator.ps1))
+### 1. Flipenator ([flipenator.cmd](flipenator.cmd))
 **Purpose:** Batch flip/mirror operations for selected geometric bodies
 
 - Prompts user to select multiple solid bodies in Creo
@@ -16,9 +18,9 @@ This repository contains five specialized automation tools designed for orthogri
 - Applies flip operation to each body using Creo's built-in Flip feature
 - Useful for creating mirrored components in orthogrid structures
 
-**Usage:** Run [flipenator_RUN.bat](flipenator_RUN.bat) and select bodies to flip in Creo
+**Usage:** Double-click `flipenator.cmd` and select bodies to flip in Creo
 
-### 2. Nodelator ([nodelator.ps1](nodelator.ps1))
+### 2. Nodelator ([nodelator.cmd](nodelator.cmd))
 **Purpose:** Duplicate node features at multiple datum point locations
 
 - Requires pre-existing "example node" feature (typically an extruded solid body)
@@ -27,9 +29,9 @@ This repository contains five specialized automation tools designed for orthogri
 - Uses Creo's Paste Special functionality with by-reference assembly operations
 - Essential for creating node patterns in orthogrid structures
 
-**Usage:** Create an example node feature, run [nodelator_RUN.bat](nodelator_RUN.bat), select the example and target datum points
+**Usage:** Create an example node feature, double-click `nodelator.cmd`, select the example and target datum points
 
-### 3. Surfenator ([surfenator.ps1](surfenator.ps1))
+### 3. Surfenator ([surfenator.cmd](surfenator.cmd))
 **Purpose:** Create surfaces by extruding 3D curves between datum planes
 
 - Collects user-selected 3D curves and three datum planes (midplane, top plane, bottom plane)
@@ -37,9 +39,9 @@ This repository contains five specialized automation tools designed for orthogri
 - Handles plane-based depth constraints and offset calculations
 - Generates the surface structure between orthogrid planes
 
-**Usage:** Create 3D curves and datum planes, run [surfenator_RUN.bat](surfenator_RUN.bat), select curves and planes as prompted
+**Usage:** Create 3D curves and datum planes, double-click `surfenator.cmd`, select curves and planes as prompted
 
-### 4. Thickenator ([thickenator.ps1](thickenator.ps1))
+### 4. Thickenator ([thickenator.cmd](thickenator.cmd))
 **Purpose:** Apply consistent thickness to multiple surface quilts
 
 - Prompts user to select multiple quilt surfaces
@@ -48,9 +50,9 @@ This repository contains five specialized automation tools designed for orthogri
 - Includes options for thickness direction and body creation
 - Converts surface quilts to solid bodies for structural analysis
 
-**Usage:** Create surface quilts, run [thickenator_RUN.bat](thickenator_RUN.bat), select quilts to thicken
+**Usage:** Create surface quilts, double-click `thickenator.cmd`, select quilts to thicken
 
-### 5. Gauginator ([gauginator.ps1](gauginator.ps1))
+### 5. Gauginator ([gauginator.cmd](gauginator.cmd))
 **Purpose:** Extract geometric dimensions and properties from all solid bodies in the active model
 
 - Analyzes all solid bodies in the current Creo model automatically (no user selection required)
@@ -64,11 +66,11 @@ This repository contains five specialized automation tools designed for orthogri
 - Dimension names and values from feature parameters
 - Center of gravity coordinates (X, Y, Z) relative to default coordinate system
 
-**Usage:** Run [gauginator_RUN.bat](gauginator_RUN.bat) with your model open - no selections needed. CSV file will be created in the script directory with filename based on the active model name.
+**Usage:** Double-click `gauginator.cmd` with your model open - no selections needed. CSV file will be created in the script directory with filename based on the active model name.
 
 **Output:** `[ModelName]_dimensions.csv` containing tabular data suitable for spreadsheet analysis
 
-### 6. Gripenator ([gripenator.ps1](gripenator.ps1))
+### 6. Gripenator ([gripenator.cmd](gripenator.cmd))
 **Purpose:** Streamlines management of hi-lite fasteners
 - Filter: Isolate valid HST fasteners (HST12, HST13, HST54, HST59) from a mixed selection
 - Change: Modify fastener diameter and/or grip length, with automatic nut diameter updates
@@ -96,31 +98,31 @@ The scripts automatically handle VB API connection, but ensure:
 
 ## Usage Instructions
 
-### Method 1: Double-Click Execution (Recommended)
-Each PowerShell script has a corresponding batch file wrapper:
-- Double-click the `*_RUN.bat` file for the desired tool
+### Execution (Simple Double-Click)
+All tools are now packaged as single-file .cmd executables:
+- Double-click the desired `.cmd` file (e.g., `flipenator.cmd`, `gauginator.cmd`)
 - Follow the prompts in the PowerShell window
 - Switch to Creo when prompted to make selections
 - Return to PowerShell window to continue
 
-### Method 2: Direct PowerShell Execution
-```powershell
-# Navigate to script directory
-cd "path\to\ngs-orthogrid-automation"
-
-# Execute desired script
-.\flipenator.ps1
-.\nodelator.ps1
-.\surfenator.ps1
-.\thickenator.ps1
-```
+**Available Tools:**
+- `flipenator.cmd` - Flip/mirror operations
+- `gauginator.cmd` - Extract dimensions to CSV
+- `gripenator.cmd` - Fastener management (interactive menu)
+- `nodelator.cmd` - Duplicate node features
+- `radinator.cmd` - Node-to-stiffener radius automation
+- `surfenator.cmd` - Surface extrusion from curves
+- `thickenator.cmd` - Thicken surface quilts
 
 ### General Workflow
 1. **Open Creo** and load your model
-2. **Run desired script** (via batch file or PowerShell)
+2. **Double-click** the desired .cmd file
 3. **Follow prompts** to select geometry in Creo
 4. **Wait for completion** - script will generate and execute mapkey automatically
 5. **Review results** in Creo model
+
+### Legacy Source Files
+Original .ps1 source files are preserved in the `ps1 archive/` folder for reference and version control purposes. The .cmd files are self-contained and do not require the .ps1 files to run.
 
 
 ## Troubleshooting
