@@ -17,6 +17,20 @@ trap {
     exit 1
 }
 
+$script:lastPct = -1
+function Show-Progress {
+    param([int]$Pct, [string]$Label)
+    if ($Pct -eq $script:lastPct) { return }
+    $script:lastPct = $Pct
+    $filled = [Math]::Floor($Pct / 5)
+    $empty = 20 - $filled
+    $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
+    $color = if ($Pct -ge 100) { "Green" } else { "White" }
+    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
+    if ($Pct -ge 100) { Write-Host "" }
+}
+
 <#
 .SYNOPSIS
     Automates surface creation by extruding 3D curves between datum planes in Creo Parametric
@@ -142,97 +156,64 @@ Read-Host -Prompt "Select the botplane (extrude start boundary), return to this 
 $selection = ($session.CurrentSelectionBuffer()).Contents
 $botPlane = $selection[0].SelItem.Id
 
-# Use StringBuilder for efficient string concatenation when building large mapkeys
-# [void] casting prevents console output of AppendLine return values
-$StringBuilder = New-Object System.Text.StringBuilder
+# Build one giant command string for all curves
+$allCommands = ""
 
-# Set Visible Mapkeys to No (speeds up execution and prevents display issues)
-[void]$StringBuilder.AppendLine("visible_mapkeys no")
-
-# Start main mapkey
-[void]$StringBuilder.AppendLine("mapkey $name @MAPKEY_LABEL$name;\")
-
-# Generate mapkey for each curve - create surface by extruding between planes:
-# 1. Select midplane as sketch plane
-# 2. Project 3D curve onto sketch plane
-# 3. Set up extrude with depth constraints from top to bottom plane
+$totalCurves = $curves.Count
 foreach ($item in $curves)
 {
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
-
-    # Select midplane as sketch plane for extrude feature
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$midPlane``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``CancelButton``;~ Command ``ProCmdFtExtrude`` ;\")
-
-    # Project 3D curve onto the sketch plane
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdSketProject``  1;~ Command ``ProCmdMdlTreeSearch`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``3D Curve``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$item``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;~ Activate ``selspecdlg0`` ``CancelButton``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``Odui_Dlg_02`` ``stdbtn_1``;~ Command ``ProCmdSketDone`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``UI Message Dialog`` ``ok``;\")
-
-    # Configure extrude depth constraints - from top plane to bottom plane
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``chkbn.extrev_2_options.0`` 1;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``extrev_2_options.0.0`` ``PH.depth1_om`` 1 ``toselected``;\")
-
-    # Select top plane as first depth boundary
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$topPlane``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``CancelButton``;\")
-
-    # Configure second depth boundary to bottom plane
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``extrev_2_options.0.0`` ``PH.depth2_om`` 1 ``toselected``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Expand ``main_dlg_cur`` ``PHTLeft.AssyTree`` ``T7 10 21``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``extrev_2_options.0.0`` ``PH.depth2_sel_list`` ``0``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Focus ``extrev_2_options.0.0`` ``PH.depth2_sel_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``extrev_2_options.0.0`` ``PH.depth2_sel_list`` 0;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``extrev_2_options.0.0`` ``PH.depth2_sel_list`` ``;\")
-
-    # Select bottom plane as second depth boundary
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$botPlane``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;~ Activate ``selspecdlg0`` ``CancelButton``;\")
-
-    # Set extrude type to "Surface" (Creo 12 UI change)
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``main_dlg_cur`` ``maindashInst0.solid_surf_rg`` 1 ``Surface``;\")
-
-    # Complete the extrude feature
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``dashInst0.Done``;\")
+    # Add commands for this curve to the master string
+    $allCommands += "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;" +
+        "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$midPlane``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        "~ Command ``ProCmdFtExtrude``;" +
+        "~ Command ``ProCmdSketProject`` 1;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``3D Curve``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$item``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        "~ Activate ``Odui_Dlg_02`` ``stdbtn_1``;" +
+        "~ Command ``ProCmdSketDone``;" +
+        "~ Activate ``UI Message Dialog`` ``ok``;" +
+        "~ Activate ``main_dlg_cur`` ``chkbn.extrev_2_options.0`` 1;" +
+        "~ Select ``extrev_2_options.0.0`` ``PH.depth1_om`` 1 ``toselected``;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;" +
+        "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$topPlane``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        "~ Select ``extrev_2_options.0.0`` ``PH.depth2_om`` 1 ``toselected``;" +
+        "~ Expand ``main_dlg_cur`` ``PHTLeft.AssyTree`` ``T7 10 21``;" +
+        "~ Trigger ``extrev_2_options.0.0`` ``PH.depth2_sel_list`` ``0``;" +
+        "~ Focus ``extrev_2_options.0.0`` ``PH.depth2_sel_list``;" +
+        "~ Select ``extrev_2_options.0.0`` ``PH.depth2_sel_list`` 0;" +
+        "~ Trigger ``extrev_2_options.0.0`` ``PH.depth2_sel_list`` ``;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$botPlane``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        "~ Select ``main_dlg_cur`` ``maindashInst0.solid_surf_rg`` 1 ``Surface``;" +
+        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
 }
 
-# End main mapkey
-[void]$StringBuilder.AppendLine('mapkey(continued) ~ Activate `main_dlg_cur` `buffer_clean`;')
-
-# Write the generated mapkey to user's working folder
-$username = $env:USERNAME
-$StringBuilder.ToString() | Out-File "C:\Users\$username\working_folder\$name.pro"
-
-# Import generated mapkey file into Creo configuration:
-# 1. Open Ribbon Options dialog
-# 2. Navigate to Configuration page
-# 3. Load the generated .pro file
-# 4. Accept configuration changes
-$session.RunMacro("~ Command ``ProCmdUtilMacros``")
-$session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
-$session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
-$session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$name.pro``")
-$session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
-$session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
-$session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
-
-# Execute the generated mapkey
-$session.RunMacro("%$name")
+# Execute all commands as a single RunMacro call
+Write-Host "Executing macro for $totalCurves surface extrusions..."
+try {
+    $session.RunMacro($allCommands)
+} catch {
+    Write-Host "Error during execution: $_" -ForegroundColor Red
+}
 
 # Clean up VB API connection
 $connection.Disconnect($null)

@@ -1,10 +1,10 @@
 # NGS Orthogrid Automation
 
-A collection of PowerShell automation tools that leverage the Creo Parametric VB API to automate complex modeling operations through dynamic mapkey generation. These tools enable advanced Creo automation without requiring additional software licenses beyond standard Creo Parametric.
+A collection of PowerShell automation tools that leverage the Creo Parametric VB API to automate complex modeling operations. These tools enable advanced Creo automation without requiring additional software licenses beyond standard Creo Parametric.
 
 ## Overview
 
-This repository contains specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. All tools are packaged as single-file .cmd executables that embed PowerShell code for ease of use. Most tools use the Creo VB API COM interface to gather user selections and model data, then generate and execute custom mapkeys "on the fly" to perform complex operations that would be tedious to do manually. One tool focuses on data extraction and analysis.
+This repository contains specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. All tools are packaged as single-file .cmd executables that embed PowerShell code for ease of use. Tools use the Creo VB API COM interface to gather user selections and model data, then execute operations through direct RunMacro commands to perform complex operations that would be tedious to do manually.
 
 **Note:** All tools now use the .cmd format (hybrid batch/PowerShell) for simplified execution. Legacy .ps1 source files are archived in the `ps1 archive/` folder for reference.
 
@@ -14,8 +14,7 @@ This repository contains specialized automation tools designed for orthogrid and
 **Purpose:** Batch flip/mirror operations for selected geometric bodies
 
 - Prompts user to select multiple solid bodies in Creo
-- Generates mapkey that iterates through each selected body
-- Applies flip operation to each body using Creo's built-in Flip feature
+- Iterates through each selected body and applies Creo's built-in Flip feature
 - Useful for creating mirrored components in orthogrid structures
 
 **Usage:** Double-click `flipenator.cmd` and select bodies to flip in Creo
@@ -25,8 +24,7 @@ This repository contains specialized automation tools designed for orthogrid and
 
 - Requires pre-existing "example node" feature (typically an extruded solid body)
 - User selects the example feature, then multiple datum points
-- Generates mapkey that copies the node feature to each datum point location
-- Uses Creo's Paste Special functionality with by-reference assembly operations
+- Copies the node feature to each datum point location using Creo's Paste Special with by-reference assembly operations
 - Essential for creating node patterns in orthogrid structures
 
 **Usage:** Create an example node feature, double-click `nodelator.cmd`, select the example and target datum points
@@ -45,7 +43,6 @@ This repository contains specialized automation tools designed for orthogrid and
 **Purpose:** Apply consistent thickness to multiple surface quilts
 
 - Prompts user to select multiple quilt surfaces
-- Generates mapkey with reusable sub-routine for thicken operations
 - Applies consistent thickness (0.1 units) to each selected quilt
 - Includes options for thickness direction and body creation
 - Converts surface quilts to solid bodies for structural analysis
@@ -118,7 +115,7 @@ All tools are now packaged as single-file .cmd executables:
 1. **Open Creo** and load your model
 2. **Double-click** the desired .cmd file
 3. **Follow prompts** to select geometry in Creo
-4. **Wait for completion** - script will generate and execute mapkey automatically
+4. **Wait for completion** - script will execute operations automatically
 5. **Review results** in Creo model
 
 ### Legacy Source Files

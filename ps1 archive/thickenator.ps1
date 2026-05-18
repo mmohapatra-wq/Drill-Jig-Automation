@@ -1,3 +1,30 @@
+﻿
+$Host.UI.RawUI.WindowTitle = "THICKENATOR"
+$ErrorActionPreference = "Stop"
+
+trap {
+    Write-Host ""
+    Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
+}
+
+$script:lastPct = -1
+function Show-Progress {
+    param([int]$Pct, [string]$Label)
+    if ($Pct -eq $script:lastPct) { return }
+    $script:lastPct = $Pct
+    $filled = [Math]::Floor($Pct / 5)
+    $empty = 20 - $filled
+    $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
+    $color = if ($Pct -ge 100) { "Green" } else { "White" }
+    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
+    if ($Pct -ge 100) { Write-Host "" }
+}
+
 <#
 .SYNOPSIS
     Automates thickening operations for selected surface quilts in Creo Parametric
@@ -75,7 +102,7 @@ catch {
     Write-Output "Could not connect to Creo session."
     Write-Output "Press any key to continue..."
 }
- 
+
 # Optional: Set regeneration failure handling (commented out)
 # $session.SetConfigOption("regen_failure_handling", "resolve_mode")
 $model = $session.GetActiveModel()
@@ -107,69 +134,50 @@ foreach ($item in $selection)
     $i++
 }
 
-# Use StringBuilder for efficient string concatenation when building large mapkeys
-# [void] casting prevents console output of AppendLine return values
-$StringBuilder = New-Object System.Text.StringBuilder
+# Define thicken sub-macro with thickness parameter
+$thickenSubMacro = "~ Command ``ProCmdFtThicken``;" +
+    "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
+    "~ Exit ``main_dlg_cur`` ``dashInst0.Quit``;" +
+    "~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;" +
+    "~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;" +
+    "~ Input ``main_dlg_cur`` ``maindashInst0.Thickness`` ``$thickness``;" +
+    "~ Activate ``main_dlg_cur`` ``maindashInst0.Thickness``;" +
+    "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
+    "~ Activate ``body_page.0.0`` ``PH.bodyusechkbtnrepwdg`` 1;" +
+    "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
 
-# Set Visible Mapkeys to No (speeds up execution and prevents display issues)
-[void]$StringBuilder.AppendLine("visible_mapkeys no")
-
-# Create thicken feature sub-mapkey - reusable routine for thicken operation
-[void]$StringBuilder.AppendLine("mapkey sub$name @MAPKEY_LABELsub$name;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdFtThicken`` ;~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Exit ``main_dlg_cur`` ``dashInst0.Quit``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;\")
-# Apply standard thickness (modify $thickness variable at top of script as needed)
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Input ``main_dlg_cur`` ``maindashInst0.Thickness`` ``$thickness``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``maindashInst0.Thickness``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``body_page.0.0`` ``PH.bodyusechkbtnrepwdg`` 1;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``dashInst0.Done``;")
-
-# Start main mapkey
-[void]$StringBuilder.AppendLine("mapkey $name @MAPKEY_LABEL$name;\")
-
-# Generate mapkey that iterates through each selected quilt:
-# 1. Search and select quilt by ID
-# 2. Call thicken sub-routine
-# 3. Clean selection buffer
+# Loop through quilts with progress reporting
+$totalQuilts = $quilts.Count
+$quiltIndex = 0
 foreach ($item in $quilts)
 {
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Open ``selspecdlg0`` ``SelOptionRadio``;~ Close ``selspecdlg0`` ``SelOptionRadio``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Quilt``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$item``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``CancelButton``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) %sub$name;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
+    $quiltIndex++
+    $pct = [Math]::Floor(($quiltIndex / $totalQuilts) * 100)
+    Show-Progress $pct "Thickening quilt ${quiltIndex}/${totalQuilts}"
+
+    # Step 1: Select quilt by ID
+    try {
+        $selectQuilt = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+            "~ Command ``ProCmdMdlTreeSearch``;" +
+            "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Quilt``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+            "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$item``;" +
+            "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+            "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+            "~ Activate ``selspecdlg0`` ``CancelButton``;"
+
+        $session.RunMacro($selectQuilt)
+        Start-Sleep -Milliseconds 200
+    } catch {}
+
+    # Step 2: Execute thicken operation
+    try {
+        $session.RunMacro($thickenSubMacro)
+    } catch {}
 }
-
-# End main mapkey
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;")
-
-# Write the generated mapkey to user's working folder
-$username = $env:USERNAME
-$StringBuilder.ToString() | Out-File "C:\Users\$username\working_folder\$name.pro"
-
-# Import generated mapkey file into Creo configuration:
-# 1. Open Ribbon Options dialog
-# 2. Navigate to Configuration page
-# 3. Load the generated .pro file
-# 4. Accept configuration changes
-$session.RunMacro("~ Command ``ProCmdUtilMacros``")
-$session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
-$session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
-$session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$name.pro``")
-$session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
-$session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
-$session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
-
-# Execute the generated mapkey
-$session.RunMacro("%$name")
+Show-Progress 100 "Thicken complete"
 
 # Clean up VB API connection
 $connection.Disconnect($null)

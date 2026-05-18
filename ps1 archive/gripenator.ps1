@@ -1,3 +1,30 @@
+﻿
+$Host.UI.RawUI.WindowTitle = "GRIPENATOR - Fastener Management Tool"
+$ErrorActionPreference = "Stop"
+
+trap {
+    Write-Host ""
+    Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
+}
+
+$script:lastPct = -1
+function Show-Progress {
+    param([int]$Pct, [string]$Label)
+    if ($Pct -eq $script:lastPct) { return }
+    $script:lastPct = $Pct
+    $filled = [Math]::Floor($Pct / 5)
+    $empty = 20 - $filled
+    $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
+    $color = if ($Pct -ge 100) { "Green" } else { "White" }
+    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
+    if ($Pct -ge 100) { Write-Host "" }
+}
+
 <#
 .SYNOPSIS
     Automates fastener and nut management in Creo Parametric
@@ -92,7 +119,6 @@ catch {
 # SETUP & VARIABLES
 #================================================================
 
-$Host.UI.RawUI.WindowTitle = "GRIPENATOR - Fastener Management Tool"
 $scriptName = "gripenator"
 $username = [Environment]::UserName
 $workingFolder = "C:\Users\$username\working_folder"
@@ -223,211 +249,83 @@ function Write-SelectionSummary {
     }
 }
 
-function New-FindToolMapkey {
+function New-SelectComponents {
     param(
         [array]$ComponentIds,
-        [string]$MapkeyName
+        [string]$SelectionType = "Component"
     )
 
-    $stringBuilder = New-Object System.Text.StringBuilder
+    # Open and configure find tool ONCE
+    $openFind = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``$SelectionType``;" +
+        "~ Select ``selspecdlg0`` ``CascadeButton1``;" +
+        "~ Close ``selspecdlg0`` ``CascadeButton1``;" +
+        "~ Activate ``selspecdlg0`` ``HiliteScreenCheckBtn`` 0;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;"
 
-    [void]$stringBuilder.AppendLine("visible_mapkeys no")
-    [void]$stringBuilder.AppendLine("mapkey $MapkeyName @MAPKEY_LABEL$MapkeyName;\")
+    try { $session.RunMacro($openFind) } catch {}
 
-    # Clear selection buffer
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
-
-    # Open Find tool once
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-
-    # Disable GUI highlighting during batch search for performance
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Component``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``CascadeButton1``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Close ``selspecdlg0`` ``CascadeButton1``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``HiliteScreenCheckBtn`` 0;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;\")
-    
-
-    # For each component ID, search and apply without closing the dialog
-    $idCount = @($ComponentIds).Count
+    # Loop through IDs with progress
+    $totalIds = @($ComponentIds).Count
     $idIndex = 0
     foreach ($id in $ComponentIds) {
         $idIndex++
-        $isLast = ($idIndex -eq $idCount)
+        $pct = [Math]::Floor(($idIndex / $totalIds) * 100)
+        Show-Progress $pct "Selecting component ${idIndex}/${totalIds}"
 
-        [void]$stringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$id``;\")
-        [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
+        $searchAndApply = "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$id``;" +
+            "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+            "~ Activate ``selspecdlg0`` ``ApplyBtn``;"
 
-        if ($isLast) {
-            [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;~ Activate ``selspecdlg0`` ``CancelButton``;")
-        }
-        else {
-            [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-        }
+        try { $session.RunMacro($searchAndApply) } catch {}
     }
+    Show-Progress 100 "Selection complete"
 
-    return $stringBuilder.ToString()
+    # Close find tool ONCE
+    $closeFind = "~ Activate ``selspecdlg0`` ``CancelButton``;"
+    try { $session.RunMacro($closeFind) } catch {}
 }
 
-function New-ReplaceMapkey {
+function Invoke-ReplaceComponents {
     param(
         [array]$ComponentIds,
-        [string]$NewPartNumber,
-        [string]$MapkeyName
+        [string]$NewPartNumber
     )
 
-    $stringBuilder = New-Object System.Text.StringBuilder
+    # Select all components first (reuse New-SelectComponents)
+    New-SelectComponents -ComponentIds $ComponentIds -SelectionType "Component"
 
-    [void]$stringBuilder.AppendLine("visible_mapkeys no")
-    [void]$stringBuilder.AppendLine("mapkey $MapkeyName @MAPKEY_LABEL$MapkeyName;\")
-
-    # Clear selection buffer
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
-
-    # Open Find tool once
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-
-    # Disable GUI highlighting during batch search for performance
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``CascadeButton1``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Close ``selspecdlg0`` ``CascadeButton1``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``HiliteScreenCheckBtn`` 0;\")
-
-    # Select all component IDs in batch
-    $idCount = @($ComponentIds).Count
-    $idIndex = 0
-    foreach ($id in $ComponentIds) {
-        $idIndex++
-        $isLastId = ($idIndex -eq $idCount)
-
-        [void]$stringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` \")
-        [void]$stringBuilder.AppendLine("mapkey(continued) ``$id``;~ Activate ``selspecdlg0`` ``EvaluateBtn``;\")
-
-        if ($isLastId) {
-            [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;~ Activate ``selspecdlg0`` ``CancelButton``;\")
-        }
-        else {
-            [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-        }
-    }
-
-    # Execute Replace tool with new part number
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdReplComp@PopupMenuGraphicWinStack`` ;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Trigger ``gen_repl_dlg`` ``Lst_NewComp`` ``0``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Trigger ``gen_repl_dlg`` ``Lst_NewComp`` ``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``gen_repl_dlg`` ``PB_NewComp``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``mdlbrowser`` ``MBar`` 1 ``TreeMenu``;~ Close ``mdlbrowser`` ``MBar``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``mdlbrowser`` ``Find``;~ Open ``brws_query`` ``ClassOptMenu``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Close ``brws_query`` ``ClassOptMenu``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Select ``brws_query`` ``ClassOptMenu`` 1 ``Model Name``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Input ``brws_query`` ``ValueInput`` ``$NewPartNumber``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Update ``brws_query`` ``ValueInput`` ``$NewPartNumber``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``brws_query`` ``AddBtn``;~ Activate ``brws_query`` ``FindNextBtn``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``brws_query`` ``SelectBtn``;~ Activate ``brws_query`` ``CloseBtn``;\")
-    [void]$stringBuilder.AppendLine("mapkey(continued) ~ Activate ``mdlbrowser`` ``OK``;~ Activate ``gen_repl_dlg`` ``DoneBtn``;")
-
-    return $stringBuilder.ToString()
-}
-
-function Import-Mapkey {
-    param(
-        [string]$MapkeyContent,
-        [string]$MapkeyName
-    )
+    # Execute replace with new part number
+    $replace = "~ Command ``ProCmdReplComp@PopupMenuGraphicWinStack``;" +
+        "~ Trigger ``gen_repl_dlg`` ``Lst_NewComp`` ``0``;" +
+        "~ Trigger ``gen_repl_dlg`` ``Lst_NewComp`` ``;" +
+        "~ Activate ``gen_repl_dlg`` ``PB_NewComp``;" +
+        "~ Select ``mdlbrowser`` ``MBar`` 1 ``TreeMenu``;" +
+        "~ Close ``mdlbrowser`` ``MBar``;" +
+        "~ Activate ``mdlbrowser`` ``Find``;" +
+        "~ Open ``brws_query`` ``ClassOptMenu``;" +
+        "~ Close ``brws_query`` ``ClassOptMenu``;" +
+        "~ Select ``brws_query`` ``ClassOptMenu`` 1 ``Model Name``;" +
+        "~ Input ``brws_query`` ``ValueInput`` ``$NewPartNumber``;" +
+        "~ Update ``brws_query`` ``ValueInput`` ``$NewPartNumber``;" +
+        "~ Activate ``brws_query`` ``AddBtn``;" +
+        "~ Activate ``brws_query`` ``FindNextBtn``;" +
+        "~ Activate ``brws_query`` ``SelectBtn``;" +
+        "~ Activate ``brws_query`` ``CloseBtn``;" +
+        "~ Activate ``mdlbrowser`` ``OK``;" +
+        "~ Activate ``gen_repl_dlg`` ``DoneBtn``;"
 
     try {
-        $mapkeyFile = "$workingFolder\${scriptName}_${MapkeyName}.pro"
-        $MapkeyContent | Out-File -FilePath $mapkeyFile -Encoding ASCII
-
-        Write-Host "Importing mapkey: $MapkeyName from $mapkeyFile" -ForegroundColor Green
-
-        $filename = "${scriptName}_${MapkeyName}.pro"
-
-        # Close any open dialogs from previous mapkey execution
-        $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
-
-        # Import generated mapkey file into Creo configuration
-        # Use individual RunMacro calls for reliability
-        $session.RunMacro("~ Command ``ProCmdUtilMacros``")
-        $session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
-        $session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
-        $session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$filename``")
-        $session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
-        $session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
-        $session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
-
+        $session.RunMacro($replace)
         return $true
     }
     catch {
-        Write-Host "ERROR importing mapkey: $_" -ForegroundColor Red
+        Write-Host "ERROR replacing components: $_" -ForegroundColor Red
         return $false
     }
 }
 
-function Execute-Mapkey {
-    param(
-        [string]$MapkeyContent,
-        [string]$MapkeyName
-    )
-
-    try {
-        $mapkeyFile = "$workingFolder\${scriptName}_${MapkeyName}.pro"
-        $MapkeyContent | Out-File -FilePath $mapkeyFile -Encoding ASCII
-
-        Write-Host "Importing mapkey: $MapkeyName from $mapkeyFile" -ForegroundColor Green
-
-        $filename = "${scriptName}_${MapkeyName}.pro"
-
-        # Close any open dialogs from previous mapkey execution
-        $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
-
-        # Import generated mapkey file into Creo configuration
-        # Use individual RunMacro calls for reliability
-        $session.RunMacro("~ Command ``ProCmdUtilMacros``")
-        $session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
-        $session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
-        $session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$filename``")
-        $session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
-        $session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
-        $session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
-
-        Write-Host "Executing mapkey: %$MapkeyName" -ForegroundColor Green
-
-        # Execute the generated mapkey
-        $session.RunMacro("%$MapkeyName")
-
-        Write-Host "Mapkey execution call completed" -ForegroundColor Green
-
-        return $true
-    }
-    catch {
-        Write-Host "ERROR executing mapkey: $_" -ForegroundColor Red
-        return $false
-    }
-}
-
-function Run-Mapkey {
-    param(
-        [string]$MapkeyName
-    )
-
-    try {
-        Write-Host "Executing mapkey: %$MapkeyName" -ForegroundColor Green
-
-        # Close any open dialogs from previous mapkey execution
-        $session.RunMacro("~ Close ``main_dlg_cur`` ``appl_casc``")
-
-        # Execute the mapkey (assumes it's already been imported)
-        $session.RunMacro("%$MapkeyName")
-
-        Write-Host "Mapkey execution completed" -ForegroundColor Green
-
-        return $true
-    }
-    catch {
-        Write-Host "ERROR running mapkey: $_" -ForegroundColor Red
-        return $false
-    }
-}
 
 #================================================================
 # FILTER FUNCTION
@@ -451,11 +349,9 @@ function Invoke-FilterFunction {
     Write-Host "Found $fastenerCount valid fastener(s). Filtering selection..." -ForegroundColor Green
 
     $fastenerIds = $selection.Fasteners | ForEach-Object { $_.ID }
-    $mapkey = New-FindToolMapkey -ComponentIds $fastenerIds -MapkeyName "filter"
+    New-SelectComponents -ComponentIds $fastenerIds -SelectionType "Component"
 
-    if (Execute-Mapkey -MapkeyContent $mapkey -MapkeyName "filter") {
-        Write-Host "Filtered selection to $fastenerCount fastener(s)" -ForegroundColor Green
-    }
+    Write-Host "Filtered selection to $fastenerCount fastener(s)" -ForegroundColor Green
 }
 
 #================================================================
@@ -515,49 +411,35 @@ function Invoke-ChangeFunction {
 
         # Group fasteners by coating to handle multiple coatings in one selection
         $fastenersByCoating = $selection.Fasteners | Group-Object -Property Coating
-        $fastenerMapkeys = @()
+        $totalGroups = $fastenersByCoating.Count
+        $groupIndex = 0
 
-        # Phase 1: Import all fastener mapkeys
         foreach ($coatingGroup in $fastenersByCoating) {
+            $groupIndex++
             $coating = $coatingGroup.Name
             $fastenerIds = $coatingGroup.Group | ForEach-Object { $_.ID }
             $newFastenerPartNumber = "HST$family$coating$newDiameter-$newGrip"
 
             Write-Host "Changing $($fastenerIds.Count) fastener(s) with $coating coating to: $newFastenerPartNumber" -ForegroundColor Green
 
-            # Create safe mapkey name (replace "-" with underscore for valid identifier)
-            $safeCoatingName = $coating -replace '-', 'null'
-            $mapkeyName = "change_fastener_$safeCoatingName"
+            $pct = [Math]::Floor(($groupIndex / $totalGroups) * 50)  # 0-50% for fasteners
+            Show-Progress $pct "Changing fasteners (${groupIndex}/${totalGroups})"
 
-            $mapkey = New-ReplaceMapkey -ComponentIds $fastenerIds -NewPartNumber $newFastenerPartNumber -MapkeyName $mapkeyName
-
-            # Store mapkey info for later execution
-            $fastenerMapkeys += @{
-                Name = $mapkeyName
-                Content = $mapkey
-                Count = $fastenerIds.Count
-                Coating = $coating
-            }
-
-            # Import the mapkey (but don't execute yet)
-            [void](Import-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName)
+            Invoke-ReplaceComponents -ComponentIds $fastenerIds -NewPartNumber $newFastenerPartNumber
         }
     }
 
     # Process nuts if present and diameter was changed
-    $nutMapkeys = @()
     if ($nutCount -gt 0 -and -not [string]::IsNullOrWhiteSpace($newDiameter)) {
         $newDiameter = $newDiameter.Trim()
 
         # Group nuts by coating
         $nutsByCoating = $selection.Nuts | Group-Object -Property Coating
+        $totalGroups = $nutsByCoating.Count
+        $groupIndex = 0
 
-        foreach ($group in $nutsByCoating) {
-            Write-Host "  Group Name='$($group.Name)' Count=$($group.Count)" -ForegroundColor Cyan
-        }
-
-        # Phase 1b: Import all nut mapkeys
         foreach ($coatingGroup in $nutsByCoating) {
+            $groupIndex++
             $coating = $coatingGroup.Name
 
             # Filter out nuts that already have the target diameter
@@ -573,38 +455,14 @@ function Invoke-ChangeFunction {
 
             Write-Host "Changing $($nutIds.Count) nut(s) with $coating coating to: $newNutPartNumber" -ForegroundColor Green
 
-            # Create safe mapkey name (replace "-" with underscore for valid identifier)
-            $safeCoatingName = $coating -replace '-', 'null'
-            $mapkeyName = "change_nuts_$safeCoatingName"
+            $pct = 50 + [Math]::Floor(($groupIndex / $totalGroups) * 50)  # 50-100% for nuts
+            Show-Progress $pct "Changing nuts (${groupIndex}/${totalGroups})"
 
-            $mapkey = New-ReplaceMapkey -ComponentIds $nutIds -NewPartNumber $newNutPartNumber -MapkeyName $mapkeyName
-
-            # Store mapkey info for later execution
-            $nutMapkeys += @{
-                Name = $mapkeyName
-                Content = $mapkey
-                Count = $nutIds.Count
-                Coating = $coating
-            }
-
-            # Import the mapkey (but don't execute yet)
-            [void](Import-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName)
+            Invoke-ReplaceComponents -ComponentIds $nutIds -NewPartNumber $newNutPartNumber
         }
     }
 
-    # Phase 2: Execute all fastener mapkeys (already imported in Phase 1)
-    foreach ($mapkeyInfo in $fastenerMapkeys) {
-        if (Run-Mapkey -MapkeyName $mapkeyInfo.Name) {
-            Write-Host "Changed $($mapkeyInfo.Count) fastener(s) with $($mapkeyInfo.Coating) coating" -ForegroundColor Green
-        }
-    }
-
-    # Phase 3: Execute all nut mapkeys (already imported in Phase 1b)
-    foreach ($mapkeyInfo in $nutMapkeys) {
-        if (Run-Mapkey -MapkeyName $mapkeyInfo.Name) {
-            Write-Host "Changed $($mapkeyInfo.Count) nut(s) with $($mapkeyInfo.Coating) coating" -ForegroundColor Green
-        }
-    }
+    Show-Progress 100 "Change complete"
 }
 
 #================================================================
@@ -630,8 +488,11 @@ function Invoke-GroundingFunction {
 
     # Group fasteners by unique family-diameter-grip combinations
     $combinations = $selection.Fasteners | Group-Object { "$($_.Family)-$($_.Diameter)-$($_.Grip)" }
+    $totalCombos = $combinations.Count
+    $comboIndex = 0
 
     foreach ($combo in $combinations) {
+        $comboIndex++
         $comboKey = $combo.Name -split '-'
         $family = $comboKey[0]
         $diameter = $comboKey[1]
@@ -639,15 +500,14 @@ function Invoke-GroundingFunction {
         $newPartNumber = "HST$family" + "GD" + "$diameter-$grip"
         $comboIds = $combo.Group | ForEach-Object { $_.ID }
 
+        $pct = [Math]::Floor(($comboIndex / $totalCombos) * 100)
+        Show-Progress $pct "Grounding fasteners (${comboIndex}/${totalCombos})"
+
         Write-Host "Grounding $($comboIds.Count) fastener(s): $newPartNumber" -ForegroundColor Green
-
-        $mapkeyName = "ground_${family}_${diameter}_${grip}"
-        $mapkey = New-ReplaceMapkey -ComponentIds $comboIds -NewPartNumber $newPartNumber -MapkeyName $mapkeyName
-
-        if (Execute-Mapkey -MapkeyContent $mapkey -MapkeyName $mapkeyName) {
-            Write-Host "Grounded $($comboIds.Count) fastener(s)" -ForegroundColor Green
-        }
+        Invoke-ReplaceComponents -ComponentIds $comboIds -NewPartNumber $newPartNumber
     }
+
+    Show-Progress 100 "Grounding complete"
 }
 
 #================================================================

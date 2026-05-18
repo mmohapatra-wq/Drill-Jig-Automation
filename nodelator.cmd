@@ -17,6 +17,20 @@ trap {
     exit 1
 }
 
+$script:lastPct = -1
+function Show-Progress {
+    param([int]$Pct, [string]$Label)
+    if ($Pct -eq $script:lastPct) { return }
+    $script:lastPct = $Pct
+    $filled = [Math]::Floor($Pct / 5)
+    $empty = 20 - $filled
+    $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
+    $color = if ($Pct -ge 100) { "Green" } else { "White" }
+    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
+    if ($Pct -ge 100) { Write-Host "" }
+}
+
 <#
 .SYNOPSIS
     Automates duplication of node features at multiple datum point locations in Creo Parametric
@@ -132,86 +146,62 @@ foreach ($item in $points)
     $pointIDs += $item.SelItem.Id
 }
 
-# Use StringBuilder for efficient string concatenation when building large mapkeys
-# [void] casting prevents console output of AppendLine return values
-$StringBuilder = New-Object System.Text.StringBuilder
+# Initial copy of the example node feature (once)
+$copyNode = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+    "~ Command ``ProCmdMdlTreeSearch``;" +
+    "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+    "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+    "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Feature``;" +
+    "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+    "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$nodeID``;" +
+    "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+    "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+    "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+    "~ Command ``ProCmdEditCopy``;"
 
-# Set Visible Mapkeys to No (speeds up execution and prevents display issues)
-[void]$StringBuilder.AppendLine("visible_mapkeys no")
+try { $session.RunMacro($copyNode) } catch {}
 
-# Start main mapkey - begins with copying the example node feature
-[void]$StringBuilder.AppendLine("mapkey $name @MAPKEY_LABEL$name;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Open ``selspecdlg0`` ``SelOptionRadio``;~ Close ``selspecdlg0`` ``SelOptionRadio``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Feature``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$nodeID``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``CancelButton``;\")
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdEditCopy``;\")
-
-# Generate mapkey that iterates through each datum point:
-# 1. Paste Special with by-reference assembly operations
-# 2. Configure external reference table for node placement
-# 3. Select target datum point for positioning
+# Loop through datum points with progress reporting
+$totalPoints = $pointIDs.Count
+$pointIndex = 0
 foreach ($item in $pointIDs)
 {
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdEditPasteSpecial`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``paste_special`` ``makecopyiesPB`` 0;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``paste_special`` ``pastebyrefPB`` 1;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``paste_special`` ``okPB``;\")
+    $pointIndex++
+    $pct = [Math]::Floor(($pointIndex / $totalPoints) * 100)
+    Show-Progress $pct "Pasting node ${pointIndex}/${totalPoints}"
 
-    # Configure Paste Special dialog for by-reference copying:
-    # - Navigate through external reference table
-    # - Enable body creation option
-    # - Select target datum point for node placement
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``4`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``4`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``3`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``2`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ```` ````;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``Odui_Dlg_00`` ``t1.body_add_chk_btn`` 1;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ```` ````;\")
+    # Paste node at datum point with by-reference assembly operations
+    $pasteAtPoint = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+        "~ Command ``ProCmdEditPasteSpecial``;" +
+        "~ Activate ``paste_special`` ``makecopyiesPB`` 0;" +
+        "~ Activate ``paste_special`` ``pastebyrefPB`` 1;" +
+        "~ Activate ``paste_special`` ``okPB``;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``4`` ``ext_ref_list``;" +
+        "~ Select ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``4`` ``ext_ref_list``;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``3`` ``ext_ref_list``;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``2`` ``ext_ref_list``;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ```` ````;" +
+        "~ Activate ``Odui_Dlg_00`` ``t1.body_add_chk_btn`` 1;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;" +
+        "~ Select ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ``5`` ``ext_ref_list``;" +
+        "~ Trigger ``Odui_Dlg_00`` ``t1.ext_ref_table`` 2 ```` ````;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$item``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;" +
+        "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
 
-    # Select target datum point by ID for node positioning
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Command ``ProCmdMdlTreeSearch`` ;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Open ``selspecdlg0`` ``SelOptionRadio``;~ Close ``selspecdlg0`` ``SelOptionRadio``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$item``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``EvaluateBtn``;~ Activate ``selspecdlg0`` ``ApplyBtn``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``selspecdlg0`` ``CancelButton``;\")
-    [void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;\")
+    try {
+        $session.RunMacro($pasteAtPoint)
+        Start-Sleep -Milliseconds 200
+    } catch {}
 }
-
-
-# End main mapkey
-[void]$StringBuilder.AppendLine("mapkey(continued) ~ Activate ``main_dlg_cur`` ``buffer_clean``;")
-
-# Write the generated mapkey to user's working folder
-$username = $env:USERNAME
-$StringBuilder.ToString() | Out-File "C:\Users\$username\working_folder\$name.pro"
-
-# Import generated mapkey file into Creo configuration:
-# 1. Open Ribbon Options dialog
-# 2. Navigate to Configuration page
-# 3. Load the generated .pro file
-# 4. Accept configuration changes
-$session.RunMacro("~ Command ``ProCmdUtilMacros``")
-$session.RunMacro("~ Activate ``mapkey_main`` ``psh_import``")
-$session.RunMacro("~ Trail `` `` ``DLG_PREVIEW_POST`` ``file_open``")
-$session.RunMacro("~ Select ``file_open`` ``Ph_list.Filelist`` 1 ``$name.pro``")
-$session.RunMacro("~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``")
-$session.RunMacro("~ Activate ``mapkey_main`` ``CloseButton``")
-$session.RunMacro("~ Activate ``unsaved_mapkeys`` ``yes``")
-
-# Execute the generated mapkey
-$session.RunMacro("%$name")
+Show-Progress 100 "Node duplication complete"
 
 # Clean up VB API connection
 $connection.Disconnect($null)
