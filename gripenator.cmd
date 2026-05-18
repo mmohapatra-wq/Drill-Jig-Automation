@@ -525,6 +525,21 @@ Write-Host ("=" * 50) -ForegroundColor Green
 Write-Host "GRIPENATOR - Fastener Management Tool" -ForegroundColor Green
 Write-Host ("=" * 50) -ForegroundColor Green
 
+$origVisibleMapkeys = $null
+$origDynamicPreview = $null
+try {
+    $vals = $session.GetConfigOptionValues("visible_mapkeys")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origVisibleMapkeys = $vals.Item(0) }
+} catch {}
+try {
+    $vals = $session.GetConfigOptionValues("dynamic_preview")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origDynamicPreview = $vals.Item(0) }
+} catch {}
+try {
+    $session.SetConfigOption("visible_mapkeys", "no") | Out-Null
+    $session.SetConfigOption("dynamic_preview", "no") | Out-Null
+} catch {}
+
 try {
     do {
         Write-Host "`n" -ForegroundColor Cyan
@@ -550,6 +565,10 @@ try {
     } while ($choice.ToUpper() -ne 'E')
 }
 finally {
+    try {
+        if ($null -ne $origVisibleMapkeys) { $session.SetConfigOption("visible_mapkeys", $origVisibleMapkeys) | Out-Null }
+        if ($null -ne $origDynamicPreview)  { $session.SetConfigOption("dynamic_preview",  $origDynamicPreview)  | Out-Null }
+    } catch {}
     try {
         if ($null -ne $connection) {
             $connection.Disconnect($null)

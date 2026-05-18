@@ -185,6 +185,22 @@ if ($null -eq $model) {
 
 Write-Host " Connected to $($model.FileName)" -ForegroundColor Green
 
+$origVisibleMapkeys = $null
+$origDynamicPreview = $null
+try {
+    $vals = $session.GetConfigOptionValues("visible_mapkeys")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origVisibleMapkeys = $vals.Item(0) }
+} catch {}
+try {
+    $vals = $session.GetConfigOptionValues("dynamic_preview")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origDynamicPreview = $vals.Item(0) }
+} catch {}
+try {
+    $session.SetConfigOption("visible_mapkeys", "no") | Out-Null
+    $session.SetConfigOption("dynamic_preview", "no") | Out-Null
+} catch {}
+
+try {
 # ============================================
 # ENUMERATE BODIES AND SURFACES
 # ============================================
@@ -516,34 +532,41 @@ else {
     Write-Host "  No matching edges found in range $MinLength - $MaxLength inches" -ForegroundColor Yellow
 }
 
-# ============================================
-# CLEANUP
-# ============================================
-if ($null -ne $allBodies) {
-    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($allBodies) | Out-Null } catch {}
-}
-if ($null -ne $modelItemType) {
-    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($modelItemType) | Out-Null } catch {}
-}
-if ($null -ne $model) {
-    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($model) | Out-Null } catch {}
-}
-if ($null -ne $session) {
-    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($session) | Out-Null } catch {}
-}
-if ($null -ne $connection) {
+} finally {
     try {
-        $connection.Disconnect(2)
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($connection) | Out-Null
+        if ($null -ne $origVisibleMapkeys) { $session.SetConfigOption("visible_mapkeys", $origVisibleMapkeys) | Out-Null }
+        if ($null -ne $origDynamicPreview)  { $session.SetConfigOption("dynamic_preview",  $origDynamicPreview)  | Out-Null }
+    } catch {}
+
+    # ============================================
+    # CLEANUP
+    # ============================================
+    if ($null -ne $allBodies) {
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($allBodies) | Out-Null } catch {}
+    }
+    if ($null -ne $modelItemType) {
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($modelItemType) | Out-Null } catch {}
+    }
+    if ($null -ne $model) {
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($model) | Out-Null } catch {}
+    }
+    if ($null -ne $session) {
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($session) | Out-Null } catch {}
+    }
+    if ($null -ne $connection) {
+        try {
+            $connection.Disconnect(2)
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($connection) | Out-Null
+        } catch {}
+    }
+    if ($null -ne $async) {
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($async) | Out-Null } catch {}
+    }
+    try {
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
     } catch {}
 }
-if ($null -ne $async) {
-    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($async) | Out-Null } catch {}
-}
-try {
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
-} catch {}
 
 # ============================================
 # FINAL REPORT

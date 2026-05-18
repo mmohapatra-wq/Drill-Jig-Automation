@@ -58,6 +58,22 @@ catch {
 # $session.SetConfigOption("regen_failure_handling", "resolve_mode")
 $model = $session.GetActiveModel()
 
+$origVisibleMapkeys = $null
+$origDynamicPreview = $null
+try {
+    $vals = $session.GetConfigOptionValues("visible_mapkeys")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origVisibleMapkeys = $vals.Item(0) }
+} catch {}
+try {
+    $vals = $session.GetConfigOptionValues("dynamic_preview")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origDynamicPreview = $vals.Item(0) }
+} catch {}
+try {
+    $session.SetConfigOption("visible_mapkeys", "no") | Out-Null
+    $session.SetConfigOption("dynamic_preview", "no") | Out-Null
+} catch {}
+
+try {
 #------------- Start Sandbox ---------------------
 
 #Add in pertinent ComObjects
@@ -121,4 +137,10 @@ foreach ($item in $bodies)
 # Export data to CSV format
 $dimension_array | Export-Csv -Path ".\$filename.csv" -NoTypeInformation
 
-$connection.Disconnect($null)
+} finally {
+    try {
+        if ($null -ne $origVisibleMapkeys) { $session.SetConfigOption("visible_mapkeys", $origVisibleMapkeys) | Out-Null }
+        if ($null -ne $origDynamicPreview)  { $session.SetConfigOption("dynamic_preview",  $origDynamicPreview)  | Out-Null }
+    } catch {}
+    $connection.Disconnect($null)
+}
