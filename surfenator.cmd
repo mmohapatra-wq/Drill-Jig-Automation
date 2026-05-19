@@ -31,6 +31,17 @@ function Show-Progress {
     if ($Pct -ge 100) { Write-Host "" }
 }
 
+function Wait-ModelModified {
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            if ($Model.VersionStamp -ne $PreviousStamp) { return }
+        } catch {}
+    }
+    Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
+}
+
 <#
 .SYNOPSIS
     Automates surface creation by extruding 3D curves between datum planes in Creo Parametric
@@ -172,14 +183,15 @@ Read-Host -Prompt "Select the botplane (extrude start boundary), return to this 
 $selection = ($session.CurrentSelectionBuffer()).Contents
 $botPlane = $selection[0].SelItem.Id
 
-# Build one giant command string for all curves
-$allCommands = ""
-
 $totalCurves = $curves.Count
+$curveIndex = 0
 foreach ($item in $curves)
 {
-    # Add commands for this curve to the master string
-    $allCommands += "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+    $curveIndex++
+    $pct = [Math]::Floor(($curveIndex / $totalCurves) * 100)
+    Show-Progress $pct "Extruding surface ${curveIndex}/${totalCurves}"
+
+    $extrudeSurface = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
         "~ Command ``ProCmdMdlTreeSearch``;" +
         "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;" +
         "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;" +
@@ -221,15 +233,16 @@ foreach ($item in $curves)
         "~ Activate ``selspecdlg0`` ``CancelButton``;" +
         "~ Select ``main_dlg_cur`` ``maindashInst0.solid_surf_rg`` 1 ``Surface``;" +
         "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-}
 
-# Execute all commands as a single RunMacro call
-Write-Host "Executing macro for $totalCurves surface extrusions..."
-try {
-    $session.RunMacro($allCommands)
-} catch {
-    Write-Host "Error during execution: $_" -ForegroundColor Red
+    try {
+        $stamp = $model.VersionStamp
+        $session.RunMacro($extrudeSurface)
+        Wait-ModelModified -Model $model -PreviousStamp $stamp
+    } catch {
+        Write-Host "  Error on curve ${curveIndex}: $_" -ForegroundColor Red
+    }
 }
+Show-Progress 100 "Surface extrusion complete"
 
 } finally {
     try {

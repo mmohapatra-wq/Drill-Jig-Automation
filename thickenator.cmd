@@ -31,6 +31,18 @@ function Show-Progress {
     if ($Pct -ge 100) { Write-Host "" }
 }
 
+function Wait-ModelModified {
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            if ($Model.VersionStamp -ne $PreviousStamp) { return }
+        } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
+}
+
 <#
 .SYNOPSIS
     Automates thickening operations for selected surface quilts in Creo Parametric
@@ -166,7 +178,9 @@ $thickenSubMacro = "~ Command ``ProCmdFtThicken``;" +
     "~ Activate ``main_dlg_cur`` ``maindashInst0.Thickness``;" +
     "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
     "~ Activate ``body_page.0.0`` ``PH.bodyusechkbtnrepwdg`` 1;" +
-    "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+    "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;" +
+    "~ Activate ``main_dlg_cur`` ``buffer_clean``;"
+
 
 # Loop through quilts with progress reporting
 $totalQuilts = $quilts.Count
@@ -177,7 +191,6 @@ foreach ($item in $quilts)
     $pct = [Math]::Floor(($quiltIndex / $totalQuilts) * 100)
     Show-Progress $pct "Thickening quilt ${quiltIndex}/${totalQuilts}"
 
-    # Step 1: Select quilt by ID
     try {
         $selectQuilt = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
             "~ Command ``ProCmdMdlTreeSearch``;" +
@@ -190,13 +203,9 @@ foreach ($item in $quilts)
             "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
             "~ Activate ``selspecdlg0`` ``CancelButton``;"
 
-        $session.RunMacro($selectQuilt)
-        Start-Sleep -Milliseconds 200
-    } catch {}
-
-    # Step 2: Execute thicken operation
-    try {
-        $session.RunMacro($thickenSubMacro)
+        $stamp = $model.VersionStamp
+        $session.RunMacro($selectQuilt + $thickenSubMacro)
+        Wait-ModelModified -Model $model -PreviousStamp $stamp
     } catch {}
 }
 Show-Progress 100 "Thicken complete"

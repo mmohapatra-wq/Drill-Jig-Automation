@@ -31,6 +31,17 @@ function Show-Progress {
     if ($Pct -ge 100) { Write-Host "" }
 }
 
+function Wait-ModelModified {
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            if ($Model.VersionStamp -ne $PreviousStamp) { return }
+        } catch {}
+    }
+    Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
+}
+
 <#
 .SYNOPSIS
     Automates duplication of node features at multiple datum point locations in Creo Parametric
@@ -213,8 +224,9 @@ foreach ($item in $pointIDs)
         "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
 
     try {
+        $stamp = $model.VersionStamp
         $session.RunMacro($pasteAtPoint)
-        Start-Sleep -Milliseconds 200
+        Wait-ModelModified -Model $model -PreviousStamp $stamp
     } catch {}
 }
 Show-Progress 100 "Node duplication complete"
