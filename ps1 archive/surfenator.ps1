@@ -20,10 +20,43 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
+
+function Wait-ModelModified {
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            if ($Model.VersionStamp -ne $PreviousStamp) { return }
+        } catch {}
+    }
+    Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
+}
+
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "  ███████╗██╗   ██╗██████╗ ███████╗███████╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ██╔════╝██║   ██║██╔══██╗██╔════╝██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "  ███████╗██║   ██║██████╔╝█████╗  █████╗  ██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "  ╚════██║██║   ██║██╔══██╗██╔══╝  ██╔══╝  ██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "  ███████║╚██████╔╝██║  ██║██║     ███████╗██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "  ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Surface Extrusion Automation" -ForegroundColor White
+Write-Host ""
+
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Part open in Creo with 3D curves created" -ForegroundColor White
+Write-Host "    2. Three datum planes: midplane (sketch), top plane, bottom plane" -ForegroundColor White
+Write-Host "    3. Do not interact with Creo during processing" -ForegroundColor White
+Write-Host ""
 
 <#
 .SYNOPSIS
@@ -130,7 +163,9 @@ try {
 $name = "surfenator"
 
 # Collect 3D curves from user
-Read-Host -Prompt "Select curves to be extruded, return to this window, and press enter"
+Write-Host "  Select curves to extrude in Creo," -ForegroundColor White
+Write-Host "  then press ENTER here." -ForegroundColor White
+Read-Host
 $selection = ($session.CurrentSelectionBuffer()).Contents
 
 # Extract curve IDs handling both individual curves and composite selections
@@ -154,26 +189,33 @@ foreach ($temp1 in $selection)
 }
 
 # Collect three datum planes with specific roles
-Read-Host -Prompt "Select the midplane (sketch plane for curve projection), return to this window, and press enter"
+Write-Host "  Select the sketch midplane in Creo," -ForegroundColor White
+Write-Host "  then press ENTER here." -ForegroundColor White
+Read-Host
 $selection = ($session.CurrentSelectionBuffer()).Contents
 $midPlane = $selection[0].SelItem.Id
 
-Read-Host -Prompt "Select the topplane (extrude end boundary), return to this window, and press enter"
+Write-Host "  Select the top plane (extrude end) in Creo," -ForegroundColor White
+Write-Host "  then press ENTER here." -ForegroundColor White
+Read-Host
 $selection = ($session.CurrentSelectionBuffer()).Contents
 $topPlane = $selection[0].SelItem.Id
 
-Read-Host -Prompt "Select the botplane (extrude start boundary), return to this window, and press enter"
+Write-Host "  Select the bottom plane (extrude start) in Creo," -ForegroundColor White
+Write-Host "  then press ENTER here." -ForegroundColor White
+Read-Host
 $selection = ($session.CurrentSelectionBuffer()).Contents
 $botPlane = $selection[0].SelItem.Id
 
-# Build one giant command string for all curves
-$allCommands = ""
-
 $totalCurves = $curves.Count
+$curveIndex = 0
 foreach ($item in $curves)
 {
-    # Add commands for this curve to the master string
-    $allCommands += "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+    $curveIndex++
+    $pct = [Math]::Floor(($curveIndex / $totalCurves) * 100)
+    Show-Progress $pct "Surface $curveIndex/$totalCurves"
+
+    $extrudeSurface = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
         "~ Command ``ProCmdMdlTreeSearch``;" +
         "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;" +
         "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;" +
@@ -215,15 +257,16 @@ foreach ($item in $curves)
         "~ Activate ``selspecdlg0`` ``CancelButton``;" +
         "~ Select ``main_dlg_cur`` ``maindashInst0.solid_surf_rg`` 1 ``Surface``;" +
         "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-}
 
-# Execute all commands as a single RunMacro call
-Write-Host "Executing macro for $totalCurves surface extrusions..."
-try {
-    $session.RunMacro($allCommands)
-} catch {
-    Write-Host "Error during execution: $_" -ForegroundColor Red
+    try {
+        $stamp = $model.VersionStamp
+        $session.RunMacro($extrudeSurface)
+        Wait-ModelModified -Model $model -PreviousStamp $stamp
+    } catch {
+        Write-Host "  Error on curve ${curveIndex}: $_" -ForegroundColor Red
+    }
 }
+Show-Progress 100 "Extrusion complete"
 
 } finally {
     try {

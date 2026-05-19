@@ -20,10 +20,43 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
+
+function Wait-ModelModified {
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            if ($Model.VersionStamp -ne $PreviousStamp) { return }
+        } catch {}
+        Start-Sleep -Milliseconds 50
+    }
+    Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
+}
+
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "  ████████╗██╗  ██╗██╗ ██████╗██╗  ██╗███████╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ╚══██╔══╝██║  ██║██║██╔════╝██║ ██╔╝██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "     ██║   ███████║██║██║     █████╔╝ █████╗  ██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "     ██║   ██╔══██║██║██║     ██╔═██╗ ██╔══╝  ██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "     ██║   ██║  ██║██║╚██████╗██║  ██╗███████╗██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "     ╚═╝   ╚═╝  ╚═╝╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Surface Quilt Thickening" -ForegroundColor White
+Write-Host ""
+
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Part open in Creo with surface quilts" -ForegroundColor White
+Write-Host "    2. Do not interact with Creo during processing" -ForegroundColor White
+Write-Host ""
 
 <#
 .SYNOPSIS
@@ -137,7 +170,9 @@ $selection = ($session.CurrentSelectionBuffer()).Contents
 # Prompt the user if selection was empty
 if ($selection -eq $null)
 {
-    Read-Host -Prompt "Select quilts to be thickened, return to this window, and press enter"
+    Write-Host "  Select quilts to thicken in Creo," -ForegroundColor White
+    Write-Host "  then press ENTER here." -ForegroundColor White
+    Read-Host
     $selection = ($session.CurrentSelectionBuffer()).Contents
 }
 
@@ -160,7 +195,9 @@ $thickenSubMacro = "~ Command ``ProCmdFtThicken``;" +
     "~ Activate ``main_dlg_cur`` ``maindashInst0.Thickness``;" +
     "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
     "~ Activate ``body_page.0.0`` ``PH.bodyusechkbtnrepwdg`` 1;" +
-    "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+    "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;" +
+    "~ Activate ``main_dlg_cur`` ``buffer_clean``;"
+
 
 # Loop through quilts with progress reporting
 $totalQuilts = $quilts.Count
@@ -169,9 +206,8 @@ foreach ($item in $quilts)
 {
     $quiltIndex++
     $pct = [Math]::Floor(($quiltIndex / $totalQuilts) * 100)
-    Show-Progress $pct "Thickening quilt ${quiltIndex}/${totalQuilts}"
+    Show-Progress $pct "Quilt $quiltIndex/$totalQuilts"
 
-    # Step 1: Select quilt by ID
     try {
         $selectQuilt = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
             "~ Command ``ProCmdMdlTreeSearch``;" +
@@ -184,13 +220,9 @@ foreach ($item in $quilts)
             "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
             "~ Activate ``selspecdlg0`` ``CancelButton``;"
 
-        $session.RunMacro($selectQuilt)
-        Start-Sleep -Milliseconds 200
-    } catch {}
-
-    # Step 2: Execute thicken operation
-    try {
-        $session.RunMacro($thickenSubMacro)
+        $stamp = $model.VersionStamp
+        $session.RunMacro($selectQuilt + $thickenSubMacro)
+        Wait-ModelModified -Model $model -PreviousStamp $stamp
     } catch {}
 }
 Show-Progress 100 "Thicken complete"

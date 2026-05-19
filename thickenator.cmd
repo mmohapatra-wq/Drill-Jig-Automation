@@ -26,7 +26,7 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
@@ -42,6 +42,27 @@ function Wait-ModelModified {
     }
     Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
 }
+
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "  ████████╗██╗  ██╗██╗ ██████╗██╗  ██╗███████╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ╚══██╔══╝██║  ██║██║██╔════╝██║ ██╔╝██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "     ██║   ███████║██║██║     █████╔╝ █████╗  ██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "     ██║   ██╔══██║██║██║     ██╔═██╗ ██╔══╝  ██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "     ██║   ██║  ██║██║╚██████╗██║  ██╗███████╗██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "     ╚═╝   ╚═╝  ╚═╝╚═╝ ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Surface Quilt Thickening" -ForegroundColor White
+Write-Host ""
+
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Part open in Creo with surface quilts" -ForegroundColor White
+Write-Host "    2. Do not interact with Creo during processing" -ForegroundColor White
+Write-Host ""
 
 <#
 .SYNOPSIS
@@ -155,7 +176,9 @@ $selection = ($session.CurrentSelectionBuffer()).Contents
 # Prompt the user if selection was empty
 if ($selection -eq $null)
 {
-    Read-Host -Prompt "Select quilts to be thickened, return to this window, and press enter"
+    Write-Host "  Select quilts to thicken in Creo," -ForegroundColor White
+    Write-Host "  then press ENTER here." -ForegroundColor White
+    Read-Host
     $selection = ($session.CurrentSelectionBuffer()).Contents
 }
 
@@ -189,7 +212,7 @@ foreach ($item in $quilts)
 {
     $quiltIndex++
     $pct = [Math]::Floor(($quiltIndex / $totalQuilts) * 100)
-    Show-Progress $pct "Thickening quilt ${quiltIndex}/${totalQuilts}"
+    Show-Progress $pct "Quilt $quiltIndex/$totalQuilts"
 
     try {
         $selectQuilt = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +

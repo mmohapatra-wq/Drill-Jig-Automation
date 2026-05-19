@@ -26,10 +26,31 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
+
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "  ███████╗██╗     ██╗██████╗ ███████╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ██╔════╝██║     ██║██╔══██╗██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "  █████╗  ██║     ██║██████╔╝█████╗  ██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "  ██╔══╝  ██║     ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "  ██║     ███████╗██║██║     ███████╗██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "  ╚═╝     ╚══════╝╚═╝╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Body Flip Automation" -ForegroundColor White
+Write-Host ""
+
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Part open in Creo with solid bodies" -ForegroundColor White
+Write-Host "    2. Do not interact with Creo during processing" -ForegroundColor White
+Write-Host ""
 
 <#
 .SYNOPSIS
@@ -135,7 +156,9 @@ $selection = ($session.CurrentSelectionBuffer()).Contents
 # Prompt the user if selection was empty
 if ($selection -eq $null)
 {
-    Read-Host -Prompt "Select bodies to be flipped, return to this window, and press enter"
+    Write-Host "  Select bodies to flip in Creo," -ForegroundColor White
+    Write-Host "  then press ENTER here." -ForegroundColor White
+    Read-Host
     $selection = ($session.CurrentSelectionBuffer()).Contents
 }
 
@@ -162,7 +185,7 @@ foreach ($item in $featIds)
 {
     $featureIndex++
     $pct = [Math]::Floor(($featureIndex / $totalFeatures) * 100)
-    Show-Progress $pct "Flipping body ${featureIndex}/${totalFeatures}"
+    Show-Progress $pct "Body $featureIndex/$totalFeatures"
 
     # Select feature by ID and execute flip
     $selectAndFlip = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +

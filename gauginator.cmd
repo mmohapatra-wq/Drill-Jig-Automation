@@ -7,15 +7,27 @@ exit /b %errorlevel%
 
 $Host.UI.RawUI.WindowTitle = "GAUGINATOR"
 
-# This location on the network drive
-# \\blueorigin\fs\ProEAdmin\Creo_Developer\vbs\playMacro\
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "   ██████╗  █████╗ ██╗   ██╗ ██████╗ ██╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ██╔════╝ ██╔══██╗██║   ██║██╔════╝ ██║████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "  ██║  ███╗███████║██║   ██║██║  ███╗██║██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "  ██║   ██║██╔══██║██║   ██║██║   ██║██║██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "  ╚██████╔╝██║  ██║╚██████╔╝╚██████╔╝██║██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "   ╚═════╝ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Dimension Extraction to CSV" -ForegroundColor White
+Write-Host ""
 
-# Visual Studio Code
-# https://code.visualstudio.com/
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Part open in Creo with solid features" -ForegroundColor White
+Write-Host ""
 
-# VB API Documentation
-# C:/PTC/Creo 6.0.4.0/Common Files/vbapi/vbapidoc/index.html
-# https://wiki.blueorigin.com/x/mAHdB
+Write-Host "  Connecting to Creo..." -ForegroundColor White
 
 # Set environment variables before connecting in
 try {
@@ -57,6 +69,7 @@ catch {
 
 # $session.SetConfigOption("regen_failure_handling", "resolve_mode")
 $model = $session.GetActiveModel()
+Write-Host "  Connected: $($model.FileName)" -ForegroundColor Green
 
 $origVisibleMapkeys = $null
 $origDynamicPreview = $null
@@ -94,6 +107,8 @@ $bodies = $model.listitems($pfcModelItemType.ITEM_body)    #lists bodies within 
 
 #Initiate Array
 $dimension_Array=@()
+
+Write-Host "  Analyzing model..." -ForegroundColor White
 
 #Iterate through and collect dimensions of solid $feobjects
 foreach ($item in $bodies)
@@ -136,6 +151,7 @@ foreach ($item in $bodies)
 
 # Export data to CSV format
 $dimension_array | Export-Csv -Path ".\$filename.csv" -NoTypeInformation
+Write-Host "  Exported: $filename.csv" -ForegroundColor Green
 
 } finally {
     try {
@@ -144,3 +160,7 @@ $dimension_array | Export-Csv -Path ".\$filename.csv" -NoTypeInformation
     } catch {}
     $connection.Disconnect($null)
 }
+
+Write-Host ""
+Write-Host "  Press any key to exit..." -ForegroundColor White
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

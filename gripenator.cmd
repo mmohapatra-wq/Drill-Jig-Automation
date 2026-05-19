@@ -26,10 +26,32 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
+
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "   ██████╗ ██████╗ ██╗██████╗ ███████╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ██╔════╝ ██╔══██╗██║██╔══██╗██╔════╝████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "  ██║  ███╗██████╔╝██║██████╔╝█████╗  ██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "  ██║   ██║██╔══██╗██║██╔═══╝ ██╔══╝  ██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "  ╚██████╔╝██║  ██║██║██║     ███████╗██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "   ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Fastener Management" -ForegroundColor White
+Write-Host ""
+
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Assembly open in Creo" -ForegroundColor White
+Write-Host "    2. Valid HST fasteners present (HST12/13/54/59)" -ForegroundColor White
+Write-Host "    3. Always exit using the 'E' command" -ForegroundColor White
+Write-Host ""
 
 <#
 .SYNOPSIS
@@ -520,11 +542,6 @@ function Invoke-GroundingFunction {
 # MAIN MENU LOOP
 #================================================================
 
-
-Write-Host ("=" * 50) -ForegroundColor Green
-Write-Host "GRIPENATOR - Fastener Management Tool" -ForegroundColor Green
-Write-Host ("=" * 50) -ForegroundColor Green
-
 $origVisibleMapkeys = $null
 $origDynamicPreview = $null
 try {
@@ -581,3 +598,7 @@ finally {
         Write-Host "Warning: Could not properly disconnect: $_" -ForegroundColor Yellow
     }
 }
+
+Write-Host ""
+Write-Host "  Press any key to exit..." -ForegroundColor White
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

@@ -20,10 +20,44 @@ function Show-Progress {
     $empty = 20 - $filled
     $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
     $color = if ($Pct -ge 100) { "Green" } else { "White" }
-    $shortLabel = if ($Label.Length -gt 60) { $Label.Substring(0, 60) } else { $Label }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
     Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
     if ($Pct -ge 100) { Write-Host "" }
 }
+
+function Wait-ModelModified {
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try {
+            if ($Model.VersionStamp -ne $PreviousStamp) { return }
+        } catch {}
+    }
+    Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
+}
+
+# ============================================
+# HEADER
+# ============================================
+Write-Host ""
+Write-Host "  ███╗   ██╗ ██████╗ ██████╗ ███████╗██╗      █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor White
+Write-Host "  ████╗  ██║██╔═══██╗██╔══██╗██╔════╝██║     ██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor White
+Write-Host "  ██╔██╗ ██║██║   ██║██║  ██║█████╗  ██║     ███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor White
+Write-Host "  ██║╚██╗██║██║   ██║██║  ██║██╔══╝  ██║     ██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor White
+Write-Host "  ██║ ╚████║╚██████╔╝██████╔╝███████╗███████╗██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor White
+Write-Host "  ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor White
+Write-Host "  Node Feature Duplication" -ForegroundColor White
+Write-Host ""
+
+# ============================================
+# PREREQUISITES
+# ============================================
+Write-Host "  Prerequisites:" -ForegroundColor Green
+Write-Host "    1. Part open in Creo" -ForegroundColor White
+Write-Host "    2. Example node feature created (extrude that creates new body)" -ForegroundColor White
+Write-Host "    3. Datum points placed at target node locations" -ForegroundColor White
+Write-Host "    4. Do not interact with Creo during processing" -ForegroundColor White
+Write-Host ""
 
 <#
 .SYNOPSIS
@@ -135,18 +169,18 @@ $node = ($session.CurrentSelectionBuffer()).Contents
 # Prompt the user if selection was empty - provide clear prerequisites
 if ($node -eq $null)
 {
-    Write-Output "PREREQUISITES:"
-    Write-Output "1. Create an example node feature (extrude that creates new body)"
-    Write-Output "2. Create datum points at desired node locations"
-    Write-Output "3. Select the example node feature when prompted"
-    Read-Host -Prompt "Select feature of the example node, return to this window, and press enter"
+    Write-Host "  Select the example node feature in Creo," -ForegroundColor White
+    Write-Host "  then press ENTER here." -ForegroundColor White
+    Read-Host
     $node = ($session.CurrentSelectionBuffer()).Contents
 }
 # Extract the node feature ID for copying
 $nodeID = $node[0].SelItem.Id
 
 # Collect target datum point locations
-Read-Host -Prompt "Select the datum points for the nodes, return to this window, and press enter"
+Write-Host "  Select datum points for nodes in Creo," -ForegroundColor White
+Write-Host "  then press ENTER here." -ForegroundColor White
+Read-Host
 $points = ($session.CurrentSelectionBuffer()).Contents
 
 # Extract datum point IDs from selection
@@ -178,7 +212,7 @@ foreach ($item in $pointIDs)
 {
     $pointIndex++
     $pct = [Math]::Floor(($pointIndex / $totalPoints) * 100)
-    Show-Progress $pct "Pasting node ${pointIndex}/${totalPoints}"
+    Show-Progress $pct "Node $pointIndex/$totalPoints"
 
     # Paste node at datum point with by-reference assembly operations
     $pasteAtPoint = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
@@ -207,11 +241,12 @@ foreach ($item in $pointIDs)
         "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
 
     try {
+        $stamp = $model.VersionStamp
         $session.RunMacro($pasteAtPoint)
-        Start-Sleep -Milliseconds 200
+        Wait-ModelModified -Model $model -PreviousStamp $stamp
     } catch {}
 }
-Show-Progress 100 "Node duplication complete"
+Show-Progress 100 "Nodes complete"
 
 } finally {
     try {
