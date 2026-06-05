@@ -1,84 +1,47 @@
-# NGS Orthogrid Automation
+# Drill Jig Automation
 
-A collection of PowerShell automation tools that leverage the Creo Parametric VB API to automate complex modeling operations. These tools enable advanced Creo automation without requiring additional software licenses beyond standard Creo Parametric.
+Automation tooling that leverages the Creo Parametric VB API to **generate drill jigs** — locating geometry, bushing placements, and jig plates — directly from a part's hole pattern, without requiring software licenses beyond standard Creo Parametric.
 
-## Overview
+## Goal
 
-This repository contains specialized automation tools designed for orthogrid and structural modeling workflows in Creo Parametric. All tools are packaged as single-file .cmd executables that embed PowerShell code for ease of use. Tools use the Creo VB API COM interface to gather user selections and model data, then execute operations through direct RunMacro commands to perform complex operations that would be tedious to do manually.
+The objective of this repository is to automate the creation of drill jig tooling in Creo Parametric. Given a part or its hole pattern, the target workflow is to:
 
-**Note:** All tools now use the .cmd format (hybrid batch/PowerShell) for simplified execution. Legacy .ps1 source files are archived in the `ps1 archive/` folder for reference.
+1. Read hole locations and diameters from the source model
+2. Build the jig body / plate geometry
+3. Place locating features and drill bushings at each hole
+4. Produce a jig model ready for downstream manufacturing
 
-## Tools
+The work builds on a proven set of Creo automation techniques (see **Baseline** below) that already demonstrate every primitive the jig workflow needs: capturing user selections, reading and writing model data through the VB API, and driving feature creation through scripted Creo commands.
 
-### 1. Flipenator ([flipenator.cmd](flipenator.cmd))
-**Purpose:** Batch flip/mirror operations for selected geometric bodies
+## Approach
 
-- Prompts user to select multiple solid bodies in Creo
-- Iterates through each selected body and applies Creo's built-in Flip feature
-- Useful for creating mirrored components in orthogrid structures
+All tooling is packaged as single-file `.cmd` executables that embed PowerShell. Each script connects to a live Creo session over the VB API COM interface (`pfcls`), uses the API to gather selections and model data, then executes operations through direct `RunMacro` commands. This means complex, repetitive modeling operations can be performed reliably and at scale, with no add-on licenses required.
 
-**Usage:** Double-click `flipenator.cmd` and select bodies to flip in Creo
+Two complementary techniques are used throughout:
 
-### 2. Nodelator ([nodelator.cmd](nodelator.cmd))
-**Purpose:** Duplicate node features at multiple datum point locations
+- **Programmatic (VB API)** — reads and writes Creo data directly without touching the UI. Stable across Creo versions. Used for data extraction and geometry traversal (e.g. enumerating bodies, surfaces, edges, dimensions, and mass properties).
+- **Mapkeys** — drives the Creo UI by replaying recorded command and widget interactions. Used for feature creation (rounds, extrudes, thickens, flips). More version-sensitive, but able to create geometry the API alone cannot.
 
-- Requires pre-existing "example node" feature (typically an extruded solid body)
-- User selects the example feature, then multiple datum points
-- Copies the node feature to each datum point location using Creo's Paste Special with by-reference assembly operations
-- Essential for creating node patterns in orthogrid structures
+## Baseline — Proven Techniques (Proof of Concept)
 
-**Usage:** Create an example node feature, double-click `nodelator.cmd`, select the example and target datum points
+The tools below were developed for orthogrid and structural modeling workflows. They are included here as a **proof of concept and a reusable foundation**: each one demonstrates a capability the drill jig automation depends on. Rather than full end-user docs, the focus here is on *what technique each tool proves out*.
 
-### 3. Surfenator ([surfenator.cmd](surfenator.cmd))
-**Purpose:** Create surfaces by extruding 3D curves between datum planes
+| Tool | Proves out | Relevance to drill jig automation |
+|------|-----------|-----------------------------------|
+| **[gauginator.cmd](gauginator.cmd)** | Whole-model traversal + data extraction to CSV — enumerate every body, read all dimensions (name/type/value), capture center-of-gravity mass properties | Reading hole locations, diameters, and reference geometry out of a source part |
+| **[nodelator.cmd](nodelator.cmd)** | Copying a feature to many datum-point locations via Paste-Special **by reference**, rerouting each placement reference | Placing a bushing / locator feature at every hole in a pattern |
+| **[surfenator.cmd](surfenator.cmd)** | Programmatic feature creation between datum planes — projecting curves and driving extrudes with plane-based depth | Building jig plate / body geometry constrained to reference planes |
+| **[thickenator.cmd](thickenator.cmd)** | Mapkey-driven feature creation with parameter input (thicken quilt → solid, with direction and body options) | Turning surface geometry into solid jig bodies |
+| **[flipenator.cmd](flipenator.cmd)** | Batch selection capture (body ID vs. feature ID) and per-feature redefine operations | Bulk operations across many jig features |
+| **[radinator.cmd](radinator.cmd)** | Pure-VB-API geometry filtering (edge length, curve type, adjacent-surface analysis) feeding batched mapkey feature creation | Identifying and operating on specific edges/holes by geometric criteria |
+| **[gripenator.cmd](gripenator.cmd)** | Interactive part-number filtering and component replacement in an assembly via regex matching | Selecting and swapping standardized hardware (bushings, fasteners) by part number |
 
-- Collects user-selected 3D curves and three datum planes (midplane, top plane, bottom plane)
-- For each curve: projects it onto the midplane, creates extrude feature extending from top to bottom plane
-- Handles plane-based depth constraints and offset calculations
-- Generates the surface structure between orthogrid planes
+Two additional development tools demonstrate the dimension read/write loop that exact-geometry jig generation requires:
 
-**Usage:** Create 3D curves and datum planes, double-click `surfenator.cmd`, select curves and planes as prompted
+- **[diminator.cmd](diminator.cmd)** — reads a CSV of dimensions back **into** a model, with a 2-pass verify/repair loop that handles the difference between feature-level dims (write sticks immediately) and sketch dims (require a sketch-open regen to persist).
+- **[boxinator.cmd](boxinator.cmd)** — creates a rectangular solid to exact width/height/depth, capturing each sketch dimension at placement and verifying every value stuck before reporting success. Proves out reliable, *verified* parametric geometry creation end to end.
 
-### 4. Thickenator ([thickenator.cmd](thickenator.cmd))
-**Purpose:** Apply consistent thickness to multiple surface quilts
-
-- Prompts user to select multiple quilt surfaces
-- Applies consistent thickness (0.1 units) to each selected quilt
-- Includes options for thickness direction and body creation
-- Converts surface quilts to solid bodies for structural analysis
-
-**Usage:** Create surface quilts, double-click `thickenator.cmd`, select quilts to thicken
-
-### 5. Gauginator ([gauginator.cmd](gauginator.cmd))
-**Purpose:** Extract geometric dimensions and properties from all solid bodies in the active model
-
-- Analyzes all solid bodies in the current Creo model automatically (no user selection required)
-- Extracts dimensional information from each body's feature parameters
-- Captures mass properties including center of gravity coordinates
-- Exports  data to CSV format for analysis and reporting
-
-**Key Data Extracted:**
-- Body ID for model reference
-- Dimension types (Linear, Radial, Diameter, Angular)
-- Dimension names and values from feature parameters
-- Center of gravity coordinates (X, Y, Z) relative to default coordinate system
-
-**Usage:** Double-click `gauginator.cmd` with your model open - no selections needed. CSV file will be created in the script directory with filename based on the active model name.
-
-**Output:** `[ModelName]_dimensions.csv` containing tabular data suitable for spreadsheet analysis
-
-### 6. Gripenator ([gripenator.cmd](gripenator.cmd))
-**Purpose:** Streamlines management of hi-lite fasteners
-- Filter: Isolate valid HST fasteners (HST12, HST13, HST54, HST59) from a mixed selection
-- Change: Modify fastener diameter and/or grip length, with automatic nut diameter updates
-- Grounding: Convert fastener coatings to GD (grounding) variant across multiple fastener families
-
-**SUPPORTED PART NUMBERS:**
-Fasteners: HST{12|13|54|59}
-Collars: HST1078
-
-**CAUTION:** Always exit using the "E" command. Closing the terminal directly will leave orphaned Creo COM connections and interfer with future sessions.
-
+Together these establish that the full jig pipeline — **read source data → create geometry → place repeated features → verify dimensions** — is achievable with this toolchain.
 
 ## Requirements
 
@@ -88,68 +51,48 @@ Collars: HST1078
 - **Active Creo session** running before script execution
 
 ### Creo VB API Setup
-The scripts automatically handle VB API connection, but ensure:
-- Creo VB API COM components are registered (happens during Creo installation)
-- No additional Creo licenses required beyond standard Parametric license
-- User must have appropriate Creo modeling rights for the operations being performed
+The scripts handle the VB API connection automatically, but ensure:
+- Creo VB API COM components are registered (normally done during Creo installation; first run will attempt registration via `vb_api_register.bat`)
+- No additional Creo licenses required beyond standard Parametric
+- The user has appropriate Creo modeling rights for the operations being performed
 
-## Usage Instructions
+## Usage
 
 ### Execution (Simple Double-Click)
-All tools are now packaged as single-file .cmd executables:
-- Double-click the desired `.cmd` file (e.g., `flipenator.cmd`, `gauginator.cmd`)
-- Follow the prompts in the PowerShell window
-- Switch to Creo when prompted to make selections
-- Return to PowerShell window to continue
+All tools are packaged as single-file `.cmd` executables:
 
-**Available Tools:**
-- `flipenator.cmd` - Flip/mirror operations
-- `gauginator.cmd` - Extract dimensions to CSV
-- `gripenator.cmd` - Fastener management (interactive menu)
-- `nodelator.cmd` - Duplicate node features
-- `radinator.cmd` - Node-to-stiffener radius automation
-- `surfenator.cmd` - Surface extrusion from curves
-- `thickenator.cmd` - Thicken surface quilts
-
-### General Workflow
 1. **Open Creo** and load your model
-2. **Double-click** the desired .cmd file
-3. **Follow prompts** to select geometry in Creo
-4. **Wait for completion** - script will execute operations automatically
-5. **Review results** in Creo model
+2. **Double-click** the desired `.cmd` file
+3. **Follow the prompts** in the PowerShell window
+4. **Switch to Creo** when prompted to make selections, then return to the PowerShell window to continue
+5. **Review results** in the Creo model
 
 ### Legacy Source Files
-Original .ps1 source files are preserved in the `ps1 archive/` folder for reference and version control purposes. The .cmd files are self-contained and do not require the .ps1 files to run.
-
+Original `.ps1` source files are preserved in the `ps1 archive/` folder for reference. The `.cmd` files are self-contained and do not require the `.ps1` files to run.
 
 ## Troubleshooting
 
-### Common Issues
-
 **"Cannot find Creo process"**
-- Ensure Creo Parametric is running before executing scripts
-- Only one Creo process should be active
-- Try restarting Creo if connection fails
+- Ensure Creo Parametric is running before executing a script
+- Only one Creo process should be active; restart Creo if the connection fails
 
 **"VB API registration error"**
 - VB API COM components may need re-registration
-- Run Creo installation repair, or contact IT for COM registration
-
-**"Access denied to working folder"**
-- Ensure `C:\Users\[username]\working_folder\` exists and is writable
-- Check Windows permissions for the folder
+- Run a Creo installation repair, or contact IT for COM registration
 
 **Script hangs during execution**
-- Switch to Creo window - script may be waiting for user selection
-- Check PowerShell window for prompts
-- Ensure model is in appropriate mode (Part/Assembly as required)
+- Switch to the Creo window — the script may be waiting for a selection
+- Check the PowerShell window for prompts
+- Ensure the model is in the appropriate mode (Part / Assembly as required)
+
+**Mapkey-driven step stopped working after a Creo upgrade**
+- Widget names can change between Creo versions. Set `visible_mapkeys yes` in `config.pro` to inspect the current widget names and update the affected mapkey.
 
 ### Getting Help
-- Review script output in PowerShell window for specific error messages
-- Check Creo message log for additional error details
-- Ensure all prerequisite geometry exists before running scripts
-- Try running scripts on simple test geometry first
-
+- Review the PowerShell window output for specific error messages
+- Check the Creo message log for additional detail
+- Ensure all prerequisite geometry exists before running a script
+- Try a script on simple test geometry first
 
 ## License
 
@@ -157,5 +100,6 @@ Internal Blue Origin toolset. See company policies for usage and distribution gu
 
 ## Authors
 
-- **Kyle Brooker** - Initial development and orthogrid automation workflows
-- **Ethan Iglehart** - Gauginator development
+- **M. Mohapatra** — Drill jig automation
+- **Kyle Brooker** — Baseline orthogrid automation workflows (proof of concept)
+- **Ethan Iglehart** — Gauginator development (proof of concept)
