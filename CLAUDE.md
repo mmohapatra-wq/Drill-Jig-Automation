@@ -36,9 +36,20 @@ Two distinct approaches used across the toolkit:
 - `$dim.DimValue` — read/write double. **Write only sticks for feature-level (extrude/depth) dims when sketch is closed.** For sketch dims it accepts the write in-memory but Creo discards it on regen.
 - `$dim.DimType` — 0=Linear, 1=Radial, 2=Diameter, 3=Angular
 - `$model.GetItemByName(ITEM_DIMENSION, name)` — look up a dim by symbol name
-- `$model.Regenerate($null)` — regenerates the part
+- `$model.Regenerate($null)` — **automatic (incremental)** regen. Can leave a freshly-written feature dim unpropagated — the symptom being a box whose new depth only updates after a manual edit/reopen of the feature's sketch.
+- **Forced regen** — to make a `DimValue` write take effect immediately, pass a `RegenInstructions` object instead of `$null`:
+  ```powershell
+  $regenCls = New-Object -ComObject pfcls.pfcRegenInstructions   # CLASS object (holds static Create factory)
+  $instr    = $regenCls.Create($false, $true, $null)             # Create(AllowFixUI, ForceRegen, FromFeat)
+  $model.Regenerate($instr)
+  ```
+  - **ProgID is `pfcls.pfcRegenInstructions`, NOT `pfcls.CCpfcRegenInstructions`.** The latter is unregistered — `New-Object` on it throws `0x80040154 REGDB_E_CLASSNOTREG` (all-zeros CLSID). The docs name the factory `CCpfcRegenInstructions.Create()`, but the COM projection lives as the static `Create` method on the `pfcRegenInstructions` class object. The `CC*` factory names are a general gotcha — they are never standalone ProgIDs.
+  - `Create()` returns the instance; its 8 settable properties are `AllowFixUI, ForceRegen, FromFeat, RefreshModelTree, ResolveModeRegen, ResumeExcludedComponents, UpdateAssemblyOnly, UpdateInstances` (confirmed by COM member inspection). These do NOT exist on the class object — only on the `Create()` return value.
+  - `Regenerate(<non-null instr>)` throws `IpfcXToolkitBadContext` if Creo runs in **No-Resolve mode** (the default in Creo Elements/Pro). Always wrap forced regen in try/catch and fall back to `$model.Regenerate($null)`.
+  - **Do NOT try to enable the forced path via `regen_failure_handling = resolve_mode`.** That config option is **deprecated** on current Creo builds — calling `SetConfigOption` on it pops a blocking *"to use a deprecated config option you will need to supply an authorization code with allow deprecated config (CS260154)"* dialog that stalls the entire automation run. There is no programmatic way to dismiss it. Accept the automatic-regen fallback instead, and make feature dims reliable by writing the feature-level `DimValue` directly (it sticks on a closed sketch regardless of regen mode).
 - `$session.GetActiveModel()` — returns the **sketch model** when a sketch is open, the part model otherwise
 - `$sketchModel.Regenerate($null)` — solves the sketch in place and marks it dirty (required before closing sketch for changes to propagate)
+- `$solid.EvalOutline($null, $null)` → `IpfcOutline3D`, a 2-element sequence of corner `Point3D`s (min, max). The three axis extents (|Δx|, |Δy|, |Δz|) ARE the solid's real width/height/depth — independent of any dimension symbol. `$solid.GetOutline()` is the regeneration-outline fallback. Point3D components read via `$p[0..2]` bracket indexing (confirmed) or `.Item(i)`.
 
 ## VB API Documentation
 When writing or debugging Creo VB API code, consult the vb-docs MCP server
@@ -246,21 +257,28 @@ Thicken mapkey (confirmed working):
 ```
 
 ### boxinator.cmd
-Creates a rectangular extruded solid with exact width/height/depth. The inline `mod_dim_emb` (sketch) and `GrmTextTagEmbedMRU` (depth) writes create the geometry; a unified 2-pass verify/repair (mirrors diminator) is layered on top so a no-op'd mapkey can never report success on a wrong-sized box.
+Creates a rectangular extruded solid with exact width/height/depth. The mapkey writes (`mod_dim_emb` for the sketch, the authoritative depth `DimValue` for the feature) create the geometry; verification is **geometric** — the script measures the finished solid with `EvalOutline` and asserts the three real extents equal the three requested sizes. No dimension symbols are captured or bound.
+
+**Why geometric, not symbol-based:** the original script tried to prove correctness by capturing each sketch dim's `Symbol` (`d0`, `d1`, …) from the selection buffer at placement time, then re-asserting those symbols. That binding was never reliable — no VB API property distinguishes the width edge from the height edge (`DimType` is Linear for both; `ListSubItems` order is Creo-internal), so it could silently verify the wrong dim. `EvalOutline` sidesteps the whole problem: it returns the solid's true min/max corners, and the sorted extents ARE the box size regardless of which axis the sketch mapped width/height onto.
 
 **Flow:**
-1. User inputs width, height, depth
-2. User selects sketch plane → script selects it by ID (tree search) → opens sketcher → activates center-rectangle tool
-3. User draws a rough rectangle (2 clicks)
-4. **Capture at placement:** user dimensions WIDTH then HEIGHT in fixed order; after each placement the script reads the selection buffer to bind that dim's `Symbol` into a `$dimPlan` entry. `mod_dim_emb` write remains the primary set.
-5. Exit sketcher → `ProCmdFtExtrude` with `GrmTextTagEmbedMRU` depth. Depth dim located via a before/after `ListFeaturesByType(FEATTYPE_PROTRUSION)` ID diff (lone Linear `ListSubItems` dim), recorded into `$dimPlan` as a feature dim.
-6. **Pass 1:** assert every captured symbol via `DimValue` + `$model.Regenerate($null)` + readback. Sticks → OK; snaps back → collected for repair.
-7. **Pass 2 (sketch dims only):** prompt user to open the sketch, `$session.GetActiveModel()` → set `DimValue` on sketch model → `$sketchModel.Regenerate($null)` while open → prompt close → `$model.Regenerate($null)` → reread to confirm (REPAIRED / FAILED).
-8. Report per-role OK / REPAIRED / FAILED / UNVERIFIED; counts mapkey failures; green "Done" only if all dims confirmed, else a yellow "NOT fully confirmed" warning.
+1. User inputs width, height, depth.
+2. Script opens the Sketch tool (`ProCmdDatumSketCurve`) → user clicks the plane on screen while the dialog is open (a real pick is what populates the dialog's plane MRU) → presses ENTER → script fires `t1.PlnMru`/`t1.RefMru` + `stdbtn_1` to enter the sketcher → activates center-rectangle tool. **A `RunMacro` string runs atomically and cannot pause mid-sequence for a human pick, so the open is split into two macros around the user's plane click.**
+3. User draws a rough rectangle (2 clicks), presses ENTER.
+4. Script writes WIDTH then HEIGHT via `mod_dim_emb` (fixed pick order — the user dimensions a horizontal then a vertical edge between prompts).
+5. Exit sketcher (`ProCmdSketDone`) → `ProCmdFtExtrude` → `GrmTextTagEmbedMRU` depth → `dashInst0.Done`. User presses ENTER once the dashboard has closed.
+6. **Authoritative depth:** the dashboard depth field has produced wrong values, so the script finds the new protrusion feature (before/after `ListFeaturesByType(FEATTYPE_PROTRUSION)` ID diff), dumps all its dims, identifies the depth dim by elimination (the Linear dim matching neither width nor height), sets it via `DimValue`, and **forces a regen** (`Invoke-ForceRegen`) so the change propagates without a manual sketch reopen.
+7. **Geometric verify:** `Measure-BoxExtents` calls `EvalOutline`, sorts the three measured extents descending, compares to the sorted `{width,height,depth}` target within tol `1e-4`. PASS only if all three match.
+8. **Repair (only on mismatch):** depth mismatch is reported (not re-driven — it was already set authoritatively). Width/height mismatch offers a **y/n-gated** guided sketch repair: user opens the sketch, script maps each sketch dim to a target by nearest current value (geometric, not pick-order), writes `DimValue`, `$sketchModel.Regenerate($null)` while open, user closes, `$model.Regenerate($null)`, then **re-measures with EvalOutline** to confirm REPAIRED/STILL MISMATCHED.
+9. Final report: green "Done … (measured and confirmed)" only if EvalOutline matches AND `$script:macroFailures -eq 0`; else yellow "NOT confirmed" with measured-vs-requested extents.
 
 **Key facts:**
-- No VB API property distinguishes the width edge from the height edge — `DimType` is Linear for both and `ListSubItems` order is unreliable. Hence the fixed pick order + selection-buffer capture.
+- Verification is a real measurement of the solid (`EvalOutline`), not a symbol echo. `"Done (confirmed)"` is backed by geometry.
+- Sorting both the measured and requested triples means the script never needs to know which axis is width vs height — it asserts "the solid's three extents are W, H, D."
 - Center-rectangle sketch dims are FULL values (not halved).
-- Depth is a feature-level dim, so its `DimValue` write sticks in Pass 1; width/height are sketch dims and typically need the Pass 2 sketch-open repair.
+- Depth is a feature-level dim — its `DimValue` write sticks on a closed sketch; width/height are sketch dims that may snap back and need the gated sketch-open repair.
+- **Depth reliability comes from the direct feature `DimValue` write, not from regen mode.** After the extrude, the script finds the new feature (type-agnostic — see below), identifies its depth dim by elimination, and writes `DimValue = depth`; that write sticks on a closed sketch. `Invoke-ForceRegen` then *attempts* a forced regen but falls back to automatic regen on No-Resolve sessions. **Do not try to force resolve mode via `regen_failure_handling = resolve_mode` — it is deprecated and pops a blocking authorization dialog (CS260154) that stalls the run (see VB API Key Facts → Forced regen).**
+- **Type-agnostic feature lookup:** the new extrude is found by ID-diffing `ListFeaturesByType($FALSE)` (Type arg omitted) before/after the extrude — NOT filtered to `FEATTYPE_PROTRUSION`. A modern Creo extrude is not guaranteed to classify as PROTRUSION; filtering by type risked the new feature never being found, which silently skipped the authoritative-depth write and left depth at the unreliable dashboard value. `Get-AllFeatures` tries the single-arg call plus `$null`/`[Type]::Missing` fallbacks for the optional COM param.
+- The guided sketch repair is gated behind an explicit y/n prompt: auto-driving the sketch open/close + regenerate sequence once produced a fatal Creo traceback when the model was half-committed, so it never runs without the user confirming Creo is idle.
 
-**Current status:** 2-pass restructure applied and parses clean. The capture-at-placement selection-buffer step is **not yet confirmed against a live Creo session** — verify the buffer holds exactly the just-placed dim and `$item.Symbol` resolves; run with distinct W/H/D and deliberately swap edges to confirm the report flags a mismatch.
+**Current status:** Rebuilt around `EvalOutline` geometric verification (symbol-capture machinery removed). Parses clean. Live regressions found and fixed across several passes: (1) **sketch dialog came up with no plane** — the by-ID tree-search pre-select fed the selection buffer but not the dialog MRU; replaced with the confirmed split-macro flow (open Sketch tool → user clicks plane on screen → script enters sketcher). (2) **depth needed a manual reopen** — two independent causes addressed: the extrude was being missed by the `FEATTYPE_PROTRUSION` filter (now type-agnostic ID-diff), and depth is now made correct by the direct feature `DimValue` write rather than relying on regen mode. (3) **`regen_failure_handling = resolve_mode` removed** — it is deprecated on this Creo build and popped a blocking CS260154 authorization dialog that stalled the sketch step. Confirm live: sketch dialog populates after the plane click, the script prints `New extrude feature Id N` with a dim dump and sets the depth dim, depth propagates without a manual reopen, EvalOutline reports PASS, and a deliberate-mismatch negative test FAILS as expected.

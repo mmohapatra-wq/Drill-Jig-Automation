@@ -8,9 +8,22 @@ exit /b %errorlevel%
 $Host.UI.RawUI.WindowTitle = "BOXINATOR"
 $ErrorActionPreference = "Stop"
 
+# -probe / --probe: temporary diagnostic. Connect to the (single) live session and dump
+# GetConnectionId().ExternalRep so we can learn the string format ConnectById() expects.
+# This unblocks multi-session selection: once we know what ExternalRep looks like and
+# whether it embeds the xtop PID, we can build a session picker. Run with exactly ONE
+# Creo session open. Prints the rep and exits without touching the model.
+$ProbeMode = ($ScriptArgs -match '(?i)(^|\s)-{1,2}probe(\s|$)')
+
 trap {
     Write-Host ""
     Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    # Surface WHERE it threw — the bare exception message (e.g. XToolkitAmbiguous) names no
+    # line, which makes a direct-COM failure impossible to locate. Print the script line.
+    $inv = $_.InvocationInfo
+    if ($null -ne $inv) {
+        Write-Host ("  at line {0}: {1}" -f $inv.ScriptLineNumber, $inv.Line.Trim()) -ForegroundColor DarkYellow
+    }
     Write-Host ""
     Write-Host "  Press any key to exit..."
     $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -34,14 +47,39 @@ function Wait-ModelModified {
 $script:macroFailures = 0
 function Invoke-Macro {
     param([string]$Label, [string]$Macro)
-    Write-Host "    > $Label ..." -NoNewline -ForegroundColor DarkGray
+    if ($script:DebugMacros) {
+        # Announce on its own line BEFORE firing so that, if the macro hangs or diverges
+        # in Creo, we know exactly which step we were on. Also echo the raw macro string.
+        Write-Host ""
+        Write-Host "    > $Label" -ForegroundColor Cyan
+        Write-Host "      $Macro" -ForegroundColor DarkGray
+    } else {
+        Write-Host "    > $Label ..." -NoNewline -ForegroundColor DarkGray
+    }
     try {
         $session.RunMacro($Macro)
-        Write-Host " ok" -ForegroundColor DarkGray
+        if ($script:DebugMacros) { Write-Host "      -> ok" -ForegroundColor Green }
+        else { Write-Host " ok" -ForegroundColor DarkGray }
     } catch {
-        Write-Host " FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "      -> FAILED: $($_.Exception.Message)" -ForegroundColor Red
         $script:macroFailures++
     }
+}
+
+# Snapshot every dimension SYMBOL currently on the solid model, mapped to its value and
+# type. The extrude's new depth dim is identified by diffing this before vs. after the
+# extrude — ListFeaturesByType returned nothing on the live build, so we never look the new
+# feature up by Id. ListItems(ITEM_DIMENSION) is the proven Solid-model path that
+# gauginator and diminator already rely on. Returns a hashtable keyed by symbol.
+function Get-DimSymbols {
+    param($Model, $TypeObj)
+    $map = @{}
+    try {
+        foreach ($d in $Model.ListItems($TypeObj.ITEM_DIMENSION)) {
+            try { $map[$d.Symbol] = @{ Symbol = $d.Symbol; DimType = $d.DimType; DimValue = [double]$d.DimValue } } catch {}
+        }
+    } catch {}
+    return $map
 }
 
 # Read the three components of an IpfcPoint3D. The VB API exposes sequence members
@@ -51,36 +89,253 @@ function Get-PointXYZ {
     param($Point)
     try { return @([double]$Point[0], [double]$Point[1], [double]$Point[2]) } catch {}
     try { return @([double]$Point.Item(0), [double]$Point.Item(1), [double]$Point.Item(2)) } catch {}
-    throw "Could not read X/Y/Z from a Point3D object."
+    # Return $null rather than throwing — a measurement failure must degrade to "UNVERIFIED",
+    # not escape to the script trap and abort the whole run after the box is already built.
+    return $null
 }
 
-# Measure the active solid's true size via its regeneration outline. EvalOutline returns
-# an IpfcOutline3D — a 2-element sequence of corner Point3Ds (min, max). The three
-# axis extents ARE the box's real width/height/depth, with no dependence on which
-# dimension symbol is width vs height. Returns the three extents sorted descending,
-# or $null if the outline could not be read.
-function Measure-BoxExtents {
-    param($Solid)
-    $outline = $null
-    try { $outline = $Solid.EvalOutline($null, $null) } catch {}
-    if ($null -eq $outline) {
-        try { $outline = $Solid.GetOutline() } catch {}
+# Build an IpfcModelItemTypes sequence holding the datum item types we want EvalOutline to
+# ignore. Default datum planes/axes/csys are auto-sized slightly larger than the solid and,
+# if included, inflate every measured extent by a uniform amount (~0.0856 seen live). We
+# pass these as ExcludeTypes so the outline is the SOLID GEOMETRY only.
+#
+# NOTE on risk (unvalidated against a live session): a datum plane's geometry may register
+# as ITEM_SURFACE, which is ALSO the type of the solid's own faces. The +0.0856 inflation
+# comes from the DATUM PLANES, so ITEM_SURFACE is the only exclude type that could remove
+# it — but excluding it could also strip the box faces and collapse the outline. We attempt
+# the full exclude set (datum item types PLUS ITEM_SURFACE); Measure-BoxExtents then runs a
+# degenerate-outline guard: if excluding produced a collapsed box (any extent ~0), it falls
+# back to a plain no-exclude EvalOutline. In that fallback case the datum inflation remains,
+# but the 0.1 tolerance comfortably absorbs the ~0.0856 so verification still passes.
+function New-ExcludeTypes {
+    param($TypeObj)
+    $names = @("ITEM_AXIS", "ITEM_COORD_SYS", "ITEM_POINT", "ITEM_CURVE", "ITEM_SURFACE")
+    foreach ($ctor in @("pfcls.pfcModelItemTypes", "pfcls.pfcmodelitemtypes")) {
+        try {
+            $seq = New-Object -ComObject $ctor
+            foreach ($n in $names) {
+                $val = $null
+                try { $val = $TypeObj.$n } catch {}
+                if ($null -eq $val) { continue }
+                $added = $false
+                foreach ($m in @("Append", "Add", "Insert", "Set")) {
+                    try { $seq.$m($val) | Out-Null; $added = $true; break } catch {}
+                }
+                if (-not $added) { try { $seq.Item($seq.Count) = $val } catch {} }
+            }
+            if ($seq.Count -gt 0) { return $seq }
+        } catch {}
     }
-    if ($null -eq $outline) { return $null }
+    return $null
+}
 
+# Read the raw min/max corners from an IpfcOutline3D and return per-axis extents @(dx,dy,dz),
+# or $null if the outline could not be read.
+function Get-OutlineExtents {
+    param($Outline)
+    if ($null -eq $Outline) { return $null }
     $p0 = $null; $p1 = $null
-    try { $p0 = $outline[0]; $p1 = $outline[1] } catch {}
+    try { $p0 = $Outline[0]; $p1 = $Outline[1] } catch {}
     if ($null -eq $p0 -or $null -eq $p1) {
-        try { $p0 = $outline.Item(0); $p1 = $outline.Item(1) } catch {}
+        try { $p0 = $Outline.Item(0); $p1 = $Outline.Item(1) } catch {}
     }
     if ($null -eq $p0 -or $null -eq $p1) { return $null }
-
     $a = Get-PointXYZ -Point $p0
     $b = Get-PointXYZ -Point $p1
-    $ex = [math]::Abs($b[0] - $a[0])
-    $ey = [math]::Abs($b[1] - $a[1])
-    $ez = [math]::Abs($b[2] - $a[2])
-    return @($ex, $ey, $ez | Sort-Object -Descending)
+    if ($null -eq $a -or $null -eq $b) { return $null }
+    return @([math]::Abs($b[0]-$a[0]), [math]::Abs($b[1]-$a[1]), [math]::Abs($b[2]-$a[2]))
+}
+
+# Measure the active solid's true size via its regeneration outline. EvalOutline returns an
+# IpfcOutline3D — a 2-element sequence of corner Point3Ds (min, max). The three axis extents
+# ARE the box's real X/Y/Z size. Returns per-axis @(dx, dy, dz) — NOT sorted — so the caller
+# can map X=length, Z=width, Y=height. Datums are excluded so they don't inflate the result;
+# if the exclude collapses the outline (e.g. a face type got stripped), fall back to the
+# plain no-exclude measurement.
+function Measure-BoxExtents {
+    param($Solid, $ExcludeTypes)
+
+    $ext = $null
+    if ($null -ne $ExcludeTypes) {
+        $o = $null
+        try { $o = $Solid.EvalOutline($null, $ExcludeTypes) } catch {}
+        $ext = Get-OutlineExtents -Outline $o
+        # Guard: a collapsed/degenerate box (any extent ~0) means the exclude stripped real
+        # geometry — discard it and fall through to the no-exclude path.
+        if ($null -ne $ext -and ($ext[0] -lt 1e-6 -or $ext[1] -lt 1e-6 -or $ext[2] -lt 1e-6)) {
+            $ext = $null
+        }
+    }
+    if ($null -eq $ext) {
+        $o = $null
+        try { $o = $Solid.EvalOutline($null, $null) } catch {}
+        if ($null -eq $o) { try { $o = $Solid.GetOutline() } catch {} }
+        $ext = Get-OutlineExtents -Outline $o
+    }
+    return $ext
+}
+
+# ============================================
+# SESSION SELECTION (multi-Creo support)
+# ============================================
+# Background (confirmed live via -probe): Connect($null,...) throws XToolkitAmbiguous when
+# >1 xtop.exe is running — it cannot pick. The only API to target a specific session is
+# ConnectById(IpfcConnectionId), where the id is built from an ExternalRep string. That rep
+# looks like:
+#   host:NAME:address_version:0:address_type:1:rpcnum:NNNN:rpcversion:2:netaddr:HEX:netaddr_length:4
+# Everything is machine-constant EXCEPT rpcnum, which the RPC runtime assigns at session
+# start. rpcnum is NOT derivable from the xtop PID (PID 6056 ↔ rpcnum 1073862945, no
+# relation), but it IS stable for a session's lifetime (same value across probe runs). And
+# there is no API to enumerate running sessions' ids without first connecting.
+#
+# Strategy: cache each session's rep keyed by PID whenever we successfully connect. With >1
+# session, probe each cached rep (ConnectById → read model name → disconnect) to build a
+# picker labeled by ACTIVE MODEL NAME (xtop exposes no window title — confirmed empty live).
+# Any session without a usable cached rep falls back to the close-the-others flow.
+
+$script:SessionCachePath = Join-Path $env:LOCALAPPDATA "boxinator\sessions.json"
+
+function Get-SessionCache {
+    # Returns a hashtable PID(string) -> @{ rep; model; lastSeen }. Missing/corrupt = empty.
+    $map = @{}
+    try {
+        if (Test-Path $script:SessionCachePath) {
+            $json = Get-Content -Raw -Encoding UTF8 $script:SessionCachePath | ConvertFrom-Json
+            foreach ($p in $json.PSObject.Properties) {
+                $map[$p.Name] = @{ rep = $p.Value.rep; model = $p.Value.model; lastSeen = $p.Value.lastSeen }
+            }
+        }
+    } catch {}
+    return $map
+}
+
+function Save-SessionEntry {
+    # Record/refresh one PID's rep + model name. Best-effort: a cache write must never abort
+    # the run, so all IO is wrapped.
+    param([int]$ProcId, [string]$Rep, [string]$ModelName)
+    if ([string]::IsNullOrWhiteSpace($Rep)) { return }
+    try {
+        $map = Get-SessionCache
+        $map["$ProcId"] = @{ rep = $Rep; model = $ModelName; lastSeen = (Get-Date).ToString("o") }
+        $dir = Split-Path $script:SessionCachePath
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        ($map | ConvertTo-Json) | Set-Content -Encoding UTF8 -Path $script:SessionCachePath
+    } catch {}
+}
+
+function Get-ConnectionRep {
+    # The ExternalRep for an open connection, or $null. Property name confirmed via -probe.
+    param($Conn)
+    try { return [string]$Conn.GetConnectionId().ExternalRep } catch { return $null }
+}
+
+function Get-ActiveModelName {
+    # IpfcModel.FileName gives the model name in "name"."type" format (confirmed via docs).
+    param($Sess)
+    try {
+        $m = $Sess.GetActiveModel()
+        if ($null -ne $m) { return [string]$m.FileName }
+    } catch {}
+    return "(no active model)"
+}
+
+function Connect-ById {
+    # Build an IpfcConnectionId from a cached rep string and ConnectById to it. Returns the
+    # live connection or $null. ProgID CCpfc* factories are NOT standalone ProgIDs (see
+    # CLAUDE.md) — the Create factory lives as a static method on the pfcConnectionId class
+    # object, mirroring the pfcRegenInstructions pattern.
+    param($Async, [string]$Rep)
+    if ([string]::IsNullOrWhiteSpace($Rep)) { return $null }
+    foreach ($ctor in @("pfcls.pfcConnectionId", "pfcls.CCpfcConnectionId")) {
+        try {
+            $idCls = New-Object -ComObject $ctor
+            $cid   = $idCls.Create($Rep)
+            return $Async.ConnectById($cid, $null, $null)
+        } catch { continue }
+    }
+    return $null
+}
+
+function Select-CreoSession {
+    # Resolve a single live connection from possibly-many xtop.exe sessions. Returns a
+    # connection object (already connected) or throws with an actionable message.
+    #   1 session  -> Connect(); cache its rep.
+    #   >1 session -> probe cached reps to label a picker by model name; ConnectById the pick.
+    #                 Pick with no usable rep -> guide closing the others, then Connect().
+    param($Async, $Procs)
+
+    if ($Procs.Count -eq 1) {
+        $conn = $Async.Connect($null, $null, $null, $null)
+        $rep  = Get-ConnectionRep -Conn $conn
+        Save-SessionEntry -ProcId $Procs[0].Id -Rep $rep -ModelName (Get-ActiveModelName -Sess $conn.Session)
+        return $conn
+    }
+
+    Write-Host ""
+    Write-Host "  $($Procs.Count) Creo sessions (xtop.exe) are running." -ForegroundColor Yellow
+    $cache = Get-SessionCache
+
+    # Build candidate list. For each PID with a cached rep, briefly ConnectById to read the
+    # live model name so the picker is accurate (a part may have changed since last cached).
+    $cands = @()
+    foreach ($p in $Procs) {
+        $entry = $cache["$($p.Id)"]
+        $rep   = if ($null -ne $entry) { $entry.rep } else { $null }
+        $model = "(unknown — not yet seen by boxinator alone)"
+        $hasRep = $false
+        if (-not [string]::IsNullOrWhiteSpace($rep)) {
+            $probe = Connect-ById -Async $Async -Rep $rep
+            if ($null -ne $probe) {
+                $hasRep = $true
+                $model  = Get-ActiveModelName -Sess $probe.Session
+                Save-SessionEntry -ProcId $p.Id -Rep $rep -ModelName $model
+                try { $probe.Disconnect($null) } catch {}
+            }
+        }
+        $cands += [pscustomobject]@{ Proc = $p; Pid = $p.Id; Rep = $rep; HasRep = $hasRep; Model = $model }
+    }
+
+    Write-Host ""
+    Write-Host "  Select a Creo session:" -ForegroundColor Green
+    for ($i = 0; $i -lt $cands.Count; $i++) {
+        $c = $cands[$i]
+        $tag = if ($c.HasRep) { "" } else { "  [not directly selectable]" }
+        Write-Host ("    [{0}] PID {1,-6}  {2}{3}" -f ($i + 1), $c.Pid, $c.Model, $tag) -ForegroundColor White
+    }
+    Write-Host ""
+    $sel = Read-Host "  Enter the number of the session to use"
+    $idx = 0
+    if (-not [int]::TryParse($sel, [ref]$idx) -or $idx -lt 1 -or $idx -gt $cands.Count) {
+        throw "Invalid selection '$sel'."
+    }
+    $chosen = $cands[$idx - 1]
+
+    if ($chosen.HasRep) {
+        $conn = Connect-ById -Async $Async -Rep $chosen.Rep
+        if ($null -ne $conn) {
+            Save-SessionEntry -ProcId $chosen.Pid -Rep $chosen.Rep -ModelName (Get-ActiveModelName -Sess $conn.Session)
+            Write-Host "  Connected to PID $($chosen.Pid)." -ForegroundColor Green
+            return $conn
+        }
+        Write-Host "  Cached connection for PID $($chosen.Pid) failed — falling back." -ForegroundColor Yellow
+    }
+
+    # Fallback: no usable rep. ConnectById is impossible, so the only way to reach this
+    # specific session is to make it the ONLY one running, then Connect().
+    Write-Host ""
+    Write-Host "  PID $($chosen.Pid) has no usable saved connection (boxinator has not seen it" -ForegroundColor Yellow
+    Write-Host "  running by itself yet). To use it, close every OTHER Creo session and leave" -ForegroundColor Yellow
+    Write-Host "  ONLY PID $($chosen.Pid) open, then press ENTER here." -ForegroundColor Yellow
+    Read-Host
+    $still = @(Get-Process | Where-Object { $_.ProcessName -eq "xtop" })
+    if ($still.Count -ne 1) {
+        throw ("Expected exactly 1 Creo session after closing the others, found $($still.Count). " +
+               "Close all but PID $($chosen.Pid) and re-run.")
+    }
+    $conn = $Async.Connect($null, $null, $null, $null)
+    $rep  = Get-ConnectionRep -Conn $conn
+    Save-SessionEntry -ProcId $still[0].Id -Rep $rep -ModelName (Get-ActiveModelName -Sess $conn.Session)
+    return $conn
 }
 
 # ============================================
@@ -100,17 +355,20 @@ Write-Host ""
 # USER INPUTS
 # ============================================
 Write-Host "  Enter box dimensions (model units):" -ForegroundColor Green
+Write-Host "    Length is the X extent, Width the Z extent (both drawn on the sketch plane)." -ForegroundColor Gray
+Write-Host "    Height is the Y extent — the extrude depth." -ForegroundColor Gray
 Write-Host ""
-$width  = [double](Read-Host "  Width")
-$height = [double](Read-Host "  Height")
-$depth  = [double](Read-Host "  Depth (extrude)")
+$length = [double](Read-Host "  Length (X)")
+$width  = [double](Read-Host "  Width (Z)")
+$height = [double](Read-Host "  Height (Y, extrude)")
 Write-Host ""
 
 # ============================================
 # CONNECT TO CREO
 # ============================================
-$proc = Get-Process | Where-Object { $_.ProcessName -eq "xtop" }
-if ($null -eq $proc) { throw "Creo (xtop.exe) is not running" }
+$procs = @(Get-Process | Where-Object { $_.ProcessName -eq "xtop" })
+if ($procs.Count -eq 0) { throw "Creo (xtop.exe) is not running" }
+$proc = $procs[0]
 
 $Env:PRO_DIRECTORY    = $proc.Path.TrimEnd("xtop.exe")
 $Env:PRO_COMM_MSG_EXE = $proc.Path -replace "xtop.exe", "pro_comm_msg.exe"
@@ -121,60 +379,94 @@ catch {
     Start-Process -Wait -FilePath $reg
 }
 
-$async      = New-Object -ComObject pfcls.pfcAsyncConnection
-$connection = $async.Connect($null, $null, $null, $null)
+$async = New-Object -ComObject pfcls.pfcAsyncConnection
+# Resolve which session to attach to. With one xtop this is a plain Connect(); with several
+# it presents a model-name picker backed by the per-PID rep cache (see Select-CreoSession).
+$connection = Select-CreoSession -Async $async -Procs $procs
 $session    = $connection.Session
+
+# ---- PROBE MODE: dump the connection ID format, then exit -------------------
+# We need the real ExternalRep string to build ConnectById()-based session
+# selection. Inspect both the raw COM object and its string rep, and note the
+# xtop PID so we can tell whether the rep embeds it.
+if ($ProbeMode) {
+    Write-Host ""
+    Write-Host "  [PROBE] xtop PID = $($proc.Id)" -ForegroundColor Magenta
+    try { Write-Host "  [PROBE] xtop MainWindowTitle = '$($proc.MainWindowTitle)'" -ForegroundColor Magenta } catch {}
+    try {
+        $cid = $connection.GetConnectionId()
+        Write-Host "  [PROBE] GetConnectionId() COM type: $($cid.GetType().FullName)" -ForegroundColor Magenta
+        $rep = $null
+        try { $rep = $cid.ExternalRep } catch { Write-Host "  [PROBE] .ExternalRep threw: $($_.Exception.Message)" -ForegroundColor Yellow }
+        Write-Host "  [PROBE] ExternalRep = >>>$rep<<<" -ForegroundColor Green
+        Write-Host "  [PROBE] ExternalRep length = $(([string]$rep).Length) chars" -ForegroundColor Magenta
+        # Enumerate any other readable members in case the rep is exposed under a
+        # different property name on this COM build.
+        Write-Host "  [PROBE] ConnectionId members:" -ForegroundColor Magenta
+        try {
+            $cid | Get-Member -ErrorAction SilentlyContinue |
+                Where-Object { $_.MemberType -match 'Property|Method' } |
+                ForEach-Object { Write-Host "      $($_.MemberType)  $($_.Name)" -ForegroundColor DarkGray }
+        } catch {}
+    } catch {
+        Write-Host "  [PROBE] GetConnectionId() threw: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Write-Host ""
+    Write-Host "  [PROBE] Done — paste the ExternalRep line above back to continue building session selection." -ForegroundColor Magenta
+    try { $connection.Disconnect($null) } catch {}
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 0
+}
+# -----------------------------------------------------------------------------
+
 $model      = $session.GetActiveModel()
+
+# DEBUG VISIBILITY: when on, visible_mapkeys=yes makes each macro replay on screen
+# so we can watch exactly which widget interaction diverges. Flip to $false once the
+# sketch/extrude flow is confirmed, to restore the quiet repo-convention behavior.
+$DebugMacros = $true
 
 $origVis = $null; $origPrev = $null
 try { $v = $session.GetConfigOptionValues("visible_mapkeys"); if ($v.Count -gt 0) { $origVis  = $v.Item(0) } } catch {}
 try { $v = $session.GetConfigOptionValues("dynamic_preview");  if ($v.Count -gt 0) { $origPrev = $v.Item(0) } } catch {}
-# Suppress both per the repo convention. To debug a diverging widget interaction,
-# temporarily set visible_mapkeys to "yes" so each macro replays on screen.
-try { $session.SetConfigOption("visible_mapkeys", "no") | Out-Null } catch {}
+$visSetting = if ($DebugMacros) { "yes" } else { "no" }
+try { $session.SetConfigOption("visible_mapkeys", $visSetting) | Out-Null } catch {}
 try { $session.SetConfigOption("dynamic_preview",  "no") | Out-Null } catch {}
+if ($DebugMacros) {
+    Write-Host ""
+    Write-Host "  [DEBUG] visible_mapkeys = yes — each macro will replay on screen in Creo." -ForegroundColor Magenta
+    Write-Host "  [DEBUG] Watch which step diverges, then report the macro label shown below." -ForegroundColor Magenta
+}
+# NOTE: do NOT set regen_failure_handling here. It is deprecated on this Creo build and
+# setting it pops a blocking "allow deprecated config (CS260154)" authorization dialog
+# that stalls the whole run. Depth is made reliable by writing the feature depth DimValue
+# directly then a plain Regenerate($null) + re-read (diminator's pattern), not by regen mode.
 
 try {
 
 # ============================================
-# SELECT SKETCH PLANE
+# OPEN SKETCHER (confirmed pattern: real screen-pick populates the plane MRU)
 # ============================================
-Write-Host "  In Creo: select the plane to sketch on, then press ENTER here." -ForegroundColor White
+# SELECT-FIRST flow. Clicking the plane *after* the Sketch dialog is open did NOT land
+# it in the dialog's Plane field (confirmed live: "enter sketcher failed, plane field
+# still empty"), so the t1.PlnMru trigger had nothing to select. Instead we have the user
+# pick the plane on screen FIRST (a real graphics-window selection into the buffer), THEN
+# fire ProCmdDatumSketCurve — with a plane already selected, this Creo opens the Sketch
+# dialog with the Plane field auto-populated, and we just confirm with stdbtn_1. No MRU.
+Write-Host ""
+Write-Host "  In Creo: CLICK the datum plane you want to sketch on (it should highlight)." -ForegroundColor White
+Write-Host "  Do NOT open any command — just select the plane, then press ENTER here." -ForegroundColor White
 Read-Host
-$planeSel = ($session.CurrentSelectionBuffer()).Contents
-if ($null -eq $planeSel -or $planeSel.Count -eq 0) { throw "No plane selected." }
-$planeID = $planeSel[0].SelItem.Id
 
-# ============================================
-# OPEN SKETCHER
-# ============================================
-# Select the plane by ID so the sketch setup dialog picks it up in the MRU list
-$mkSelectPlane =
-    "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
-    "~ Command ``ProCmdMdlTreeSearch``;" +
-    "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
-    "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
-    "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum Plane``;" +
-    "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
-    "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$planeID``;" +
-    "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
-    "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
-    "~ Activate ``selspecdlg0`` ``CancelButton``;"
+Invoke-Macro "open sketch tool (plane pre-selected)" "~ Command ``ProCmdDatumSketCurve``;"
 
-Invoke-Macro "select plane by ID" $mkSelectPlane
-
-# Open sketcher — plane is now in MRU so t1.PlnMru item 0 picks it up
-$mkOpenSketch =
-    "~ Command ``ProCmdDatumSketCurve``;" +
-    "~ Trigger ``Odui_Dlg_00`` ``t1.PlnMru`` ``0``;" +
-    "~ Trigger ``Odui_Dlg_00`` ``t1.PlnMru`` ``````;" +
-    "~ Trigger ``Odui_Dlg_00`` ``t1.RefMru`` ``0``;" +
-    "~ Trigger ``Odui_Dlg_00`` ``t1.RefMru`` ``````;" +
-    "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
-
-# Opening the sketcher is a UI state change, not a part regen — it does not bump
-# VersionStamp, so there is nothing to poll on here.
-Invoke-Macro "open sketcher" $mkOpenSketch
+# Give the Sketch dialog a moment to come up pre-populated, then confirm it. If this Creo
+# jumps straight into the sketcher (no dialog) the stdbtn_1 Activate will no-op/fail
+# harmlessly — watch the screen and report which happens.
+Start-Sleep -Milliseconds 600
+Invoke-Macro "enter sketcher" "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
 
 # Activate center rectangle tool and wait for user to draw
 $mkRectTool = "~ Command ``ProCmdSketCenterRectangle`` 1;"
@@ -188,36 +480,35 @@ Write-Host "  Press ENTER here when done drawing." -ForegroundColor White
 Read-Host
 
 # ============================================
-# SET SKETCH DIMENSIONS (pick-order: WIDTH then HEIGHT)
+# SET SKETCH DIMENSIONS (in-plane: LENGTH then WIDTH)
 # ============================================
-# The mod_dim_emb write is what actually creates the in-plane geometry. We keep the
-# fixed WIDTH-then-HEIGHT pick order so the user knows which edge to dimension, but we
-# NO LONGER try to capture each dim's symbol from the selection buffer — that binding
-# was unreliable and could not tell width from height (DimType is Linear for both).
-# Verification is now geometric (EvalOutline below), so the symbol is not needed here.
-Write-Host "  Now dimension the rectangle. WIDTH first, then HEIGHT." -ForegroundColor White
+# The mod_dim_emb write is what actually creates the in-plane geometry. The two in-plane
+# dims are LENGTH (X) and WIDTH (Z); HEIGHT (Y) is the extrude depth, set later. We keep a
+# fixed LENGTH-then-WIDTH pick order so the user knows which edge to dimension, but we do
+# NOT capture each dim's symbol — verification is geometric (EvalOutline below).
+Write-Host "  Now dimension the rectangle. LENGTH first, then WIDTH." -ForegroundColor White
 Write-Host ""
 
-# --- WIDTH ---
+# --- LENGTH (X) ---
+Invoke-Macro "activate dimension tool (length)" "~ Command ``ProCmdSketDimension`` 1;"
+Write-Host "  [1/2 LENGTH] Click a HORIZONTAL edge (top or bottom), then middle-click to place the dimension." -ForegroundColor Green
+Write-Host "  Press ENTER here after the dimension is placed." -ForegroundColor White
+Read-Host
+$mkLength =
+    "~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$length``;" +
+    "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;"
+Invoke-Macro "write length = $length" $mkLength
+
+# --- WIDTH (Z) ---
 Invoke-Macro "activate dimension tool (width)" "~ Command ``ProCmdSketDimension`` 1;"
-Write-Host "  [1/2 WIDTH]  Click a HORIZONTAL edge (top or bottom), then middle-click to place the dimension." -ForegroundColor Green
+Write-Host ""
+Write-Host "  [2/2 WIDTH]  Click a VERTICAL edge (left or right), then middle-click to place the dimension." -ForegroundColor Green
 Write-Host "  Press ENTER here after the dimension is placed." -ForegroundColor White
 Read-Host
 $mkWidth =
     "~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$width``;" +
     "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;"
 Invoke-Macro "write width = $width" $mkWidth
-
-# --- HEIGHT ---
-Invoke-Macro "activate dimension tool (height)" "~ Command ``ProCmdSketDimension`` 1;"
-Write-Host ""
-Write-Host "  [2/2 HEIGHT] Click a VERTICAL edge (left or right), then middle-click to place the dimension." -ForegroundColor Green
-Write-Host "  Press ENTER here after the dimension is placed." -ForegroundColor White
-Read-Host
-$mkHeight =
-    "~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$height``;" +
-    "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;"
-Invoke-Macro "write height = $height" $mkHeight
 
 # ============================================
 # EXIT SKETCHER
@@ -229,114 +520,113 @@ Wait-ModelModified -Model $model -PreviousStamp $stamp
 # ============================================
 # EXTRUDE WITH EXACT DEPTH
 # ============================================
-# Snapshot existing protrusion feature IDs so the new one can be identified afterward
-# (needed only by the depth-repair fallback — the EvalOutline check itself needs no IDs).
+# HEIGHT (Y) is the extrude depth. Approach mirrors diminator's proven path:
+#   1. Snapshot every dimension SYMBOL on the model BEFORE the extrude.
+#   2. Open the extrude tool, type the height into the dashboard, and fire dashInst0.Done
+#      to commit programmatically — fully automatic, no manual green check.
+#   3. Diff the dim symbols AFTER: the symbol(s) that appeared belong to the new extrude.
+#   4. Identify the depth dim by elimination (the new Linear dim matching neither length nor
+#      width), set its DimValue = height, Regenerate($null), then re-read to confirm it
+#      stuck — exactly diminator's set/regen/re-read pattern.
 $pfcModelItemType = New-Object -ComObject pfcls.pfcModelItemType
-$pfcFeatures      = New-Object -ComObject pfcls.pfcFeatureType
 
-$beforeIds = @()
-try {
-    $existing = $model.ListFeaturesByType($FALSE, $pfcFeatures.FEATTYPE_PROTRUSION)
-    foreach ($f in $existing) { $beforeIds += $f.Id }
-} catch {}
+# Before-snapshot of dimension symbols (proven ListItems(ITEM_DIMENSION) path).
+$beforeDims = Get-DimSymbols -Model $model -TypeObj $pfcModelItemType
 
 Invoke-Macro "open extrude tool" "~ Command ``ProCmdFtExtrude``;"
 Start-Sleep -Milliseconds 800
 
+# Type the height into the dashboard MRU field, then commit with dashInst0.Done — fully
+# automatic per the chosen flow. The authoritative feature DimValue write below still runs
+# afterward to guarantee the depth is exact regardless of what the dashboard field produced.
+$stamp = $model.VersionStamp
 $mkExtrudeDepth =
-    "~ Update ``main_dlg_cur`` ``GrmTextTagEmbedMRU`` ``$depth``;" +
+    "~ Update ``main_dlg_cur`` ``GrmTextTagEmbedMRU`` ``$height``;" +
     "~ Activate ``main_dlg_cur`` ``GrmTextTagEmbedMRU``;" +
     "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-
-$stamp = $model.VersionStamp
-Invoke-Macro "set dashboard depth + done" $mkExtrudeDepth
+Invoke-Macro "set depth = $height and commit extrude" $mkExtrudeDepth
 Wait-ModelModified -Model $model -PreviousStamp $stamp
-
-Write-Host ""
-Write-Host "  The extrude should now be committed (a solid box visible in Creo)." -ForegroundColor White
-Write-Host "  Press ENTER here once the extrude dashboard has closed." -ForegroundColor White
-Read-Host
 
 # ============================================
 # AUTHORITATIVE DEPTH (feature DimValue — the dashboard field is unreliable)
 # ============================================
-# DEV_NOTES: feature-level dim writes via DimValue DO stick on a closed sketch, while the
-# GrmTextTagEmbedMRU dashboard field has produced the wrong depth. So rather than trusting
-# the dashboard value, find the new extrude feature's depth dim and set it directly.
-#
-# Identifying the depth dim: the extrude feature may expose 1 linear dim (just depth) or
-# several (depth plus the sketch's width/height, depending on how Creo nests them). We do
-# NOT assume a count. Depth is the linear dim whose current value matches NEITHER the
-# requested width NOR height — found by elimination. A full dump is printed regardless so
-# the model's actual dim layout is visible if the elimination is ambiguous.
-$newFeature = $null
-try {
-    $after = $model.ListFeaturesByType($FALSE, $pfcFeatures.FEATTYPE_PROTRUSION)
-    foreach ($f in $after) { if ($beforeIds -notcontains $f.Id) { $newFeature = $f; break } }
-} catch {}
+# Identify the new extrude's depth dim by diffing dimension symbols before vs. after.
+# Whatever symbols are new belong to the extrude. Depth is the new Linear dim whose value
+# matches NEITHER requested length NOR width (found by elimination). Then set DimValue +
+# Regenerate + re-read, just like diminator.
+$afterDims = Get-DimSymbols -Model $model -TypeObj $pfcModelItemType
 
-if ($null -eq $newFeature) {
-    Write-Host "  WARNING: could not identify the new extrude feature — leaving depth as the dashboard value." -ForegroundColor Yellow
+$newSymbols = @($afterDims.Keys | Where-Object { -not $beforeDims.ContainsKey($_) })
+if ($newSymbols.Count -eq 0) {
+    Write-Host "  WARNING: no new dimension appeared after the extrude — depth left as the dashboard value." -ForegroundColor Yellow
 } else {
-    Write-Host "  New extrude feature Id $($newFeature.Id). Dimensions on this feature:" -ForegroundColor White
-    $featLinear = @()
-    try {
-        foreach ($d in $newFeature.ListSubItems($pfcModelItemType.ITEM_DIMENSION)) {
-            $tname = switch ($d.DimType) { 0 {"Linear"} 1 {"Radial"} 2 {"Diameter"} 3 {"Angular"} default {"?"} }
-            Write-Host ("      {0,-6} {1,-8} = {2}" -f $d.Symbol, $tname, $d.DimValue) -ForegroundColor Gray
-            if ($d.DimType -eq 0) { $featLinear += $d }
-        }
-    } catch { Write-Host "      (could not list feature dims: $($_.Exception.Message))" -ForegroundColor Yellow }
-
-    # Depth = linear dim matching neither width nor height.
-    $depthCandidates = @($featLinear | Where-Object {
-        [math]::Abs([double]$_.DimValue - $width)  -ge 1e-4 -and
-        [math]::Abs([double]$_.DimValue - $height) -ge 1e-4
-    })
-    if ($depthCandidates.Count -eq 0 -and $featLinear.Count -eq 1) {
-        # Only one linear dim and it happened to equal width/height numerically — still depth.
-        $depthCandidates = @($featLinear[0])
+    Write-Host "  New dimension(s) after extrude:" -ForegroundColor White
+    foreach ($s in $newSymbols) {
+        $info = $afterDims[$s]
+        $tname = switch ($info.DimType) { 0 {"Linear"} 1 {"Radial"} 2 {"Diameter"} 3 {"Angular"} default {"?"} }
+        Write-Host ("      {0,-6} {1,-8} = {2}" -f $info.Symbol, $tname, $info.DimValue) -ForegroundColor Gray
     }
 
-    if ($depthCandidates.Count -eq 1) {
+    # Depth = new Linear dim matching neither length nor width (it is the height/Y extrude).
+    $depthSymbols = @($newSymbols | Where-Object {
+        $afterDims[$_].DimType -eq 0 -and
+        [math]::Abs($afterDims[$_].DimValue - $length) -ge 1e-4 -and
+        [math]::Abs($afterDims[$_].DimValue - $width)  -ge 1e-4
+    })
+    # Fall back: exactly one new Linear dim (even if it numerically equals L/W) is depth.
+    if ($depthSymbols.Count -eq 0) {
+        $newLinear = @($newSymbols | Where-Object { $afterDims[$_].DimType -eq 0 })
+        if ($newLinear.Count -eq 1) { $depthSymbols = $newLinear }
+    }
+
+    if ($depthSymbols.Count -eq 1) {
+        $depthSym = $depthSymbols[0]
         try {
-            $depthCandidates[0].DimValue = $depth
-            $model.Regenerate($null)
-            Write-Host "  Set depth dim $($depthCandidates[0].Symbol) = $depth (authoritative)." -ForegroundColor Green
+            $depthDim = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym)
+            $depthDim.DimValue = $height
+            try { $model.Regenerate($null) } catch {}
+            $confirm = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym).DimValue
+            if ([math]::Abs([double]$confirm - $height) -lt 1e-4) {
+                Write-Host "  Set depth dim $depthSym = $height (confirmed after regen)." -ForegroundColor Green
+            } else {
+                Write-Host "  WARNING: depth dim $depthSym reads $confirm after regen (wanted $height) — verify below." -ForegroundColor Yellow
+            }
         } catch {
             Write-Host "  WARNING: depth DimValue write threw: $($_.Exception.Message)" -ForegroundColor Yellow
         }
-    } elseif ($depthCandidates.Count -gt 1) {
-        Write-Host "  WARNING: $($depthCandidates.Count) candidate depth dims (none match W/H) — cannot pick safely. Leaving dashboard depth; verify below." -ForegroundColor Yellow
+    } elseif ($depthSymbols.Count -gt 1) {
+        Write-Host "  WARNING: $($depthSymbols.Count) candidate depth dims (none match W/H) — cannot pick safely. Verify below." -ForegroundColor Yellow
     } else {
-        Write-Host "  WARNING: no depth dim found on the extrude feature — leaving dashboard depth; verify below." -ForegroundColor Yellow
+        Write-Host "  WARNING: no depth dim found among the new dimensions — verify below." -ForegroundColor Yellow
     }
 }
 
 # ============================================
-# GEOMETRIC VERIFY (EvalOutline)
+# GEOMETRIC VERIFY (EvalOutline) — directional, datum-excluded
 # ============================================
-# Source of truth: measure the solid itself. The three sorted extents must equal the
-# three requested sizes (also sorted), within tolerance. Sorting both triples means we
-# never have to know which axis the sketch plane mapped width/height onto — we assert
-# "the solid's three extents are 5, 3, 2" exactly as the user asked for.
-$tol = 1e-4
-$targetSorted = @($width, $height, $depth | Sort-Object -Descending)
+# Source of truth: measure the solid itself. The axes are mapped explicitly per the user's
+# convention: X extent = LENGTH, Z extent = WIDTH, Y extent = HEIGHT (the extrude). No
+# sorting — each measured axis is compared to its named target so a mismatch report names
+# the wrong axis directly. Datums are excluded from the outline so they don't inflate the
+# extents. Tolerance is in model units.
+$tol = 0.1
+$excludeTypes = New-ExcludeTypes -TypeObj $pfcModelItemType
+$targetByAxis = @{ X = $length; Y = $height; Z = $width }
 
 Write-Host ""
-Write-Host "  Measuring the solid (EvalOutline)..." -ForegroundColor White
-$measured = Measure-BoxExtents -Solid $model
+Write-Host "  Measuring the solid (EvalOutline, datums excluded)..." -ForegroundColor White
+$measured = Measure-BoxExtents -Solid $model -ExcludeTypes $excludeTypes
 
 $verifyPass = $false
 if ($null -eq $measured) {
     Write-Host "  WARNING: could not read the solid outline — size is UNVERIFIED." -ForegroundColor Yellow
 } else {
-    Write-Host ("    measured extents (sorted): {0:0.####} x {1:0.####} x {2:0.####}" -f $measured[0], $measured[1], $measured[2]) -ForegroundColor Gray
-    Write-Host ("    requested      (sorted): {0:0.####} x {1:0.####} x {2:0.####}" -f $targetSorted[0], $targetSorted[1], $targetSorted[2]) -ForegroundColor Gray
+    Write-Host ("    measured  X={0:0.####} (len)  Z={2:0.####} (wid)  Y={1:0.####} (hgt)" -f $measured[0], $measured[1], $measured[2]) -ForegroundColor Gray
+    Write-Host ("    requested X={0:0.####} (len)  Z={1:0.####} (wid)  Y={2:0.####} (hgt)" -f $length, $width, $height) -ForegroundColor Gray
     $verifyPass = $true
-    for ($i = 0; $i -lt 3; $i++) {
-        if ([math]::Abs($measured[$i] - $targetSorted[$i]) -ge $tol) { $verifyPass = $false }
-    }
+    if ([math]::Abs($measured[0] - $length) -ge $tol) { $verifyPass = $false; Write-Host ("    X (length) off: measured {0:0.####}, wanted {1:0.####}" -f $measured[0], $length) -ForegroundColor Yellow }
+    if ([math]::Abs($measured[2] - $width)  -ge $tol) { $verifyPass = $false; Write-Host ("    Z (width) off:  measured {0:0.####}, wanted {1:0.####}" -f $measured[2], $width)  -ForegroundColor Yellow }
+    if ([math]::Abs($measured[1] - $height) -ge $tol) { $verifyPass = $false; Write-Host ("    Y (height) off: measured {0:0.####}, wanted {1:0.####}" -f $measured[1], $height) -ForegroundColor Yellow }
     if ($verifyPass) {
         Write-Host "    PASS — solid matches the requested size." -ForegroundColor Green
     } else {
@@ -348,41 +638,32 @@ if ($null -eq $measured) {
 # REPAIR (only if the measurement disagrees)
 # ============================================
 # Every repaired claim below is re-confirmed by a fresh EvalOutline, never by a symbol
-# echo. Depth is a feature-level dim (DimValue writes stick on a closed sketch); width/
-# height are sketch dims and need the sketch-open flow.
+# echo. Height (Y) is a feature-level depth dim (DimValue writes stick on a closed sketch);
+# length (X) and width (Z) are sketch dims and need the sketch-open flow.
 if ($null -ne $measured -and -not $verifyPass) {
 
-    # Which requested values are not yet present among the measured extents? Match by
-    # value (geometric), not by symbol or pick-order.
-    $remaining = [System.Collections.ArrayList]@($measured)
-    function Test-Present {
-        param([double]$Value)
-        for ($j = 0; $j -lt $remaining.Count; $j++) {
-            if ([math]::Abs([double]$remaining[$j] - $Value) -lt $tol) { $remaining.RemoveAt($j); return $true }
-        }
-        return $false
-    }
-    $depthOk  = Test-Present -Value $depth
-    $widthOk  = Test-Present -Value $width
-    $heightOk = Test-Present -Value $height
+    # Per-axis pass flags from the directional measurement (X=length, Z=width, Y=height).
+    $lengthOk = [math]::Abs($measured[0] - $length) -lt $tol
+    $widthOk  = [math]::Abs($measured[2] - $width)  -lt $tol
+    $heightOk = [math]::Abs($measured[1] - $height) -lt $tol
 
-    # Depth was already set authoritatively above via the feature DimValue. If it still
+    # Height was already set authoritatively above via the feature DimValue. If it still
     # reads wrong here, that is a genuine failure (not a sketch-snapback case) — report it
     # rather than re-driving the dashboard.
-    if (-not $depthOk) {
+    if (-not $heightOk) {
         Write-Host ""
-        Write-Host "  Depth still reads wrong after the authoritative set — this is unexpected." -ForegroundColor Red
+        Write-Host "  Height (Y extrude) still reads wrong after the authoritative set — this is unexpected." -ForegroundColor Red
         Write-Host "  Check the dim dump above; the depth dim may not have been identified correctly." -ForegroundColor Red
     }
 
-    # --- Sketch repair: width/height that did not land ---
+    # --- Sketch repair: length/width that did not land ---
     # GATED. Auto-driving the sketch open/close + Regenerate sequence has crashed Creo
     # (fatal traceback) when the model was in a half-committed state. So we never enter it
     # without an explicit y/n, and we tell the user to make sure no tool/dialog is open
     # first. If they decline, the box is reported NOT confirmed rather than risking a crash.
-    if (-not $widthOk -or -not $heightOk) {
+    if (-not $lengthOk -or -not $widthOk) {
         Write-Host ""
-        Write-Host "  In-plane size is off (width and/or height did not stick)." -ForegroundColor Yellow
+        Write-Host "  In-plane size is off (length and/or width did not stick)." -ForegroundColor Yellow
         Write-Host "  A guided sketch repair is available, but it drives Creo through a sketch" -ForegroundColor Yellow
         Write-Host "  open/close + regenerate — only safe if NO tool or dialog is currently open." -ForegroundColor Yellow
         Write-Host ""
@@ -394,7 +675,7 @@ if ($null -ne $measured -and -not $verifyPass) {
         Read-Host
 
         # When the sketch is open, GetActiveModel returns the sketch model. Map each
-        # sketch dim to width or height by which CURRENT VALUE it sits closest to — the
+        # sketch dim to length or width by which CURRENT VALUE it sits closest to — the
         # geometric pairing, not the old pick-order guess. Whichever requested value is
         # missing gets written onto the dim currently nearest it.
         $sketchModel = $session.GetActiveModel()
@@ -424,8 +705,8 @@ if ($null -ne $measured -and -not $verifyPass) {
             }
         }
 
+        if (-not $lengthOk) { Repair-SketchDim -Target $length }
         if (-not $widthOk)  { Repair-SketchDim -Target $width }
-        if (-not $heightOk) { Repair-SketchDim -Target $height }
 
         Write-Host "  Solving sketch..." -NoNewline
         try { $sketchModel.Regenerate($null); Write-Host " done." -ForegroundColor Green }
@@ -441,16 +722,17 @@ if ($null -ne $measured -and -not $verifyPass) {
     # --- Re-confirm by measuring again ---
     Write-Host ""
     Write-Host "  Re-measuring the solid..." -ForegroundColor White
-    $measured = Measure-BoxExtents -Solid $model
+    $measured = Measure-BoxExtents -Solid $model -ExcludeTypes $excludeTypes
     if ($null -eq $measured) {
         Write-Host "  WARNING: could not re-read the solid outline — size is UNVERIFIED." -ForegroundColor Yellow
         $verifyPass = $false
     } else {
-        Write-Host ("    measured extents (sorted): {0:0.####} x {1:0.####} x {2:0.####}" -f $measured[0], $measured[1], $measured[2]) -ForegroundColor Gray
-        $verifyPass = $true
-        for ($i = 0; $i -lt 3; $i++) {
-            if ([math]::Abs($measured[$i] - $targetSorted[$i]) -ge $tol) { $verifyPass = $false }
-        }
+        Write-Host ("    measured  X={0:0.####} (len)  Z={2:0.####} (wid)  Y={1:0.####} (hgt)" -f $measured[0], $measured[1], $measured[2]) -ForegroundColor Gray
+        $verifyPass = (
+            [math]::Abs($measured[0] - $length) -lt $tol -and
+            [math]::Abs($measured[2] - $width)  -lt $tol -and
+            [math]::Abs($measured[1] - $height) -lt $tol
+        )
         if ($verifyPass) { Write-Host "    REPAIRED — solid now matches the requested size." -ForegroundColor Green }
         else             { Write-Host "    STILL MISMATCHED after repair." -ForegroundColor Red }
     }
@@ -468,19 +750,23 @@ if ($script:macroFailures -gt 0) {
 
 Write-Host ""
 if ($ok) {
-    Write-Host "  Done. Box: $width x $height x $depth (measured and confirmed)." -ForegroundColor Green
+    Write-Host ("  Done. Box: Length(X)={0} Width(Z)={1} Height(Y)={2} (measured and confirmed)." -f `
+        $length, $width, $height) -ForegroundColor Green
 } elseif ($null -eq $measured) {
     Write-Host "  Box created but size UNVERIFIED (could not read the solid outline)." -ForegroundColor Yellow
     Write-Host "  Measure the solid in Creo before trusting these dimensions." -ForegroundColor Yellow
 } else {
-    Write-Host ("  Box created but NOT confirmed. Requested {0} x {1} x {2}; measured (sorted) {3:0.####} x {4:0.####} x {5:0.####}." -f `
-        $width, $height, $depth, $measured[0], $measured[1], $measured[2]) -ForegroundColor Yellow
+    Write-Host ("  Box created but NOT confirmed.") -ForegroundColor Yellow
+    Write-Host ("    requested  Length(X)={0}  Width(Z)={1}  Height(Y)={2}" -f `
+        $length, $width, $height) -ForegroundColor Yellow
+    Write-Host ("    measured   Length(X)={0:0.####}  Width(Z)={1:0.####}  Height(Y)={2:0.####}" -f `
+        $measured[0], $measured[2], $measured[1]) -ForegroundColor Yellow
     Write-Host "  Measure the solid in Creo before trusting these dimensions." -ForegroundColor Yellow
 }
 
 } finally {
-    try { if ($null -ne $origVis)  { $session.SetConfigOption("visible_mapkeys", $origVis)  | Out-Null } } catch {}
-    try { if ($null -ne $origPrev) { $session.SetConfigOption("dynamic_preview",  $origPrev) | Out-Null } } catch {}
+    try { if ($null -ne $origVis)   { $session.SetConfigOption("visible_mapkeys", $origVis)   | Out-Null } } catch {}
+    try { if ($null -ne $origPrev)  { $session.SetConfigOption("dynamic_preview",  $origPrev)  | Out-Null } } catch {}
     $connection.Disconnect($null)
 }
 
