@@ -39,6 +39,26 @@ function Wait-ModelModified {
     Write-Host "  (warning: timed out waiting for model update)" -ForegroundColor Yellow
 }
 
+# Force an immediate, full regen so a freshly-written feature DimValue propagates without a
+# manual sketch reopen. Automatic Regenerate($null) can leave a just-written depth dim
+# unpropagated (symptom: depth only updates after editing/reopening the feature's sketch).
+# A forced regen fixes that — but it throws IpfcXToolkitBadContext when Creo runs in
+# No-Resolve mode (the default), so we always fall back to automatic regen on failure.
+# ProgID is pfcls.pfcRegenInstructions (NOT CCpfcRegenInstructions — that is unregistered);
+# the CC* factory name lives as the static Create method on the pfcRegenInstructions class.
+function Invoke-ForceRegen {
+    param($Model)
+    try {
+        $regenCls = New-Object -ComObject pfcls.pfcRegenInstructions
+        $instr    = $regenCls.Create($false, $true, $null)   # Create(AllowFixUI, ForceRegen, FromFeat)
+        $Model.Regenerate($instr)
+        return
+    } catch {
+        # No-Resolve mode (IpfcXToolkitBadContext) or unavailable factory — fall back.
+    }
+    try { $Model.Regenerate($null) } catch {}
+}
+
 # Fire a mapkey and report success/failure instead of swallowing it. A silent
 # failure here is what made boxinator impossible to debug — a wrong widget name
 # or unready dashboard would no-op and the script would march on to "Done".
@@ -480,35 +500,62 @@ Write-Host "  Press ENTER here when done drawing." -ForegroundColor White
 Read-Host
 
 # ============================================
-# SET SKETCH DIMENSIONS (in-plane: LENGTH then WIDTH)
+# SET SKETCH DIMENSIONS PROGRAMMATICALLY (no per-edge clicking)
 # ============================================
-# The mod_dim_emb write is what actually creates the in-plane geometry. The two in-plane
-# dims are LENGTH (X) and WIDTH (Z); HEIGHT (Y) is the extrude depth, set later. We keep a
-# fixed LENGTH-then-WIDTH pick order so the user knows which edge to dimension, but we do
-# NOT capture each dim's symbol — verification is geometric (EvalOutline below).
-Write-Host "  Now dimension the rectangle. LENGTH first, then WIDTH." -ForegroundColor White
+# A drawn center-rectangle already carries its two driving linear dims as d# symbols on the
+# SKETCH model. Instead of firing ProCmdSketDimension and making the user click+place each
+# edge, we read those dims directly and write DimValue, then solve the sketch in place. The
+# sketch must be regenerated WHILE OPEN ($sketchModel.Regenerate) or Creo discards the edits
+# ("Part not changed since last regen") — this is diminator's confirmed pass-2 pattern.
+#
+# We do NOT need to know which dim is LENGTH vs WIDTH: both are DimType=Linear and ListItems
+# order is Creo-internal. We assign {length, width} to the two sketch dims in whatever order
+# they come, then let the geometric EvalOutline verify (below) detect and repair a reversed
+# mapping. So a swap is self-correcting, not a failure.
 Write-Host ""
+Write-Host "  Setting sketch dimensions automatically (no clicking needed)..." -ForegroundColor White
 
-# --- LENGTH (X) ---
-Invoke-Macro "activate dimension tool (length)" "~ Command ``ProCmdSketDimension`` 1;"
-Write-Host "  [1/2 LENGTH] Click a HORIZONTAL edge (top or bottom), then middle-click to place the dimension." -ForegroundColor Green
-Write-Host "  Press ENTER here after the dimension is placed." -ForegroundColor White
-Read-Host
-$mkLength =
-    "~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$length``;" +
-    "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;"
-Invoke-Macro "write length = $length" $mkLength
+$sketchTypeObj = New-Object -ComObject pfcls.pfcModelItemType
+$sketchModel   = $null
+try { $sketchModel = $session.GetActiveModel() } catch {}
 
-# --- WIDTH (Z) ---
-Invoke-Macro "activate dimension tool (width)" "~ Command ``ProCmdSketDimension`` 1;"
-Write-Host ""
-Write-Host "  [2/2 WIDTH]  Click a VERTICAL edge (left or right), then middle-click to place the dimension." -ForegroundColor Green
-Write-Host "  Press ENTER here after the dimension is placed." -ForegroundColor White
-Read-Host
-$mkWidth =
-    "~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$width``;" +
-    "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;"
-Invoke-Macro "write width = $width" $mkWidth
+$sketchDims = @()
+if ($null -ne $sketchModel) {
+    try {
+        foreach ($d in $sketchModel.ListItems($sketchTypeObj.ITEM_DIMENSION)) {
+            try { if ($d.DimType -eq 0) { $sketchDims += $d } } catch {}
+        }
+    } catch {}
+}
+
+if ($sketchDims.Count -lt 2) {
+    Write-Host "  WARNING: expected 2 linear sketch dims, found $($sketchDims.Count). Falling back to manual entry." -ForegroundColor Yellow
+    Write-Host "  [1/2 LENGTH] Click a HORIZONTAL edge, middle-click to place, then press ENTER." -ForegroundColor Green
+    Invoke-Macro "activate dimension tool (length)" "~ Command ``ProCmdSketDimension`` 1;"
+    Read-Host
+    Invoke-Macro "write length = $length" ("~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$length``;" + "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;")
+    Write-Host "  [2/2 WIDTH] Click a VERTICAL edge, middle-click to place, then press ENTER." -ForegroundColor Green
+    Invoke-Macro "activate dimension tool (width)" "~ Command ``ProCmdSketDimension`` 1;"
+    Read-Host
+    Invoke-Macro "write width = $width" ("~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$width``;" + "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;")
+} else {
+    # Assign first dim = length, second dim = width (arbitrary; EvalOutline repairs a swap).
+    $targets = @($length, $width)
+    for ($i = 0; $i -lt 2; $i++) {
+        $d = $sketchDims[$i]
+        try {
+            $sym = $d.Symbol
+            $d.DimValue = $targets[$i]
+            Write-Host ("    {0} = {1}" -f $sym, $targets[$i]) -ForegroundColor Gray
+        } catch {
+            Write-Host "    WARNING: could not set sketch dim $($i): $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    # Solve the sketch IN PLACE so the edits stick and the section is marked dirty.
+    try { $sketchModel.Regenerate($null) } catch {
+        Write-Host "    WARNING: sketch regen threw: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
 
 # ============================================
 # EXIT SKETCHER
@@ -526,8 +573,8 @@ Wait-ModelModified -Model $model -PreviousStamp $stamp
 #      to commit programmatically — fully automatic, no manual green check.
 #   3. Diff the dim symbols AFTER: the symbol(s) that appeared belong to the new extrude.
 #   4. Identify the depth dim by elimination (the new Linear dim matching neither length nor
-#      width), set its DimValue = height, Regenerate($null), then re-read to confirm it
-#      stuck — exactly diminator's set/regen/re-read pattern.
+#      width), set its DimValue = height, force a regen (Invoke-ForceRegen) so it propagates
+#      without a manual sketch reopen, then re-read to confirm it stuck.
 $pfcModelItemType = New-Object -ComObject pfcls.pfcModelItemType
 
 # Before-snapshot of dimension symbols (proven ListItems(ITEM_DIMENSION) path).
@@ -584,7 +631,9 @@ if ($newSymbols.Count -eq 0) {
         try {
             $depthDim = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym)
             $depthDim.DimValue = $height
-            try { $model.Regenerate($null) } catch {}
+            # Forced regen propagates the write immediately so depth updates without the user
+            # reopening the feature's sketch. Falls back to automatic regen in No-Resolve mode.
+            Invoke-ForceRegen -Model $model
             $confirm = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym).DimValue
             if ([math]::Abs([double]$confirm - $height) -lt 1e-4) {
                 Write-Host "  Set depth dim $depthSym = $height (confirmed after regen)." -ForegroundColor Green
