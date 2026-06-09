@@ -512,7 +512,9 @@ Invoke-Macro "open sketch tool (plane pre-selected)" "~ Command ``ProCmdDatumSke
 # Give the Sketch dialog a moment to come up pre-populated, then confirm it. If this Creo
 # jumps straight into the sketcher (no dialog) the stdbtn_1 Activate will no-op/fail
 # harmlessly — watch the screen and report which happens.
-Start-Sleep -Milliseconds 600
+# Trimmed 600->300ms: if the dialog isn't ready in time the stdbtn_1 macro no-ops (visible),
+# so dial back up if the enter-sketcher step starts failing.
+Start-Sleep -Milliseconds 300
 Invoke-Macro "enter sketcher" "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
 
 # Activate center rectangle tool and wait for user to draw
@@ -558,9 +560,11 @@ foreach ($pass in @(
 # ============================================
 # EXIT SKETCHER
 # ============================================
-$stamp = $model.VersionStamp
+# No VersionStamp wait here: nothing reads model geometry between exiting the sketcher and
+# opening the extrude tool (the next step is just the ProCmdFtExtrude UI command). The old
+# Wait-ModelModified could idle up to its full timeout if exiting the sketch didn't bump the
+# stamp — pure dead time that read as "slow regen."
 Invoke-Macro "exit sketcher" "~ Command ``ProCmdSketDone``;"
-Wait-ModelModified -Model $model -PreviousStamp $stamp
 
 # ============================================
 # EXTRUDE WITH EXACT DEPTH
@@ -578,37 +582,46 @@ $pfcModelItemType = New-Object -ComObject pfcls.pfcModelItemType
 # Before-snapshot of dimension symbols (proven ListItems(ITEM_DIMENSION) path).
 $beforeDims = Get-DimSymbols -Model $model -TypeObj $pfcModelItemType
 
-Invoke-Macro "open extrude tool" "~ Command ``ProCmdFtExtrude``;"
-Start-Sleep -Milliseconds 800
-
-# Type the height into the dashboard MRU field, then commit with dashInst0.Done — fully
-# automatic per the chosen flow. The authoritative feature DimValue write below still runs
-# afterward to guarantee the depth is exact regardless of what the dashboard field produced.
+# Open the extrude tool, type the depth, and confirm — ALL IN ONE ATOMIC MACRO. This mirrors
+# thickenator's working pattern (ProCmdFtThicken ... dashInst0.Done in a single RunMacro) and
+# the recorded extrude trail. Splitting open/depth/confirm into separate RunMacro calls (as a
+# prior version did) silently drops dashInst0.Done: the dashboard's command context does not
+# survive across separate RunMacro calls, so the confirm fired into a dashboard Creo had
+# already lost track of. One atomic string keeps the whole tool session alive end to end.
+# The Enter/Exit on dashInst0.Quit (from the recording) blur the depth field so Done lands;
+# they do NOT cancel anything (Enter/Exit are hover events, not Activate).
 $stamp = $model.VersionStamp
-$mkExtrudeDepth =
+$mkExtrude =
+    "~ Command ``ProCmdFtExtrude``;" +
     "~ Update ``main_dlg_cur`` ``GrmTextTagEmbedMRU`` ``$height``;" +
     "~ Activate ``main_dlg_cur`` ``GrmTextTagEmbedMRU``;" +
+    "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
+    "~ Exit ``main_dlg_cur`` ``dashInst0.Quit``;" +
     "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-Invoke-Macro "set depth = $height and commit extrude" $mkExtrudeDepth
-Wait-ModelModified -Model $model -PreviousStamp $stamp
+Invoke-Macro "extrude + confirm" $mkExtrude
+# A normal fast regen bumps the stamp within tens of ms and this returns immediately. Cap the
+# ceiling at 5s (not the 30s default) so a stamp that never changes the expected way can't
+# silently burn half a minute and look like a slow regen.
+Wait-ModelModified -Model $model -PreviousStamp $stamp -TimeoutMs 5000
 
 # ============================================
-# IDENTIFY DEPTH DIM (no write yet — measure first, correct only if needed)
+# DEPTH DIM IDENTIFICATION (deferred — only runs if the measure shows depth wrong)
 # ============================================
 # Identify the new extrude's depth dim by diffing dimension symbols before vs. after.
 # Whatever symbols are new belong to the extrude. Depth is the new Linear dim whose value
-# matches NEITHER requested length NOR width (found by elimination). We DO NOT write/regen
-# here: the extrude's dashInst0.Done already committed and regenerated the feature, so the
-# geometry is usually already correct. A full $model.Regenerate($null) is the slow step, so
-# we defer it — the EvalOutline measure below decides whether the authoritative DimValue
-# write + regen is actually needed (only when the dashboard depth came out wrong).
-$afterDims = Get-DimSymbols -Model $model -TypeObj $pfcModelItemType
-
-$depthSym = $null
-$newSymbols = @($afterDims.Keys | Where-Object { -not $beforeDims.ContainsKey($_) })
-if ($newSymbols.Count -eq 0) {
-    Write-Host "  WARNING: no new dimension appeared after the extrude — depth correction unavailable if needed." -ForegroundColor Yellow
-} else {
+# matches NEITHER requested length NOR width (found by elimination).
+#
+# This is wrapped in a function and NOT called here: the after-extrude dim enumeration +
+# diff is only needed to drive the depth correction, which only fires when EvalOutline shows
+# the height wrong. On the common correct-depth path we skip the whole scan. $beforeDims was
+# already captured before the extrude (it is cheap and must be taken pre-extrude).
+function Resolve-DepthSym {
+    $afterDims = Get-DimSymbols -Model $model -TypeObj $pfcModelItemType
+    $newSymbols = @($afterDims.Keys | Where-Object { -not $beforeDims.ContainsKey($_) })
+    if ($newSymbols.Count -eq 0) {
+        Write-Host "  WARNING: no new dimension appeared after the extrude — depth correction unavailable." -ForegroundColor Yellow
+        return $null
+    }
     Write-Host "  New dimension(s) after extrude:" -ForegroundColor White
     foreach ($s in $newSymbols) {
         $info = $afterDims[$s]
@@ -629,13 +642,13 @@ if ($newSymbols.Count -eq 0) {
     }
 
     if ($depthSymbols.Count -eq 1) {
-        $depthSym = $depthSymbols[0]
-        Write-Host "  Depth dim identified as $depthSym (will correct only if the measure disagrees)." -ForegroundColor Gray
+        return $depthSymbols[0]
     } elseif ($depthSymbols.Count -gt 1) {
-        Write-Host "  WARNING: $($depthSymbols.Count) candidate depth dims (none match W/H) — cannot pick safely. Verify below." -ForegroundColor Yellow
+        Write-Host "  WARNING: $($depthSymbols.Count) candidate depth dims (none match W/H) — cannot pick safely." -ForegroundColor Yellow
     } else {
-        Write-Host "  WARNING: no depth dim found among the new dimensions — verify below." -ForegroundColor Yellow
+        Write-Host "  WARNING: no depth dim found among the new dimensions." -ForegroundColor Yellow
     }
+    return $null
 }
 
 # ============================================
@@ -690,6 +703,9 @@ if ($null -ne $measured -and -not $verifyPass) {
     # so the common correct-depth path skips it entirely (that was the slow step).
     if (-not $heightOk) {
         Write-Host ""
+        # Identify the depth dim NOW (deferred from after the extrude — skipped entirely when
+        # depth was already correct, which is the common case).
+        $depthSym = Resolve-DepthSym
         if ($null -ne $depthSym) {
             Write-Host "  Height (Y extrude) measured wrong — correcting depth dim $depthSym = $height..." -ForegroundColor Yellow
             try {
