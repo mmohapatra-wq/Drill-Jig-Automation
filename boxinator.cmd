@@ -35,6 +35,10 @@ function Wait-ModelModified {
     $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
     while ([DateTime]::Now -lt $deadline) {
         try { if ($Model.VersionStamp -ne $PreviousStamp) { return } } catch {}
+        # Sleep between polls. Without this the loop busy-waits, pegging a CPU core and
+        # flooding Creo with COM VersionStamp reads *during* the regen it's waiting on,
+        # which slows the very operation it's polling for. 50ms is well under human-perceptible.
+        Start-Sleep -Milliseconds 50
     }
     Write-Host "  (warning: timed out waiting for model update)" -ForegroundColor Yellow
 }
@@ -48,13 +52,36 @@ function Wait-ModelModified {
 # the CC* factory name lives as the static Create method on the pfcRegenInstructions class.
 function Invoke-ForceRegen {
     param($Model)
+    # Why this is not just $Model.Regenerate(): on this build Creo runs in No-Resolve mode, where
+    # the VB API explicitly does NOT support regeneration — $Model.Regenerate($instr) throws
+    # IpfcXToolkitBadContext (confirmed in the docs), and the only documented workaround is the
+    # deprecated regen_failure_handling=resolve_mode config, which pops a blocking CS260154 dialog
+    # (see CLAUDE.md). The $null (automatic/incremental) regen does NOT propagate a freshly-written
+    # feature DimValue to geometry — that was the live symptom: depth stayed stale until the feature
+    # was manually reopened. So the real fix is to drive Creo's own Regenerate command through the
+    # UI (ProCmdRegenerate), which does a full regenerate and is exactly what the manual reopen
+    # accomplished. Order: API forced regen (works if a session is ever in Resolve mode) -> UI
+    # regenerate mapkey (the reliable path here) -> automatic regen as a last resort.
     try {
         $regenCls = New-Object -ComObject pfcls.pfcRegenInstructions
         $instr    = $regenCls.Create($false, $true, $null)   # Create(AllowFixUI, ForceRegen, FromFeat)
         $Model.Regenerate($instr)
         return
     } catch {
-        # No-Resolve mode (IpfcXToolkitBadContext) or unavailable factory — fall back.
+        # No-Resolve mode (IpfcXToolkitBadContext) or unavailable factory — fall through to the UI command.
+    }
+    # UI regenerate — mirrors the manual feature reopen that DID propagate the depth. ProCmdRegenerate
+    # is the standard Creo regenerate command; if it ever no-ops, re-record with visible_mapkeys yes.
+    $before = $null
+    try { $before = $Model.VersionStamp } catch {}
+    Invoke-Macro "force regenerate (UI)" "~ Command ``ProCmdRegenerate``;"
+    if ($null -ne $before) {
+        # Give the regenerate a moment to bump the stamp; if it does, the model rebuilt.
+        # Poll at 50ms (finer than the old 100ms) so a fast regen returns sooner; same ~1.5s ceiling.
+        for ($i = 0; $i -lt 30; $i++) {
+            try { if ($Model.VersionStamp -ne $before) { return } } catch {}
+            Start-Sleep -Milliseconds 50
+        }
     }
     try { $Model.Regenerate($null) } catch {}
 }
@@ -446,7 +473,7 @@ $model      = $session.GetActiveModel()
 # DEBUG VISIBILITY: when on, visible_mapkeys=yes makes each macro replay on screen
 # so we can watch exactly which widget interaction diverges. Flip to $false once the
 # sketch/extrude flow is confirmed, to restore the quiet repo-convention behavior.
-$DebugMacros = $true
+$DebugMacros = $false
 
 $origVis = $null; $origPrev = $null
 try { $v = $session.GetConfigOptionValues("visible_mapkeys"); if ($v.Count -gt 0) { $origVis  = $v.Item(0) } } catch {}
@@ -495,66 +522,37 @@ Invoke-Macro "activate center-rectangle tool" $mkRectTool
 Write-Host ""
 Write-Host "  In Creo sketcher: click the center of the rectangle, then click a corner." -ForegroundColor White
 Write-Host "  The size doesn't matter — dimensions will be set automatically." -ForegroundColor Gray
+Write-Host "  Then press Esc to finish the rectangle." -ForegroundColor White
 Write-Host ""
-Write-Host "  Press ENTER here when done drawing." -ForegroundColor White
-Read-Host
 
 # ============================================
-# SET SKETCH DIMENSIONS PROGRAMMATICALLY (no per-edge clicking)
+# SET SKETCH DIMENSIONS — one double-click PER dim, no per-edge dimension tool
 # ============================================
-# A drawn center-rectangle already carries its two driving linear dims as d# symbols on the
-# SKETCH model. Instead of firing ProCmdSketDimension and making the user click+place each
-# edge, we read those dims directly and write DimValue, then solve the sketch in place. The
-# sketch must be regenerated WHILE OPEN ($sketchModel.Regenerate) or Creo discards the edits
-# ("Part not changed since last regen") — this is diminator's confirmed pass-2 pattern.
+# The inline dim editor (mod_dim_emb) only exists while a single dim is being edited.
+# Double-clicking a sketch dim opens it (DEV_NOTES: "Also fires on double-click of existing
+# dim"). A write + Activate commits that dim and CLOSES the editor — it does NOT advance to a
+# second dim. (The earlier "one double-click fills both" attempt set only one value for exactly
+# this reason.) So each dim needs its own double-click; the write+Activate then sticks it.
+# This is still just two double-clicks total — no ProCmdSketDimension per-edge picking.
 #
-# We do NOT need to know which dim is LENGTH vs WIDTH: both are DimType=Linear and ListItems
-# order is Creo-internal. We assign {length, width} to the two sketch dims in whatever order
-# they come, then let the geometric EvalOutline verify (below) detect and repair a reversed
-# mapping. So a swap is self-correcting, not a failure.
-Write-Host ""
-Write-Host "  Setting sketch dimensions automatically (no clicking needed)..." -ForegroundColor White
-
-$sketchTypeObj = New-Object -ComObject pfcls.pfcModelItemType
-$sketchModel   = $null
-try { $sketchModel = $session.GetActiveModel() } catch {}
-
-$sketchDims = @()
-if ($null -ne $sketchModel) {
-    try {
-        foreach ($d in $sketchModel.ListItems($sketchTypeObj.ITEM_DIMENSION)) {
-            try { if ($d.DimType -eq 0) { $sketchDims += $d } } catch {}
-        }
-    } catch {}
-}
-
-if ($sketchDims.Count -lt 2) {
-    Write-Host "  WARNING: expected 2 linear sketch dims, found $($sketchDims.Count). Falling back to manual entry." -ForegroundColor Yellow
-    Write-Host "  [1/2 LENGTH] Click a HORIZONTAL edge, middle-click to place, then press ENTER." -ForegroundColor Green
-    Invoke-Macro "activate dimension tool (length)" "~ Command ``ProCmdSketDimension`` 1;"
+# LENGTH/WIDTH order is not load-bearing — the geometric EvalOutline verify (below) repairs a
+# swap, so it doesn't matter which dim the user double-clicks first.
+#
+# NOTE: do NOT switch this to the VB API. A freshly drawn weak sketch dim is not yet a model
+# item — $session.GetActiveModel().ListItems(ITEM_DIMENSION) returns 0 for an in-progress
+# sketch (confirmed live), and the VB API exposes no live-sketcher dimension accessor.
+foreach ($pass in @(
+    @{ Label = 'FIRST';  Value = $length },
+    @{ Label = 'SECOND'; Value = $width  }
+)) {
+    Write-Host ("  DOUBLE-CLICK the {0} dimension in Creo (its inline edit box must appear)," -f $pass.Label) -ForegroundColor White
+    Write-Host "  then press ENTER here." -ForegroundColor White
     Read-Host
-    Invoke-Macro "write length = $length" ("~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$length``;" + "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;")
-    Write-Host "  [2/2 WIDTH] Click a VERTICAL edge, middle-click to place, then press ENTER." -ForegroundColor Green
-    Invoke-Macro "activate dimension tool (width)" "~ Command ``ProCmdSketDimension`` 1;"
-    Read-Host
-    Invoke-Macro "write width = $width" ("~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$width``;" + "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;")
-} else {
-    # Assign first dim = length, second dim = width (arbitrary; EvalOutline repairs a swap).
-    $targets = @($length, $width)
-    for ($i = 0; $i -lt 2; $i++) {
-        $d = $sketchDims[$i]
-        try {
-            $sym = $d.Symbol
-            $d.DimValue = $targets[$i]
-            Write-Host ("    {0} = {1}" -f $sym, $targets[$i]) -ForegroundColor Gray
-        } catch {
-            Write-Host "    WARNING: could not set sketch dim $($i): $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-    }
-    # Solve the sketch IN PLACE so the edits stick and the section is marked dirty.
-    try { $sketchModel.Regenerate($null) } catch {
-        Write-Host "    WARNING: sketch regen threw: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
+
+    $mk =
+        "~ Update ``main_dlg_cur`` ``mod_dim_emb`` ``$($pass.Value)``;" +
+        "~ Activate ``main_dlg_cur`` ``mod_dim_emb``;"
+    Invoke-Macro "set $($pass.Label.ToLower()) sketch dim = $($pass.Value)" $mk
 }
 
 # ============================================
@@ -595,17 +593,21 @@ Invoke-Macro "set depth = $height and commit extrude" $mkExtrudeDepth
 Wait-ModelModified -Model $model -PreviousStamp $stamp
 
 # ============================================
-# AUTHORITATIVE DEPTH (feature DimValue — the dashboard field is unreliable)
+# IDENTIFY DEPTH DIM (no write yet — measure first, correct only if needed)
 # ============================================
 # Identify the new extrude's depth dim by diffing dimension symbols before vs. after.
 # Whatever symbols are new belong to the extrude. Depth is the new Linear dim whose value
-# matches NEITHER requested length NOR width (found by elimination). Then set DimValue +
-# Regenerate + re-read, just like diminator.
+# matches NEITHER requested length NOR width (found by elimination). We DO NOT write/regen
+# here: the extrude's dashInst0.Done already committed and regenerated the feature, so the
+# geometry is usually already correct. A full $model.Regenerate($null) is the slow step, so
+# we defer it — the EvalOutline measure below decides whether the authoritative DimValue
+# write + regen is actually needed (only when the dashboard depth came out wrong).
 $afterDims = Get-DimSymbols -Model $model -TypeObj $pfcModelItemType
 
+$depthSym = $null
 $newSymbols = @($afterDims.Keys | Where-Object { -not $beforeDims.ContainsKey($_) })
 if ($newSymbols.Count -eq 0) {
-    Write-Host "  WARNING: no new dimension appeared after the extrude — depth left as the dashboard value." -ForegroundColor Yellow
+    Write-Host "  WARNING: no new dimension appeared after the extrude — depth correction unavailable if needed." -ForegroundColor Yellow
 } else {
     Write-Host "  New dimension(s) after extrude:" -ForegroundColor White
     foreach ($s in $newSymbols) {
@@ -628,21 +630,7 @@ if ($newSymbols.Count -eq 0) {
 
     if ($depthSymbols.Count -eq 1) {
         $depthSym = $depthSymbols[0]
-        try {
-            $depthDim = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym)
-            $depthDim.DimValue = $height
-            # Forced regen propagates the write immediately so depth updates without the user
-            # reopening the feature's sketch. Falls back to automatic regen in No-Resolve mode.
-            Invoke-ForceRegen -Model $model
-            $confirm = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym).DimValue
-            if ([math]::Abs([double]$confirm - $height) -lt 1e-4) {
-                Write-Host "  Set depth dim $depthSym = $height (confirmed after regen)." -ForegroundColor Green
-            } else {
-                Write-Host "  WARNING: depth dim $depthSym reads $confirm after regen (wanted $height) — verify below." -ForegroundColor Yellow
-            }
-        } catch {
-            Write-Host "  WARNING: depth DimValue write threw: $($_.Exception.Message)" -ForegroundColor Yellow
-        }
+        Write-Host "  Depth dim identified as $depthSym (will correct only if the measure disagrees)." -ForegroundColor Gray
     } elseif ($depthSymbols.Count -gt 1) {
         Write-Host "  WARNING: $($depthSymbols.Count) candidate depth dims (none match W/H) — cannot pick safely. Verify below." -ForegroundColor Yellow
     } else {
@@ -696,13 +684,39 @@ if ($null -ne $measured -and -not $verifyPass) {
     $widthOk  = [math]::Abs($measured[2] - $width)  -lt $tol
     $heightOk = [math]::Abs($measured[1] - $height) -lt $tol
 
-    # Height was already set authoritatively above via the feature DimValue. If it still
-    # reads wrong here, that is a genuine failure (not a sketch-snapback case) — report it
-    # rather than re-driving the dashboard.
+    # Height (Y extrude) measured wrong — the dashboard depth came out off, so NOW run the
+    # authoritative correction we deferred: diminator's feature-dim path (set DimValue +
+    # $model.Regenerate($null) + re-read). This regen only fires in the wrong-depth case,
+    # so the common correct-depth path skips it entirely (that was the slow step).
     if (-not $heightOk) {
         Write-Host ""
-        Write-Host "  Height (Y extrude) still reads wrong after the authoritative set — this is unexpected." -ForegroundColor Red
-        Write-Host "  Check the dim dump above; the depth dim may not have been identified correctly." -ForegroundColor Red
+        if ($null -ne $depthSym) {
+            Write-Host "  Height (Y extrude) measured wrong — correcting depth dim $depthSym = $height..." -ForegroundColor Yellow
+            try {
+                $depthDim = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym)
+                $depthDim.DimValue = $height
+                Write-Host "  Regenerating after depth set..." -NoNewline
+                try { $model.Regenerate($null) } catch {}
+                Write-Host " done." -ForegroundColor Green
+
+                # Re-read after regen (diminator's truth check). Confirms the feature dim held.
+                $confirm = $model.GetItemByName($pfcModelItemType.ITEM_DIMENSION, $depthSym).DimValue
+                if ([math]::Abs([double]$confirm - $height) -lt 1e-4) {
+                    Write-Host "  Set depth dim $depthSym = $height (held through regen)." -ForegroundColor Green
+                } else {
+                    Write-Host "  WARNING: depth dim $depthSym snapped back to $confirm after regen (wanted $height)." -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "  WARNING: depth DimValue write threw: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        } else {
+            # No depth dim was identifiable — fall back to the manual guidance.
+            Write-Host "  Height (Y extrude) measures wrong and no depth dim was identified to correct it." -ForegroundColor Yellow
+            Write-Host "  In Creo, manually reopen/redefine the extrude feature (or run Regenerate) to force it," -ForegroundColor Yellow
+            Write-Host "  then press ENTER here to re-measure." -ForegroundColor Yellow
+            Read-Host
+            try { $model.Regenerate($null) } catch {}
+        }
     }
 
     # --- Sketch repair: length/width that did not land ---
@@ -735,22 +749,30 @@ if ($null -ne $measured -and -not $verifyPass) {
             }
         } catch {}
 
+        # Track dims already claimed by a target so a second target can't re-pick the
+        # same edge. Without this, when both length and width are off the width pass
+        # could select the dim the length pass just set (now == $length) and collapse
+        # both requested sizes onto one edge, leaving the other unchanged.
+        $script:usedSymbols = @()
+
         function Repair-SketchDim {
             param([double]$Target)
             $best = $null; $bestErr = [double]::MaxValue
             foreach ($d in $sketchDims) {
+                if ($script:usedSymbols -contains $d.Symbol) { continue }
                 $err = [math]::Abs([double]$d.DimValue - $Target)
                 if ($err -lt $bestErr) { $bestErr = $err; $best = $d }
             }
             if ($null -ne $best) {
                 try {
                     $best.DimValue = $Target
+                    $script:usedSymbols += $best.Symbol
                     Write-Host "    set sketch dim $($best.Symbol) -> $Target" -ForegroundColor Green
                 } catch {
                     Write-Host "    FAIL  sketch dim write threw: $($_.Exception.Message)" -ForegroundColor Red
                 }
             } else {
-                Write-Host "    FAIL  no Linear sketch dim found to set to $Target." -ForegroundColor Red
+                Write-Host "    FAIL  no unclaimed Linear sketch dim found to set to $Target." -ForegroundColor Red
             }
         }
 
