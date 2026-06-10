@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drill Jig Decision Tree Builder</title>
+<style>
+  :root {
+    --bg: #1e1f24; --panel: #2a2c33; --panel2: #32343c; --ink: #e7e8ea;
+    --muted: #9aa0a6; --line: #3d404a; --accent: #4f9cff;
+    --q: #4f9cff; --opt: #38c172; --outcome: #e0a93b; --bushing: #c678dd; --pattern: #ef6b73;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .hint { color: var(--muted); font-size: 12px; }
+  .wrap { display: flex; gap: 0; height: calc(100vh - 52px); }
+  .left { flex: 1 1 60%; overflow: auto; padding: 16px 20px; }
+  .right { flex: 1 1 40%; min-width: 360px; border-left: 1px solid var(--line); display: flex; flex-direction: column; background: var(--panel); }
+  .toolbar { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--panel2); color: var(--ink); border-radius: 6px; padding: 5px 10px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.tiny { padding: 2px 7px; font-size: 12px; }
+  button.danger:hover { border-color: var(--pattern); color: var(--pattern); }
+  .node { margin: 4px 0; }
+  .row { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+  .row:hover { border-color: #4a4d57; }
+  .grip { color: var(--muted); cursor: default; user-select: none; font-size: 12px; }
+  select.kind { font: inherit; border-radius: 6px; border: 1px solid var(--line); padding: 3px 6px; color: #fff; background: var(--panel2); }
+  .kind-q { border-left: 4px solid var(--q); }
+  .kind-option { border-left: 4px solid var(--opt); }
+  .kind-outcome { border-left: 4px solid var(--outcome); }
+  .kind-bushing { border-left: 4px solid var(--bushing); }
+  .kind-pattern { border-left: 4px solid var(--pattern); }
+  input.label { flex: 1; font: inherit; background: transparent; border: none; color: var(--ink); padding: 4px 6px; border-radius: 4px; min-width: 80px; }
+  input.label:focus { outline: none; background: var(--panel2); }
+  .btns { display: flex; gap: 4px; }
+  .children { margin-left: 22px; border-left: 1px dashed var(--line); padding-left: 10px; }
+  .notes { margin: 2px 0 2px 22px; }
+  .notes textarea { width: 100%; background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; resize: vertical; min-height: 38px; }
+  .notes .lbl { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+  .right h2 { font-size: 13px; margin: 0; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .tabs { display: flex; gap: 6px; padding: 8px 16px 0; }
+  .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .out { flex: 1; overflow: auto; padding: 12px 16px; }
+  textarea.export { width: 100%; height: 100%; min-height: 300px; background: #16171b; color: #cfe3ff; border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: 12px/1.5 "Cascadia Code", Consolas, monospace; resize: none; white-space: pre; }
+  .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .status { font-size: 11px; color: var(--muted); margin-left: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Drill Jig Decision Tree Builder</h1>
+  <span class="hint">Build the tree on the left → copy or download the JSON on the right and hand it back to Claude. Autosaves to this browser.</span>
+</header>
+<div class="wrap">
+  <div class="left">
+    <div class="legend" style="margin-bottom:12px">
+      <span><i class="dot" style="background:var(--q)"></i>Question</span>
+      <span><i class="dot" style="background:var(--opt)"></i>Option / answer</span>
+      <span><i class="dot" style="background:var(--outcome)"></i>Outcome (resulting jig spec/action)</span>
+      <span><i class="dot" style="background:var(--bushing)"></i>Bushing pick (OD → hole dia)</span>
+      <span><i class="dot" style="background:var(--pattern)"></i>Pattern grouping</span>
+    </div>
+    <div id="tree"></div>
+    <div style="margin-top:14px">
+      <button class="primary" onclick="addRoot()">+ Add top-level node</button>
+    </div>
+  </div>
+  <div class="right">
+    <div class="toolbar">
+      <button class="primary" id="linkBtn" onclick="linkFile()">🔗 Link to file (autosave)</button>
+      <button onclick="copyExport()">Copy JSON</button>
+      <button onclick="downloadJSON()">Download .json</button>
+      <button onclick="loadFromPaste()">Load from pasted JSON</button>
+      <button class="danger" onclick="resetTree()">Reset to starter</button>
+      <span class="status" id="status"></span>
+    </div>
+    <div class="tabs">
+      <button id="tab-json" class="active" onclick="setTab('json')">JSON</button>
+      <button id="tab-outline" onclick="setTab('outline')">Readable outline</button>
+    </div>
+    <div class="out">
+      <textarea id="export" class="export" spellcheck="false"></textarea>
+    </div>
+  </div>
+</div>
+
+<script>
+const KINDS = [
+  ["question", "Question"],
+  ["option", "Option / answer"],
+  ["outcome", "Outcome"],
+  ["bushing", "Bushing pick"],
+  ["pattern", "Pattern grouping"],
+];
+const STORE_KEY = "drilljig_tree_v1";
+let uid = 1;
+const nid = () => "n" + (uid++) + "_" + Date.now().toString(36);
+
+function starter() {
+  // Seeded from what we've already settled. Edit freely — the structure here
+  // is just a head start, not a constraint. Fill in NOTES with "what this
+  // choice changes downstream" wherever you can.
+  const N = (kind, label, notes, children=[]) => ({ id: nid(), kind, label, notes: notes||"", children });
+  return [
+    N("question", "Material of part being drilled?", "First branch. Does this change bushing style, plate thickness, or feed/speed callouts?", [
+      N("option", "Plastic", "", [
+        N("question", "Drill method?", "PFD = portable/power feed drill; Hand drill = manual. What differs in the jig output?", [
+          N("option", "PFD (power feed drill)", "What does PFD require? (e.g. nose-piece bushing style, plate thickness)", [
+            N("pattern", "Group datum points into named patterns", "Read datum points from skeleton plane; let user name/group them.", [
+              N("bushing", "Pick bushing for this pattern → OD sets hole dia", "Read OD from bushings.csv; hole diameter = bushing OD.", [
+                N("outcome", "Resulting jig spec", "Describe the concrete result: plate size rule, hole depth/thru, etc.")
+              ])
+            ])
+          ]),
+          N("option", "Hand drill", "How does hand-drill differ from PFD here?", [
+            N("pattern", "Group datum points into named patterns", "", [
+              N("bushing", "Pick bushing for this pattern → OD sets hole dia", "", [
+                N("outcome", "Resulting jig spec", "")
+              ])
+            ])
+          ]),
+        ])
+      ]),
+      N("option", "Metal", "Does metal change anything vs plastic? (bushing material, edge distance, depth)", [
+        N("question", "Drill method?", "", [
+          N("option", "PFD (power feed drill)", "", []),
+          N("option", "Hand drill", "", []),
+        ])
+      ]),
+    ])
+  ];
+}
+
+let tree = load() || starter();
+
+function load() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    // bump uid past any stored ids to avoid collisions
+    return data;
+  } catch (e) { return null; }
+}
+function save() {
+  localStorage.setItem(STORE_KEY, JSON.stringify(tree));
+  if (fileHandle) writeLinked();
+  flash(fileHandle ? "saved → " + fileHandle.name : "saved (browser only)");
+}
+let flashT;
+function flash(msg) {
+  const s = document.getElementById("status");
+  s.textContent = msg + " · " + new Date().toLocaleTimeString();
+  clearTimeout(flashT);
+}
+
+function findParent(list, id, parent=null) {
+  for (const n of list) {
+    if (n.id === id) return { parent, list };
+    const r = findParent(n.children, id, n);
+    if (r) return r;
+  }
+  return null;
+}
+function findNode(list, id) {
+  for (const n of list) {
+    if (n.id === id) return n;
+    const r = findNode(n.children, id);
+    if (r) return r;
+  }
+  return null;
+}
+
+function addChild(id) {
+  const n = findNode(tree, id);
+  // sensible default child kind based on parent
+  const def = n.kind === "question" ? "option" : (n.kind === "option" ? "question" : "outcome");
+  n.children.push({ id: nid(), kind: def, label: "", notes: "", children: [] });
+  render(); save();
+}
+function addRoot() {
+  tree.push({ id: nid(), kind: "question", label: "", notes: "", children: [] });
+  render(); save();
+}
+function del(id) {
+  const r = findParent(tree, id);
+  if (!r) return;
+  const i = r.list.indexOf(r.list.find(x => x.id === id));
+  if (confirm("Delete this node and everything under it?")) {
+    r.list.splice(i, 1);
+    render(); save();
+  }
+}
+function move(id, dir) {
+  const r = findParent(tree, id);
+  const i = r.list.findIndex(x => x.id === id);
+  const j = i + dir;
+  if (j < 0 || j >= r.list.length) return;
+  [r.list[i], r.list[j]] = [r.list[j], r.list[i]];
+  render(); save();
+}
+function setKind(id, kind) {
+  findNode(tree, id).kind = kind;
+  render(); save();
+}
+function setLabel(id, val) { findNode(tree, id).label = val; updateExport(); scheduleSave(); }
+function setNotes(id, val) { findNode(tree, id).notes = val; updateExport(); scheduleSave(); }
+
+let saveT;
+function scheduleSave() { clearTimeout(saveT); saveT = setTimeout(save, 500); }
+
+// ---- linked-file autosave (File System Access API) ----
+let fileHandle = null;
+const supportsFS = "showSaveFilePicker" in window;
+async function linkFile() {
+  if (!supportsFS) {
+    alert("This browser doesn't support direct file linking.\nUse Edge or Chrome, or use the Download .json button instead.");
+    return;
+  }
+  try {
+    fileHandle = await window.showSaveFilePicker({
+      suggestedName: "drill_jig_decision_tree.json",
+      types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
+    });
+    document.getElementById("linkBtn").textContent = "🔗 Linked: " + fileHandle.name;
+    document.getElementById("linkBtn").classList.add("primary");
+    await writeLinked();
+    flash("linked — autosaving to " + fileHandle.name);
+  } catch (e) { /* user cancelled */ }
+}
+async function writeLinked() {
+  if (!fileHandle) return;
+  try {
+    const w = await fileHandle.createWritable();
+    await w.write(JSON.stringify(tree, null, 2));
+    await w.close();
+  } catch (e) { flash("file write failed: " + e.message); }
+}
+
+function render() {
+  const root = document.getElementById("tree");
+  root.innerHTML = "";
+  tree.forEach(n => root.appendChild(renderNode(n)));
+  updateExport();
+}
+function renderNode(n) {
+  const wrap = document.createElement("div");
+  wrap.className = "node";
+
+  const row = document.createElement("div");
+  row.className = "row kind-" + n.kind;
+
+  const grip = document.createElement("span");
+  grip.className = "grip"; grip.textContent = "≡";
+  row.appendChild(grip);
+
+  const sel = document.createElement("select");
+  sel.className = "kind";
+  KINDS.forEach(([v, lbl]) => {
+    const o = document.createElement("option");
+    o.value = v; o.textContent = lbl; if (v === n.kind) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.onchange = () => setKind(n.id, sel.value);
+  row.appendChild(sel);
+
+  const inp = document.createElement("input");
+  inp.className = "label"; inp.value = n.label;
+  inp.placeholder = n.kind === "question" ? "Type the question…"
+    : n.kind === "outcome" ? "Describe the resulting jig spec…"
+    : "Label…";
+  inp.oninput = () => setLabel(n.id, inp.value);
+  row.appendChild(inp);
+
+  const btns = document.createElement("div");
+  btns.className = "btns";
+  btns.innerHTML = `
+    <button class="tiny" title="Add child">+ child</button>
+    <button class="tiny" title="Notes">notes</button>
+    <button class="tiny" title="Move up">↑</button>
+    <button class="tiny" title="Move down">↓</button>
+    <button class="tiny danger" title="Delete">✕</button>`;
+  const [bChild, bNotes, bUp, bDown, bDel] = btns.querySelectorAll("button");
+  bChild.onclick = () => addChild(n.id);
+  bUp.onclick = () => move(n.id, -1);
+  bDown.onclick = () => move(n.id, 1);
+  bDel.onclick = () => del(n.id);
+  row.appendChild(btns);
+  wrap.appendChild(row);
+
+  const notes = document.createElement("div");
+  notes.className = "notes";
+  notes.style.display = n.notes ? "block" : "none";
+  notes.innerHTML = `<div class="lbl">NOTES — what this choice changes downstream:</div>`;
+  const ta = document.createElement("textarea");
+  ta.value = n.notes; ta.placeholder = "e.g. PFD requires a nose-piece bushing; plate thickness fixed at …";
+  ta.oninput = () => setNotes(n.id, ta.value);
+  notes.appendChild(ta);
+  wrap.appendChild(notes);
+  bNotes.onclick = () => { notes.style.display = notes.style.display === "none" ? "block" : "none"; if (notes.style.display==="block") ta.focus(); };
+
+  if (n.children.length) {
+    const kids = document.createElement("div");
+    kids.className = "children";
+    n.children.forEach(c => kids.appendChild(renderNode(c)));
+    wrap.appendChild(kids);
+  }
+  return wrap;
+}
+
+// ---- export ----
+let tab = "json";
+function setTab(t) {
+  tab = t;
+  document.getElementById("tab-json").classList.toggle("active", t==="json");
+  document.getElementById("tab-outline").classList.toggle("active", t==="outline");
+  updateExport();
+}
+function updateExport() {
+  const ta = document.getElementById("export");
+  ta.value = tab === "json" ? JSON.stringify(tree, null, 2) : outline(tree);
+}
+function outline(list, depth=0) {
+  let s = "";
+  const pad = "  ".repeat(depth);
+  const tag = { question:"[Q]", option:"[opt]", outcome:"[OUTCOME]", bushing:"[BUSHING]", pattern:"[PATTERN]" };
+  for (const n of list) {
+    s += pad + (tag[n.kind]||"") + " " + (n.label||"(untitled)") + "\n";
+    if (n.notes) s += pad + "    note: " + n.notes.replace(/\n/g, " ") + "\n";
+    if (n.children.length) s += outline(n.children, depth+1);
+  }
+  return s;
+}
+function copyExport() {
+  const ta = document.getElementById("export");
+  ta.select(); document.execCommand("copy");
+  flash("copied to clipboard");
+}
+function downloadJSON() {
+  const blob = new Blob([JSON.stringify(tree, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "drill_jig_decision_tree.json";
+  a.click();
+  flash("downloaded");
+}
+function loadFromPaste() {
+  const txt = prompt("Paste previously-exported JSON here to reload it:");
+  if (!txt) return;
+  try {
+    tree = JSON.parse(txt);
+    render(); save(); flash("loaded pasted JSON");
+  } catch (e) { alert("That wasn't valid JSON: " + e.message); }
+}
+function resetTree() {
+  if (confirm("Discard the current tree and reload the starter template?")) {
+    tree = starter(); render(); save();
+  }
+}
+
+// allow editing JSON directly in the textarea (JSON tab only)
+document.getElementById("export").addEventListener("blur", function() {
+  if (tab !== "json") return;
+  try {
+    const parsed = JSON.parse(this.value);
+    tree = parsed; render(); save();
+  } catch (e) { /* ignore — keep editing */ }
+});
+
+render();
+</script>
+</body>
+</html>

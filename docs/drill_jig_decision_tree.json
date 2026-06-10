@@ -1,0 +1,102 @@
+[
+  {
+    "id": "n15_mq6risiq",
+    "kind": "question",
+    "label": "Material of part being drilled?",
+    "notes": "",
+    "children": [
+      {
+        "id": "n16_mq6rjmhg",
+        "kind": "option",
+        "label": "Metal",
+        "notes": "",
+        "children": [
+          {
+            "id": "n17_mq6rjtrc",
+            "kind": "question",
+            "label": "PFD or Hand Drill",
+            "notes": "",
+            "children": [
+              {
+                "id": "n18_mq6rktz3",
+                "kind": "option",
+                "label": "PFD",
+                "notes": "",
+                "children": [
+                  {
+                    "id": "n19_mq6rlomt",
+                    "kind": "outcome",
+                    "label": "Show catalog of all 3/4 ID sleeves for user to select",
+                    "notes": "",
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "id": "n20_mq6rn0g7",
+                "kind": "option",
+                "label": "Hand Drill",
+                "notes": "",
+                "children": [
+                  {
+                    "id": "n21_mq6rn68y",
+                    "kind": "outcome",
+                    "label": "Show catalog of all 3/4 OD and 1/2 OD removable bushings for user to select",
+                    "notes": "",
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "n22_mq6ro5gv",
+        "kind": "option",
+        "label": "3D print",
+        "notes": "",
+        "children": [
+          {
+            "id": "n23_mq6roylm",
+            "kind": "question",
+            "label": "PFD or Hand Drill",
+            "notes": "",
+            "children": [
+              {
+                "id": "n27_mq6rpn45",
+                "kind": "option",
+                "label": "PFD",
+                "notes": "",
+                "children": [
+                  {
+                    "id": "n29_mq6rpz1u",
+                    "kind": "outcome",
+                    "label": "Show catalog of all 3/4 ID and 1/2 ID sleeves for user to select",
+                    "notes": "",
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "id": "n28_mq6rpqzu",
+                "kind": "option",
+                "label": "Hand Drill",
+                "notes": "",
+                "children": [
+                  {
+                    "id": "n30_mq6rr0fj",
+                    "kind": "outcome",
+                    "label": "Show catalog of all 3/4 ID and 1/2 ID sleeves for user to select",
+                    "notes": "",
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]
