@@ -287,3 +287,32 @@ Creates a rectangular extruded solid with exact width/height/depth. The mapkey w
 - **The extrude fires as ONE atomic `RunMacro` (open → depth → `Enter`/`Exit Quit` → `dashInst0.Done`).** A prior version split open/depth/confirm into three separate `RunMacro` calls; the confirm was silently dropped because a dashboard's command context does not survive across `RunMacro` calls — the extrude dashboard stayed open AND the regen stalled (the half-alive dashboard is what made the regen look "slow"). Consolidating into a single macro (thickenator's proven pattern) makes `dashInst0.Done` land and the regen finish instantly. See Mapkey Patterns → Extrude depth.
 
 **Current status:** Rebuilt around `EvalOutline` geometric verification (symbol-capture machinery removed). Parses clean. Live regressions found and fixed across several passes: (1) **sketch dialog came up with no plane** — the by-ID tree-search pre-select fed the selection buffer but not the dialog MRU; replaced with the confirmed split-macro flow (open Sketch tool → user clicks plane on screen → script enters sketcher). (2) **depth needed a manual reopen** — two independent causes addressed: the extrude was being missed by the `FEATTYPE_PROTRUSION` filter (now type-agnostic ID-diff), and depth is now made correct by the direct feature `DimValue` write rather than relying on regen mode. (3) **`regen_failure_handling = resolve_mode` removed** — it is deprecated on this Creo build and popped a blocking CS260154 authorization dialog that stalled the sketch step. (4) **extrude dashboard would not auto-close + regen looked slow** — the extrude had been split across three separate `RunMacro` calls, so `dashInst0.Done` was silently dropped and the half-alive dashboard stalled the regen; fixed by firing the whole extrude as one atomic `RunMacro` (confirmed live: extrude now confirms automatically and regen completes instantly). Confirm live: sketch dialog populates after the plane click, the extrude opens/sets depth/confirms in one shot with no manual click, depth propagates without a manual reopen, EvalOutline reports PASS, and a deliberate-mismatch negative test FAILS as expected.
+
+**Parametric sketch-dim snap-back (ABANDONED):** A separate effort on this branch tried to drive a box's in-plane SKETCH dims (width/height) from PowerShell and have them survive regen. Four programmatic routes all FAILED — (1) raw `$dim.DimValue` write, (2) in-sketcher `mod_dim_emb` edit, (3) tree-Edit `mod_partdim_emb` (`ProCmdL05Edit@PopupMenuTree`), (4) direct relations `d# = value` via `$model.Relations`. Root cause: a rough rectangle has WEAK dims, so the sketch solver re-derives them from unchanged geometry on regen; routes 1–3 only change the displayed value, and the relations route failed too on this build. Abandoned 2026-06-10 (diminishing returns). The only untried mechanism is the UDF route (set dims by symbol at placement time). The working production fallback is boxinator's gated sketch-open repair. Feature-level dims (extrude depth, datum offset) are unaffected — they hold via a plain `DimValue` write.
+
+### datinator.cmd
+Skeleton datum-point reader (pure VB API, read-only). This is piece (A) of the drill-jig configurator: the source-geometry read. Writes nothing to the model — safe to run repeatedly against a live part.
+
+**Flow:**
+1. Single-session guard (exactly one `xtop.exe`), connect, get active model.
+2. Enumerate every datum point via `ListItems(ITEM_POINT)`; read each point's true XYZ via `IpfcPoint.Point`.
+3. Pick a coordinate-system frame for projection: no CSYS → world frame (origin 0, identity axes); one CSYS → use it; many → user chooses. CSYS axes read from `chosenCsys.CoordSys` via `GetOrigin`/`GetXAxis`/`GetYAxis`/`GetZAxis`.
+4. Project each point into the frame: `u = (P-O)·X`, `v = (P-O)·Y`, `off = (P-O)·Z`. In-plane `(U,V)` is the 2D hole pattern; signed `off` doubles as an on-plane check (~0 = lies on the plane).
+5. Print a table sorted by `PlaneV, PlaneU`; warn if max `|off|` > `1e-4` (not all points on the chosen plane).
+6. Export to `.\<modelname>_datums.csv`.
+
+**Output CSV columns:** `PointID, PointName, X, Y, Z, PlaneU, PlaneV, OffPlane, CsysName`
+
+Helpers: `Get-Comp` (reads the 3 components of an `IpfcPoint3D`/`IpfcVector3D` via `$V[0..2]` bracket indexing, `.Item(i)` fallback) and `Dot`.
+
+### jiginator.cmd
+Drill-jig decision-tree walker — the QUESTION FLOW only (no Creo connection yet; geometry creation comes later). Has a companion `jiginator.ps1`.
+
+**Flow:**
+1. Load the decision tree from `docs\drill_jig_decision_tree.json` (authored in `docs\drill_jig_tree_builder.html` — the tree is the single source of truth; edit the HTML builder and the prompt updates with no code change).
+2. Walk the user through the tree node-by-node (`Invoke-Walk`, recursive). Node kinds: `question`, `option`, `outcome`, `bushing`, `pattern`.
+3. At an `outcome`, parse the label into a catalog query (`Get-CatalogSpec`): "removable"/"drill" → `data\bushings_drill.csv`, "sleeve" → `data\bushings.csv`, plus any `<fraction> ID|OD` constraints.
+4. Three-stage bushing pick (`Invoke-BushingPick`): **OD** (drives the hole diameter) → **length** within that OD → **ID** (always explicit — ID never changes the jig hole, so the user may leave it unspecified). Machinist fractions ("3/4", "1 3/8") are shown from the row `EasyName` via `Get-FracLabel`.
+5. End by printing the chosen path and resolved outcome(s): which catalog subset to show and the hole diameter (= selected bushing OD).
+
+Helpers: `ConvertTo-Decimal` (fraction/number → decimal), `Read-Choice` (numbered menu with Q-to-quit). Main loop offers "Run again?".
