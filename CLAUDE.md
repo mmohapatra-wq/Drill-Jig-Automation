@@ -363,23 +363,8 @@ Creates a rectangular extruded solid with exact width/height/depth. The mapkey w
 
 **Parametric sketch-dim snap-back (ABANDONED):** A separate effort on this branch tried to drive a box's in-plane SKETCH dims (width/height) from PowerShell and have them survive regen. Four programmatic routes all FAILED — (1) raw `$dim.DimValue` write, (2) in-sketcher `mod_dim_emb` edit, (3) tree-Edit `mod_partdim_emb` (`ProCmdL05Edit@PopupMenuTree`), (4) direct relations `d# = value` via `$model.Relations`. Root cause: a rough rectangle has WEAK dims, so the sketch solver re-derives them from unchanged geometry on regen; routes 1–3 only change the displayed value, and the relations route failed too on this build. Abandoned 2026-06-10 (diminishing returns). The only untried mechanism is the UDF route (set dims by symbol at placement time). The working production fallback is boxinator's gated sketch-open repair. Feature-level dims (extrude depth, datum offset) are unaffected — they hold via a plain `DimValue` write.
 
-### datinator.cmd
-Skeleton datum-point reader (pure VB API, read-only). This is piece (A) of the drill-jig configurator: the source-geometry read. Writes nothing to the model — safe to run repeatedly against a live part.
-
-**Flow:**
-1. Single-session guard (exactly one `xtop.exe`), connect, get active model.
-2. Enumerate every datum point via `ListItems(ITEM_POINT)`; read each point's true XYZ via `IpfcPoint.Point`.
-3. Pick a coordinate-system frame for projection: no CSYS → world frame (origin 0, identity axes); one CSYS → use it; many → user chooses. CSYS axes read from `chosenCsys.CoordSys` via `GetOrigin`/`GetXAxis`/`GetYAxis`/`GetZAxis`.
-4. Project each point into the frame: `u = (P-O)·X`, `v = (P-O)·Y`, `off = (P-O)·Z`. In-plane `(U,V)` is the 2D hole pattern; signed `off` doubles as an on-plane check (~0 = lies on the plane).
-5. Print a table sorted by `PlaneV, PlaneU`; warn if max `|off|` > `1e-4` (not all points on the chosen plane).
-6. Export to `.\<modelname>_datums.csv`.
-
-**Output CSV columns:** `PointID, PointName, X, Y, Z, PlaneU, PlaneV, OffPlane, CsysName`
-
-Helpers: `Get-Comp` (reads the 3 components of an `IpfcPoint3D`/`IpfcVector3D` via `$V[0..2]` bracket indexing, `.Item(i)` fallback) and `Dot`.
-
 ### jiginator.cmd
-Drill-jig decision-tree walker — the QUESTION FLOW only (no Creo connection yet; geometry creation comes later). Has a companion `jiginator.ps1`.
+Drill-jig decision-tree walker — the QUESTION FLOW only (no Creo connection; it produces the hole diameter that holeinator consumes). Has a companion `jiginator.ps1`. This is piece **(B)** of the drill-jig configurator.
 
 **Flow:**
 1. Load the decision tree from `docs\drill_jig_decision_tree.json` (authored in `docs\drill_jig_tree_builder.html` — the tree is the single source of truth; edit the HTML builder and the prompt updates with no code change).
@@ -387,38 +372,29 @@ Drill-jig decision-tree walker — the QUESTION FLOW only (no Creo connection ye
 3. At an `outcome`, parse the label into a catalog query (`Get-CatalogSpec`): "removable"/"drill" → `data\bushings_drill.csv`, "sleeve" → `data\bushings.csv`, plus any `<fraction> ID|OD` constraints.
 4. Three-stage bushing pick (`Invoke-BushingPick`): **OD** (drives the hole diameter) → **length** within that OD → **ID** (always explicit — ID never changes the jig hole, so the user may leave it unspecified). Machinist fractions ("3/4", "1 3/8") are shown from the row `EasyName` via `Get-FracLabel`.
 5. End by printing the chosen path and resolved outcome(s): which catalog subset to show and the hole diameter (= selected bushing OD).
-6. **Handoff to holeinator:** after a completed walk, the resolved hole spec is written to `last_jig_spec.json` in the repo root (file-based handoff, same style as datinator → diminator CSV). If several outcomes resolve a bushing, the LAST pick wins as the active `HoleDiameter`; all picks are kept under `AllPicks`. holeinator reads this file to pre-fill its diameter.
+6. **Handoff to holeinator:** after a completed walk, the resolved hole spec is written to `last_jig_spec.json` in the repo root (file-based handoff, same style as the gauginator/diminator CSV handoff). If several outcomes resolve a bushing, the LAST pick wins as the active `HoleDiameter`; all picks are kept under `AllPicks`. holeinator reads this file to pre-fill its diameter.
 
 **Handoff contract — `last_jig_spec.json`:** `{ HoleDiameter (= bushing OD, the jig hole Ø), Bushing (EasyName), PartNumber, Outcome (tree label), Path (decision path string), AllPicks[] }`. holeinator only requires `HoleDiameter`; the rest is provenance.
 
 Helpers: `ConvertTo-Decimal` (fraction/number → decimal), `Read-Choice` (numbered menu with Q-to-quit). Main loop offers "Run again?".
 
 ### holeinator.cmd
-Creates an **On-Point hole** at every target datum point — piece (C) of the drill-jig configurator (geometry creation), following datinator's point read (A) and jiginator's bushing pick (B). Built on the nodelator skeleton (connect / config-suppress / finally-restore) but the engine is **create-from-scratch**, not duplicate.
+Creates an **On-Point hole** at every target datum point — piece **(C)** of the drill-jig configurator (geometry creation), consuming jiginator's diameter (B). **Works live (confirmed 2026-06-11):** drilled clean through-holes at every selected point on a real multi-body jig part.
 
-**Why On-Point create, not duplicate or extrude-cut:** there is no example feature to copy (`IpfcSolid.CreateFeature` is "not implemented" on this build, so a pure-API hole is out). An extrude-cut would need a circle sketched + dimensioned onto each point, and sketch placement needs a human screen pick (boxinator's lesson) — that does not scale to N points. Creo's native Hole tool in **On Point** placement drops a hole coaxial to a datum point with NO sketch, so the whole loop runs unattended, selecting each point **by ID** (the proven nodelator/radinator tree-search pattern — no screen picks).
+**Engine = native On-Point hole, ID-only, human-in-the-loop.** Each hole is created from scratch with Creo's native Hole tool in On-Point placement (no example feature — `IpfcSolid.CreateFeature` is "not implemented" on this build; no extrude-cut — that needs a screen pick per sketch and doesn't scale). The point is selected **by ID** (tree search), then the recorded hole dashboard fires as ONE atomic `RunMacro`. Diameter is set directly in the dashboard (never written-then-regenerated), so the sketch-dim snap-back trap never applies.
 
-**Verification is geometric** (boxinator/radinator ethos): count cylindrical surfaces at the hole radius before/after and assert the increase. "Done (confirmed)" means holes were *measured* on the solid, not that macros fired. All cylinder reads use radinator's confirmed accessors (`GetSurfaceDescriptor` → `GetSurfaceType()` == 1 → `$desc.Radius`).
+**ID-ONLY — the script never reads `IpfcPoint.Point` coordinates.** This is the key design fact and the result of a hard-won pivot (see below). The human makes the on-plane / which-body judgment **visually** (by selecting), so the tool needs only point IDs. Resolving a selected datum-point FEATURE into its point IDs uses `ListSubItems(ITEM_POINT)` → `$p.Id` — also id-only, no coords.
 
-**Flow (read-only analysis first, mutation last):**
-1. Connect, get active model, null-check, print filename.
-2. **Mode guard:** if the active model filename matches `.asm` → STOP (assembly mode resolves datum points / by-ID selection against the `.asm`, not the part to drill); non-`.prt`/non-`.asm` → warn + y/N. Keys off the filename extension, NOT `EpfcModelType` (enum ints unconfirmed on this build).
-3. **Capture + validate points:** build the real datum-point ID set via `ListItems(ITEM_POINT)`; reject buffer items that aren't datum points; dedup IDs. Cache each point's xyz (`IpfcPoint.Point`) for reuse.
-4. **Diameter (REQUIRED — it drives creation):** pre-filled from jiginator's `last_jig_spec.json`; user accepts (ENTER) or overrides; loops until a positive value. `targetRadius = Ø/2`.
-5. **Off-plane filter:** mirrors datinator's projection EXACTLY — same CSYS-frame choice (none→world / one / many→pick) and `off = (P-O)·Z` at tol `1e-4`. Points off the jig face get an `[S]kip / [A]ll / [Q]uit` prompt. Identical math means holeinator's verdict matches datinator's `OffPlane` column.
-6. **Baseline** cylinder count at the radius.
-7. **Idempotency:** read existing same-radius cylinder axes (`Get-CylinderAxes` via the descriptor's `.Origin` `IpfcTransform3D` → `GetOrigin()`/`GetZAxis()`); skip any point lying on one (perpendicular distance ≤ `1e-3`, `Dist-PointToAxis`). Re-running drills only NEW points; all-already-drilled → clean no-op exit. Purely geometric — no sidecar log.
-8. **Placeholder guard:** the hole-dashboard macro is still a scaffold with `<<...>>` tokens (no recorded hole trail yet). The guard scans the built macro for `<<...>>` and **SAFE-STOPs** if any remain, so literal placeholder text can never be fired into Creo.
-9. **Mutate gate:** explicit y/N before any geometry changes (everything above is read-only).
-10. **Create loop:** per point, ONE atomic `RunMacro` = select-point-by-ID + hole dashboard (invoke → On-Point → diameter → through-all → blur `Quit` → `dashInst0.Done`). A **canary** validates hole #1 geometrically before committing to the rest; a **circuit breaker** aborts after 3 consecutive no-ops (`VersionStamp` unchanged).
-11. **Geometric verify + honest report:** compare created-vs-*attempted* (attempted may be < points if aborted); track macro-threw and no-op counts separately; green only if clean AND measured, else yellow/red with counts.
+**Flow:**
+1. Connect, null-check, print filename. **Mode guard:** filename `.asm` → STOP (assembly mode resolves selection against the `.asm`, not the part to drill). Keys off the filename extension, NOT `EpfcModelType` (enum ints unconfirmed on this build).
+2. **STEP 1 — points:** user selects the target datum points in Creo, presses ENTER. Script reads the selection buffer and resolves each item to point IDs (direct point geometry, or a datum-point feature's `ListSubItems(ITEM_POINT)`). Dedup; report any non-point selections with their `.Type`.
+3. **STEP 2 — body:** enumerate solid bodies via `ListItems(ITEM_BODY)`; single body → index 0 silently; multiple → numbered prompt. The recorded macro selects the body in the hole dashboard by list index.
+4. **STEP 3 — diameter:** pre-filled from jiginator's `last_jig_spec.json` if present (user accepts with ENTER or overrides); loops until a positive value.
+5. **CONFIRM (y/N)** — last stop before mutation.
+6. **Fire:** per point, `Build-HoleMacro` → one atomic `RunMacro`. A **canary** validates hole #1 changed `VersionStamp` before committing to the rest (the live net against widget-name drift). Honest report: model-changed / no-op / macro-error counts.
 
-**Key facts:**
-- **No example feature** — each hole is created natively. Diameter is set directly in the hole dashboard (never written-then-regenerated), so the sketch-dim snap-back trap never applies.
-- **The hole dashboard MUST fire as ONE atomic `RunMacro`** (select + invoke + diameter + depth + confirm) — a dashboard's command context does not survive across `RunMacro` calls (boxinator extrude lesson). `Build-HoleMacro` concatenates the whole sequence.
-- Shared helpers hoisted so analysis sections can't diverge: `Get-Comp`/`Dot` (datinator), `Get-AllSurfaces` (one surface walk feeding both the counter and the axis reader), `Dist-PointToAxis`.
-- Verify is radius-aware: holes at a different Ø don't count as "already drilled," so two-diameter passes over overlapping points work.
+**`Build-HoleMacro` (recorded live 2026-06-11)** — real widget names, fired as ONE atomic `RunMacro` (a dashboard's command context does not survive across `RunMacro` calls — boxinator lesson): select point by ID → `ProCmdHole` → depth-type flyout `maindashInst0.hole_depth_to_type_flybtn` → `maindashInst0.StrHoleDepThruAllF` (thru all) → body via `chkbn.body_page.0` + `PH.bodyselectrepwdg_list` → diameter via `maindashInst0.diameter_mip_OptionMenu` → `~ FocusOut` to blur → `dashInst0.Done`. `~ Trail`/`~ Timer` recording noise dropped.
 
-**LIVE-RECORDING TODO (the one real blocker):** the hole-dashboard fragment in `Build-HoleMacro` carries 4 `<<placeholder>>` tokens (`<<ProCmdInsertHole>>`, `<<hole_placement_onpoint>>`, `<<maindashInst0.dia_field>>`, `<<maindashInst0.depth_thruall>>`) — there is no recorded hole trail in the toolkit. Record it live (`visible_mapkeys yes`, drop one On-Point hole by hand, read the trail) and replace the tokens with the real command/widget names. Until then the placeholder guard SAFE-STOPs; the entire read-only pipeline (steps 1–9) runs and is unit-tested, but no geometry is produced.
+**Verification = `VersionStamp` (did the model change), not geometric measurement.** Lighter than boxinator/radinator's cylinder-count proof; "Done" means the model changed for each hole, not that N correct holes were *measured*. Wiring holeinator's verify into the blind-evaluator lib (count cylinders at the hole radius, judge against sliced truth) is the natural next hardening step but is NOT done.
 
-**Current status:** Read-only analysis pipeline (connect, mode guard, point validation/dedup, diameter handoff, off-plane filter, idempotency, placeholder guard, mutate gate) built and parses clean; off-plane and idempotency math unit-tested. Create loop + canary + circuit breaker + geometric verify scaffolded. Blocked on the one live hole-dashboard recording above before it can create real geometry.
+**History / why ID-only:** the original design read each point's xyz via `IpfcPoint.Point` to compute an **off-plane filter** and **idempotency** check. That COM coordinate read crashed repeatedly live (`op_Subtraction on System.Object[]` — the point marshals in an array shape `Get-Comp` didn't expect; multiple shape-coercion attempts all failed on the real object). The fix was architectural, not another patch: **drop coordinate reads entirely** and let the human judge visually. Off-plane filtering, idempotency, dry-run, and the geometric cylinder-count verify were all REMOVED in that rebuild (~50k → ~19k chars). datinator (piece A, the standalone point-reader) was deleted at the same time — nothing consumed its CSV and it carried the same unfixed coordinate bug. If off-plane/idempotency are ever wanted back, the COM point-marshaling shape must be solved first (a shape-agnostic `Get-Comp` that throws-with-type is in git history).
