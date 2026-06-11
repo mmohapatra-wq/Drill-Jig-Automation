@@ -427,48 +427,59 @@ Show-BoxState -Made $made
 Write-Host ""
 
 # ============================================
-# BLIND-EVALUATOR HOOK — converge on "the SOLID matches the claim"
+# BLIND-EVALUATOR HOOK — converge on "the SOLID matches what you ASKED FOR"
 # ============================================
-# The whole premise of this probe — "resizing the planes IS resizing the box" —
-# was, until now, ASSERTED, never measured: Set-PlaneOffset re-reads the dim
-# symbol and calls it "held", but a dim can hold symbolically while the solid did
-# not actually resize (broken coupling). This hook closes that gap the way the
-# wiki's blind evaluator does: measure the finished SOLID (EvalOutline, via the
-# shared Measure-Extents), state the claim ("box width = Side offset"), and let an
-# independent judge — which never saw the mapkeys or the offset->extent mapping —
-# decide from the geometry alone whether the claim holds. It matches by VALUE, so
-# it also catches a width/height/depth swap that a symbol re-read cannot.
+# The premise of this probe — "resizing the planes IS resizing the box" — was,
+# until now, ASSERTED, never measured: Set-PlaneOffset re-reads the dim symbol and
+# calls it "held". But a dim can hold symbolically while the solid did not resize
+# (broken coupling), AND a dim can snap back so that the dim and the solid agree on
+# a value you never asked for. So the claim must encode the user's INTENT (the
+# offset you typed), not a value re-read from the model — otherwise the check is
+# outcome-vs-outcome and a wrong-but-self-consistent box passes.
 #
-# Returns $true only if the judge's overall verdict is "confirm". On no-config or
-# a judge error it writes the packet (for offline judging) and returns $false.
+# $Expected is an array of @{ Dim = "Width"; Value = 4.0 } — the values the CALLER
+# intended. Two layers then judge them:
+#   (1) DETERMINISTIC (the gate): Test-ExtentsMatch checks, by value, that each
+#       expected size appears among the measured solid extents within tol. Same
+#       geometry -> same verdict, every run. This is arithmetic, not judgment.
+#   (2) LLM (advisory): the blind judge gets the same claim + a geometry-only
+#       slice and adds semantic commentary / a summary, and a second opinion that
+#       is flagged loudly if it disagrees with the measurement.
+# Returns the deterministic gate bool. (Measure-Extents is datum-excluded; extents
+# are sorted desc so neither layer needs an axis order — a W/H/D swap still matches
+# by value. $model/$pfcType/$judgeCfg/$ScriptDir/$made come from the enclosing scope.)
 function Invoke-BoxEval {
-    param([string]$Operation, [string[]]$Claims)
+    param([string]$Operation, $Expected)
 
-    # Measure the solid itself (datum-excluded), sorted desc so the judge never
-    # needs an axis order. $model / $pfcType / $judgeCfg / $ScriptDir / $made are
-    # read from the enclosing scope (same dynamic-scope pattern Set-PlaneOffset uses).
+    # Measure the solid itself.
     $excl = New-ExcludeTypes -TypeObj $pfcType
     $ext  = Measure-Extents -Solid $model -ExcludeTypes $excl
 
     $truth = @{}
+    $measuredSorted = $null
     if ($null -ne $ext) {
-        $sorted = @($ext | Sort-Object -Descending)
-        $truth["measured_extents_sorted_desc"] = @([math]::Round([double]$sorted[0],4), [math]::Round([double]$sorted[1],4), [math]::Round([double]$sorted[2],4))
+        $measuredSorted = @($ext | Sort-Object -Descending | ForEach-Object { [math]::Round([double]$_, 4) })
+        $truth["measured_extents_sorted_desc"] = $measuredSorted
     } else {
         $truth["measured_extents_sorted_desc"] = $null
         $truth["note"] = "EvalOutline returned no outline (the solid may not exist yet)"
     }
+    # Record what was REQUESTED (intent) in the slice too, so an offline reader of
+    # the packet sees both sides of the comparison.
+    $reqMap = @{}
+    foreach ($e in $Expected) { $reqMap[[string]$e.Dim] = [double]$e.Value }
+    $truth["requested_dims"] = $reqMap
 
-    # Re-read the current offset of every created plane, labeled by box dimension.
-    $offsets = @{}
-    foreach ($mp in $made) {
-        $dim = switch ($mp.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$mp.Label} }
-        $offsets[$dim] = Read-DimValue -Model $model -TypeObj $pfcType -Sym $mp.Sym
-    }
-    $truth["offset_dims"] = $offsets
+    # (1) deterministic by-value match — the gate.
+    $expectedVals = @($Expected | ForEach-Object { [double]$_.Value })
+    $measuredVals = if ($null -ne $measuredSorted) { @($measuredSorted | ForEach-Object { [double]$_ }) } else { @() }
+    $numeric = Test-ExtentsMatch -Expected $expectedVals -Measured $measuredVals -Tol 0.1
+
+    # Human-readable claims (used by the LLM layer + persisted in the packet).
+    $claims = @($Expected | ForEach-Object { "the box {0} is {1}" -f $_.Dim.ToLower(), $_.Value })
 
     $modelName = try { [string]$model.FileName } catch { "(unknown)" }
-    $claim = New-EvalClaim -Tool "plane-probe" -Operation $Operation -Claims $Claims
+    $claim = New-EvalClaim -Tool "plane-probe" -Operation $Operation -Claims $claims
     $slice = Get-GeometrySlice -Model $modelName -Truth $truth
 
     $base = ($modelName -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
@@ -477,10 +488,12 @@ function Invoke-BoxEval {
     Write-EvalPacket -Path $packetPath -Claim $claim -Slice $slice -WhenIso $when | Out-Null
     Write-Host "  Eval packet -> $packetPath" -ForegroundColor DarkGray
 
-    # Judge the PERSISTED packet (reload), so what is judged == what is on disk.
+    # (2) LLM layer — judge the PERSISTED packet (so what is judged == what's on disk).
     $packetObj = Get-Content $packetPath -Raw | ConvertFrom-Json
     $verdict = Invoke-BlindJudge -Packet $packetObj -Config $judgeCfg
-    return (Show-ConvergenceReport -Verdict $verdict -Title "Blind evaluator: $Operation")
+
+    # Gate on the deterministic numeric result; LLM verdict is advisory.
+    return (Show-ConvergenceReport -Verdict $verdict -Title "Blind evaluator: $Operation" -Numeric $numeric)
 }
 
 # ============================================
@@ -638,16 +651,17 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
         Write-Host ""
 
         # --- BLIND EVALUATE the freshly built box -------------------------------
-        # Claim: each box extent equals its driving offset. The judge measures the
-        # solid and confirms/refutes from geometry alone (no axis map handed to it).
-        $buildClaims = @()
-        foreach ($mp in $made) {
+        # Intent = the offset values the USER ENTERED ($mp.Offset), NOT a value
+        # re-read from the model. This is the fix that makes the check intent-vs-
+        # reality: if a dim snapped back so the dim and the solid agree on a size
+        # you never asked for, claiming the re-read value would pass — claiming the
+        # ENTERED value correctly fails. Measure-Extents then confirms the solid
+        # actually took those sizes.
+        $expected = foreach ($mp in $made) {
             $dim = switch ($mp.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$mp.Label} }
-            $val = Read-DimValue -Model $model -TypeObj $pfcType -Sym $mp.Sym
-            if ($null -ne $val) { $buildClaims += ("the box {0} is {1}" -f $dim.ToLower(), $val) }
+            [pscustomobject]@{ Dim = $dim; Value = [double]$mp.Offset }
         }
-        $buildClaims += "the solid's three measured extents each equal one of the three offset dims"
-        $script:buildConfirmed = Invoke-BoxEval -Operation "build-box" -Claims $buildClaims
+        $script:buildConfirmed = Invoke-BoxEval -Operation "build-box" -Expected @($expected)
         Write-Host ""
     }
 }
@@ -705,13 +719,14 @@ while ($true) {
         Write-Host ""
         Show-BoxState -Made $made
         Write-Host ""
-        # Blind-evaluate the WHOLE resized box: the dim "held" symbolically above,
-        # but did the SOLID actually take those sizes? The judge measures and decides.
-        $resizeClaims = foreach ($t in $targets) {
+        # Blind-evaluate the WHOLE resized box against what was REQUESTED ($t.Want):
+        # the dim "held" symbolically above, but did the SOLID actually take those
+        # sizes? Deterministic measurement gates; the LLM adds a second opinion.
+        $resizeExp = foreach ($t in $targets) {
             $dim = switch ($t.Plane.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$t.Plane.Label} }
-            "the box $($dim.ToLower()) is $($t.Want)"
+            [pscustomobject]@{ Dim = $dim; Value = [double]$t.Want }
         }
-        if (@($resizeClaims).Count -gt 0) { $null = Invoke-BoxEval -Operation "resize-all" -Claims @($resizeClaims) }
+        if (@($resizeExp).Count -gt 0) { $null = Invoke-BoxEval -Operation "resize-all" -Expected @($resizeExp) }
         Write-Host ""
         continue
     }
@@ -732,10 +747,10 @@ while ($true) {
     } else {
         Write-Host "    $($p.Label) $($p.Sym) = $now  (wanted $v — did NOT hold)" -ForegroundColor Yellow
     }
-    # Blind-evaluate this single resize against the measured solid (dim "held" is
-    # necessary but not sufficient — confirm one measured extent actually became $v).
+    # Blind-evaluate this single resize against what was REQUESTED ($v): dim "held"
+    # is necessary but not sufficient — confirm a measured extent actually became $v.
     $dimName = switch ($p.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$p.Label} }
-    $null = Invoke-BoxEval -Operation "resize-$($dimName.ToLower())" -Claims @("the box $($dimName.ToLower()) is $v")
+    $null = Invoke-BoxEval -Operation "resize-$($dimName.ToLower())" -Expected @([pscustomobject]@{ Dim = $dimName; Value = [double]$v })
 }
 
 Write-Host ""

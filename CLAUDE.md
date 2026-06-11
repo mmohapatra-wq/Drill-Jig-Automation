@@ -78,11 +78,24 @@ Creo: **derive a claim cheaply, then converge by checking it against a narrowly-
 truth with a judge that never saw HOW the claim was produced** — to catch *bad generalizations*
 (the silent-wrong-dim / wrong-feature / mis-classified-edge class this toolkit keeps hitting).
 
-**Loop:** tool states a CLAIM (`New-EvalClaim`) → measure only the in-scope geometry into a SLICE
+**Loop:** tool states a CLAIM from the user's INTENT (`New-EvalClaim` — the value you ASKED for,
+NOT a value re-read from the model; re-reading makes the check outcome-vs-outcome and a
+self-consistent wrong result passes) → measure only the in-scope geometry into a SLICE
 (`Get-GeometrySlice`; `Measure-Extents`/`Count-Cylinders`/`Read-DimValue` — and NOTHING about
 mapkeys/heuristics/axis maps, that omission is what makes the judge blind) → `Write-EvalPacket`
 to `<model>_eval.json` (durable, repo-convention artifact like the gauginator/datinator CSVs) →
 `Invoke-BlindJudge` → `Show-ConvergenceReport` returns a bool the caller uses to gate green "Done".
+
+**Two gating layers (deliberate):**
+- **Deterministic numeric (`Test-ExtentsMatch`, in `creo_geometry.ps1`)** owns the ARITHMETIC. A
+  by-value, tolerance-based, multiset match (each measured value consumed once) — order-
+  independent so a W/H/D swap still matches the right values. Same geometry → same verdict every
+  run. When a numeric result is passed to `Show-ConvergenceReport -Numeric`, **it is the gate.**
+- **LLM (`Invoke-BlindJudge`)** owns the SEMANTICS + narration. In numeric-gated mode the LLM is
+  ADVISORY: a disagreement with the measurement is surfaced loudly (worth a human's eye) but does
+  NOT flip the gate — a flaky/over-eager LLM can't green-light a geometric mismatch, and a gateway
+  outage can't fail a measurably-correct result. With NO numeric layer (a purely-semantic claim
+  like radinator's "is this really a node fillet?"), the LLM verdict IS the gate.
 
 **Transport (verified live 2026-06-11):** BlueGPT is LiteLLM-fronted / OpenAI-compatible —
 `POST {base}/v1/chat/completions`, `Authorization: Bearer <token>`, `response_format` =
@@ -95,19 +108,26 @@ isolation with `--probe-judge` (`Invoke-JudgeProbe`): sends a synthetic true+fal
 expects confirm+refute.
 
 **Key facts:**
-- The judge is told it is BLIND and to match claims **by VALUE**, never by axis order — so it
-  catches a width/height/depth swap a dimension-symbol re-read cannot. Keep claims atomic
-  ("the box width is 4.0"), one verdict each.
+- Claims encode INTENT (the asked-for value), are atomic ("the box width is 4.0"), and match
+  **by VALUE** never by axis order — so a width/height/depth swap is still caught.
 - A slice must carry measured geometry ONLY. The unit tests assert no mapkey/heuristic text
   (`RunMacro`, `ProCmd`, `dashInst`, `DimValue write`, ...) leaks into the judge input.
-- Numeric truth still comes from `EvalOutline`/COM (the deterministic lib). The LLM's job is the
-  *semantic* "does this geometry back the claim / which extent is which / is this a bad
-  generalization" call — not the measurement itself.
+- Numeric truth comes from `EvalOutline`/COM via `Test-ExtentsMatch` (deterministic, the gate).
+  The LLM never does the arithmetic — its job is the *semantic* call ("is this really a node
+  fillet / is anything a bad generalization") and the human-readable summary. A verification gate
+  that can flicker run-to-run is corrosive; keeping the gate deterministic fixes that.
+- **A blind evaluator only earns its keep if the slice gives the judge signal the tool did NOT
+  already use.** For a numeric claim, the new signal is the independent `EvalOutline` measurement
+  vs. the asked-for value. For radinator, the slice must carry MORE than the heuristic's own
+  inputs (local topology / neighbors / structural context) — feeding it back the same four facts
+  that selected the edge is verification theater (the judge just re-runs a fuzzier copy of the
+  rule). This is the make-or-break constraint for the semantic-judge tools.
 - `*_eval.json` and `.bluegpt_judge.json` are gitignored.
 
-**Wired:** `plane-probe.cmd` (build + per-resize evaluation; final report gated on the judge, not
-on "the mapkey fired"). **Next (contracts in the memo):** radinator (re-decide each matched edge
-is really a node-to-stiffener fillet), holeinator (independent cylinder-count judge).
+**Wired:** `plane-probe.cmd` (build + per-resize; deterministic-gated, LLM advisory; claims use the
+entered offsets). **Next (contracts in the memo):** radinator (semantic-gated — judge re-decides
+each matched edge is really a node-to-stiffener fillet, slice MUST exceed the heuristic's inputs),
+holeinator (numeric-gated cylinder count, judged independently of its own surface walk).
 
 ## Mapkey Patterns
 

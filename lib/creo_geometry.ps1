@@ -274,3 +274,59 @@ function Read-DimValue {
     }
     catch { return $null }
 }
+
+# ----------------------------------------------------------------------------
+# Test-ExtentsMatch - DETERMINISTIC by-value check that a set of expected
+# dimension values all appear among a set of measured extents, each within
+# tolerance, with no measured extent used twice (a multiset match).
+#
+# WHY this exists separately from the LLM judge: numeric matching is arithmetic,
+# not judgment. "Is 4.0 among [4.0009, 3.0, 2.0] within tol?" has one correct
+# answer that must be the SAME every run - an LLM can flicker confirm/uncertain
+# on identical input, which is corrosive for a verification gate. So the toolkit
+# owns the arithmetic here; the LLM is reserved for the semantic call ("is this
+# really a node fillet?") and the human-readable summary. Matching is by VALUE
+# (greedy nearest, each measured value consumed once), so it is independent of
+# axis order - a width/height/depth swap still matches the right values, and a
+# genuinely wrong value (or a snap-back to the wrong size) fails to match.
+#
+# Returns a [pscustomobject]:
+#   AllMatched : $true only if EVERY expected value found an unused measured one
+#   Pairs      : per-expected @{ Expected; Matched(or $null); Error; Ok }
+#   Tol        : the tolerance used
+# $Expected / $Measured are plain double arrays. $null/empty $Measured -> no
+# match (AllMatched $false, every pair Ok=$false) rather than a throw.
+# ----------------------------------------------------------------------------
+function Test-ExtentsMatch {
+    param(
+        [double[]]$Expected,
+        [double[]]$Measured,
+        [double]$Tol = 0.1
+    )
+    $pairs = @()
+    # Work on a mutable copy of measured values; null out each as it is consumed
+    # so two expected values can't both claim the same measured extent.
+    $pool = @()
+    if ($null -ne $Measured) { foreach ($m in $Measured) { $pool += [double]$m } }
+
+    $all = $true
+    foreach ($e in $Expected) {
+        $bestIdx = -1; $bestErr = [double]::MaxValue
+        for ($i = 0; $i -lt $pool.Count; $i++) {
+            if ($null -eq $pool[$i]) { continue }                 # already consumed
+            $err = [Math]::Abs([double]$pool[$i] - [double]$e)
+            if ($err -lt $bestErr) { $bestErr = $err; $bestIdx = $i }
+        }
+        if ($bestIdx -ge 0 -and $bestErr -le $Tol) {
+            $matched = [double]$pool[$bestIdx]
+            $pool[$bestIdx] = $null                               # consume it
+            $pairs += [pscustomobject]@{ Expected = [double]$e; Matched = $matched; Error = $bestErr; Ok = $true }
+        } else {
+            $all = $false
+            $m = if ($bestIdx -ge 0) { [double]$pool[$bestIdx] } else { $null }
+            $err = if ($bestIdx -ge 0) { $bestErr } else { [double]::PositiveInfinity }
+            $pairs += [pscustomobject]@{ Expected = [double]$e; Matched = $m; Error = $err; Ok = $false }
+        }
+    }
+    return [pscustomobject]@{ AllMatched = $all; Pairs = $pairs; Tol = $Tol }
+}

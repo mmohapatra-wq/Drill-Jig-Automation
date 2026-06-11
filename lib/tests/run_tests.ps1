@@ -154,6 +154,42 @@ Assert-True "Read-DimValue reads by symbol" (Approx (Read-DimValue -Model $fakeM
 Assert-True "Read-DimValue returns null for unknown symbol" ($null -eq (Read-DimValue -Model $fakeModel -TypeObj $typeObj -Sym "nope"))
 
 # ----------------------------------------------------------------------------
+# Test-ExtentsMatch - the deterministic by-value gate (this is the arithmetic the
+# LLM no longer owns). Order-independent, tolerance-based, multiset (no reuse).
+# ----------------------------------------------------------------------------
+Write-Host "  -- creo_geometry: Test-ExtentsMatch --" -ForegroundColor White
+
+# all three expected values present among measured (within default tol 0.1)
+$r = Test-ExtentsMatch -Expected @(4.0, 3.0, 2.0) -Measured @(4.0009, 3.0001, 2.0)
+Assert-True "all expected values matched -> AllMatched true" ($r.AllMatched)
+
+# ORDER INDEPENDENCE: a width/height/depth swap still matches by value
+$r = Test-ExtentsMatch -Expected @(2.0, 4.0, 3.0) -Measured @(4.0009, 3.0001, 2.0)
+Assert-True "match is order-independent (swapped expected still matches)" ($r.AllMatched)
+
+# one wrong expected value (the snap-back-to-wrong-size case) -> fails
+$r = Test-ExtentsMatch -Expected @(4.0, 3.0, 9.9) -Measured @(4.0009, 3.0001, 2.0)
+Assert-True "a value with no measured match -> AllMatched false" (-not $r.AllMatched)
+$badPair = @($r.Pairs | Where-Object { -not $_.Ok })
+Assert-True "the failing pair is identified" ($badPair.Count -eq 1 -and (Approx $badPair[0].Expected 9.9))
+
+# MULTISET: two expected 4.0 but only one measured 4.0 -> second can't reuse it
+$r = Test-ExtentsMatch -Expected @(4.0, 4.0) -Measured @(4.0, 2.0)
+Assert-True "a measured extent is not consumed twice" (-not $r.AllMatched)
+
+# two expected 4.0 with two measured 4.0 -> both match
+$r = Test-ExtentsMatch -Expected @(4.0, 4.0) -Measured @(4.0, 4.0)
+Assert-True "duplicate expected values match duplicate measured values" ($r.AllMatched)
+
+# null / empty measured -> no match, no throw
+$r = Test-ExtentsMatch -Expected @(4.0) -Measured $null
+Assert-True "null measured -> AllMatched false (no throw)" (-not $r.AllMatched)
+
+# tolerance is respected: 0.2 off fails at tol 0.1, passes at tol 0.3
+Assert-True "outside tol fails"  (-not (Test-ExtentsMatch -Expected @(4.0) -Measured @(4.2) -Tol 0.1).AllMatched)
+Assert-True "inside tol passes"  ((Test-ExtentsMatch -Expected @(4.0) -Measured @(4.2) -Tol 0.3).AllMatched)
+
+# ----------------------------------------------------------------------------
 # blind_evaluator: New-EvalClaim / Get-GeometrySlice / Write-EvalPacket round-trip
 # ----------------------------------------------------------------------------
 Write-Host "  -- blind_evaluator: claim / slice / packet --" -ForegroundColor White
@@ -260,10 +296,38 @@ $vRefute = [pscustomobject]@{
 }
 $vErr = [pscustomobject]@{ error = "judge request failed" }
 
+# LLM-gated mode (no -Numeric): the verdict is the gate, as before.
 Assert-True "report returns true only on overall=confirm" (Show-ConvergenceReport -Verdict $vConfirm)
 Assert-True "report returns false on overall=refute" (-not (Show-ConvergenceReport -Verdict $vRefute))
 Assert-True "report returns false on error verdict" (-not (Show-ConvergenceReport -Verdict $vErr))
 Assert-True "report returns false on null verdict" (-not (Show-ConvergenceReport -Verdict $null))
+
+# ----------------------------------------------------------------------------
+# blind_evaluator: Show-ConvergenceReport DETERMINISTIC gating (the new layer)
+# The numeric result is the gate; the LLM verdict is advisory and must not flip it.
+# ----------------------------------------------------------------------------
+Write-Host "  -- blind_evaluator: deterministic gating --" -ForegroundColor White
+
+$numPass = Test-ExtentsMatch -Expected @(4.0,3.0) -Measured @(4.0009,3.0001)
+$numFail = Test-ExtentsMatch -Expected @(4.0,9.9) -Measured @(4.0009,3.0001)
+
+# numeric passes -> gate true even if the LLM hedged "uncertain"
+$vUncertain = [pscustomobject]@{ perClaim=@(); overall="uncertain"; summary="not sure" }
+Assert-True "numeric pass gates TRUE despite LLM 'uncertain'" `
+    (Show-ConvergenceReport -Verdict $vUncertain -Numeric $numPass)
+
+# numeric fails -> gate false even if the LLM said "confirm" (the dangerous case:
+# a flaky/over-eager LLM must NOT be able to green-light a geometric mismatch)
+Assert-True "numeric fail gates FALSE despite LLM 'confirm'" `
+    (-not (Show-ConvergenceReport -Verdict $vConfirm -Numeric $numFail))
+
+# numeric passes but the LLM/gateway errored -> gate still TRUE (arithmetic decided)
+Assert-True "numeric pass gates TRUE despite LLM error" `
+    (Show-ConvergenceReport -Verdict $vErr -Numeric $numPass)
+
+# numeric passes with no LLM verdict at all -> gate TRUE
+Assert-True "numeric pass gates TRUE with null verdict" `
+    (Show-ConvergenceReport -Verdict $null -Numeric $numPass)
 
 # ----------------------------------------------------------------------------
 # SUMMARY

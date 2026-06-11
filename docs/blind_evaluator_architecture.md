@@ -54,11 +54,27 @@ of bugs that an independent check would have caught at creation time, not weeks 
 Each is a *bad generalization*: a plausible claim the geometry does not actually support. The
 blind judge, matching claims **by value** against measured extents, catches exactly this class.
 
-> **Honest limit.** The judge does not replace numeric measurement — `EvalOutline` and the COM
-> surface walk remain the source of truth and run in the (deterministic) shared library. The
-> judge's job is the *semantic* call: does this measured geometry actually back the claim, which
-> measured extent corresponds to which named dimension (without being told), and is anything a
-> bad generalization. Numbers come from CAD; judgment comes from the LLM.
+> **Honest limit — and why there are two layers.** The judge does not do arithmetic. Numeric
+> matching ("is 4.0 among [4.0009, 3.0, 2.0] within tol?") has one correct answer that must be the
+> SAME every run; an LLM can flicker confirm/uncertain on identical input, and a verification gate
+> that flickers is corrosive to trust. So the toolkit splits the work:
+>
+> - **Deterministic layer (`Test-ExtentsMatch`)** — the arithmetic, by value, tolerance-based,
+>   order-independent. When present, **it is the gate.** Same geometry → same verdict.
+> - **LLM layer (`Invoke-BlindJudge`)** — the *semantic* call ("does this measured geometry back
+>   the claim, which extent is which without being told, is anything a bad generalization") plus a
+>   readable summary. In numeric-gated mode it is **advisory**: a disagreement is surfaced loudly
+>   but cannot flip the gate. For a claim with no number to check (e.g. "is this really a node
+>   fillet?"), the LLM verdict *is* the gate.
+>
+> Numbers come from CAD; semantics come from the LLM; the gate stays deterministic wherever a
+> number exists.
+>
+> **The make-or-break constraint.** A blind evaluator only adds value if the slice gives the judge
+> signal the tool did not already use. A numeric claim gets that for free (independent `EvalOutline`
+> measurement vs. the asked-for value). A *semantic* tool does not: if radinator's slice is the same
+> four facts its heuristic used to select the edge, the judge just re-runs a fuzzier copy of the
+> rule and "agreement" proves nothing. Semantic slices MUST carry more than the heuristic's inputs.
 
 ---
 
@@ -123,12 +139,17 @@ measure solid  ─▶ Get-GeometrySlice ┘                          │
 - **What it catches:** a dim that "held" symbolically while the solid did not resize (broken
   coupling), and any width/height/depth swap — neither visible to the current dim re-read.
 
-### radinator.cmd — NEXT
-- **Claim:** "edge {id} (length L, adjoining a convex cylinder r≤0.875 and a plane) is a
-  node-to-stiffener fillet and was rounded at radius R."
-- **Slice:** for each matched edge — its length, the two adjacent surface types/orientations, the
-  cylinder radius; and post-round, the presence of a new round surface. NOT the heuristic
-  thresholds that selected it.
+### radinator.cmd — NEXT (semantic-gated; the hard one)
+- **Claim:** "edge {id} is a node-to-stiffener fillet and was rounded at radius R."
+- **Slice — MUST exceed the heuristic's own inputs.** radinator selects an edge with four facts
+  (straight, convex cylinder, adjacent plane, r ≤ 0.875). Feeding *those same four* to the judge
+  is verification theater — it would just re-run a fuzzier copy of the selection rule. The slice
+  has to add signal the heuristic never used: local topology around the edge, neighboring
+  features, the edge's position/role in the part, what a "node" is structurally. That extra
+  context is radinator's equivalent of the PLC evaluator reading the ladder logic.
+- **Gating:** the "rounded at R" half is numeric (`Test-ExtentsMatch`-style: a new round surface of
+  radius R appeared) — deterministic gate. The "is really a node fillet" half is semantic — LLM
+  gate. Batch all edges into ONE judge call (the schema is already `perClaim[]`); never per-edge.
 - **What it catches:** the heuristic mis-classifying an edge (the bad generalization), and rounds
   that fired but produced no geometry. Today radinator mutates with **zero** independent check.
 
@@ -146,7 +167,12 @@ measure solid  ─▶ Get-GeometrySlice ┘                          │
 
 ## Status
 
-- Shared library + blind-evaluator + offline unit tests: **built, 43/43 tests passing**.
-- Live REST round-trip: **verified** (`--probe-judge` confirms a true claim, refutes a false one).
-- plane-probe.cmd: **wired end-to-end** (build + resize evaluation, gated final report).
-- radinator / holeinator: contracts documented above; follow the proven pattern next.
+- Shared library + blind-evaluator + offline unit tests: **built, 56/56 tests passing** (incl. the
+  deterministic-gating tests: numeric-fail gates FALSE even when the LLM says confirm; numeric-pass
+  gates TRUE even when the LLM errors).
+- Live REST round-trip: **verified** (`--probe-judge` confirms a true claim, refutes a false one;
+  full dual-layer flow exercised live for a correct box and a deliberate depth-mismatch).
+- plane-probe.cmd: **wired end-to-end** — claims use the user's ENTERED offsets (intent, not a
+  re-read dim), deterministic numeric gate, LLM advisory, final report gated on the measurement.
+- radinator / holeinator: contracts documented above; radinator's slice must exceed its heuristic's
+  inputs (the make-or-break constraint) before it is worth wiring.

@@ -256,40 +256,84 @@ function Invoke-BlindJudge {
 }
 
 # ----------------------------------------------------------------------------
-# Show-ConvergenceReport - render a verdict object to the console and return a
-# bool the caller uses to gate its final "Done". $true ONLY when overall ==
-# confirm. An error/uncertain verdict returns $false (honest: not independently
-# confirmed) but is rendered distinctly from a hard refute.
+# Show-ConvergenceReport - render the convergence result and return the bool the
+# caller uses to gate its final "Done".
+#
+# TWO GATING MODES, by design (see Test-ExtentsMatch for the why):
+#   * -Numeric supplied (a Test-ExtentsMatch result): the DETERMINISTIC arithmetic
+#     is the gate. Same geometry -> same gate, every run. The LLM verdict is shown
+#     as ADVISORY (semantic flags + narration); if the LLM disagrees with the
+#     deterministic result that disagreement is surfaced loudly - it is a real
+#     signal worth a human's eye - but it does NOT flip the gate.
+#   * -Numeric omitted: there is no number to check (a purely-semantic claim, e.g.
+#     "is this edge really a node-to-stiffener fillet?"). Then the LLM verdict IS
+#     the gate, exactly as before.
+#
+# An LLM error/uncertain returns $false (honest: not independently confirmed) in
+# LLM-gated mode. In numeric-gated mode an LLM error does NOT fail the gate - the
+# arithmetic already decided - but it is reported.
 # ----------------------------------------------------------------------------
 function Show-ConvergenceReport {
-    param($Verdict, [string]$Title = "Blind evaluator")
+    param($Verdict, [string]$Title = "Blind evaluator", $Numeric = $null)
 
     Write-Host ""
     Write-Host "  === $Title ===" -ForegroundColor Cyan
 
+    # --- deterministic numeric layer (the gate, when present) ----------------
+    $numericGate = $null
+    if ($null -ne $Numeric) {
+        $numericGate = [bool]$Numeric.AllMatched
+        Write-Host "  Deterministic measurement (gate):" -ForegroundColor White
+        foreach ($p in @($Numeric.Pairs)) {
+            $col  = if ($p.Ok) { "Green" } else { "Red" }
+            $mark = if ($p.Ok) { "[OK]  " } else { "[X]   " }
+            $meas = if ($null -eq $p.Matched) { "no measured extent within tol" } else { ("measured {0:0.####}" -f $p.Matched) }
+            Write-Host ("    {0}expected {1:0.####}  ->  {2}" -f $mark, $p.Expected, $meas) -ForegroundColor $col
+        }
+        $gColor = if ($numericGate) { "Green" } else { "Red" }
+        Write-Host ("    => geometry {0} the claimed values (tol {1})" -f ($(if ($numericGate) {"MATCHES"} else {"does NOT match"})), $Numeric.Tol) -ForegroundColor $gColor
+        Write-Host ""
+    }
+
+    # --- LLM layer (advisory when numeric present; the gate otherwise) -------
+    $llmConfirm = $null
     if ($null -eq $Verdict) {
-        Write-Host "  No verdict (null)." -ForegroundColor Yellow
-        return $false
+        Write-Host "  Judge: no verdict (null)." -ForegroundColor Yellow
     }
-    if ($Verdict.PSObject.Properties.Name -contains "error") {
+    elseif ($Verdict.PSObject.Properties.Name -contains "error") {
         Write-Host "  Judge unavailable: $($Verdict.error)" -ForegroundColor Yellow
-        Write-Host "  (Eval packet was written; it can be judged offline later.)" -ForegroundColor DarkGray
-        return $false
+        if ($null -eq $numericGate) {
+            Write-Host "  (Eval packet was written; it can be judged offline later.)" -ForegroundColor DarkGray
+        }
+    }
+    else {
+        $hdr = if ($null -ne $numericGate) { "Judge (advisory - semantics & summary):" } else { "Judge:" }
+        Write-Host "  $hdr" -ForegroundColor White
+        foreach ($c in @($Verdict.perClaim)) {
+            $color = switch ($c.verdict) { "confirm" {"Green"} "refute" {"Red"} default {"Yellow"} }
+            $mark  = switch ($c.verdict) { "confirm" {"[OK]  "} "refute" {"[X]   "} default {"[?]   "} }
+            Write-Host ("    {0}{1}" -f $mark, $c.claim) -ForegroundColor $color
+            Write-Host ("          -> {0}" -f $c.reason) -ForegroundColor DarkGray
+        }
+        $oColor = switch ($Verdict.overall) { "confirm" {"Green"} "refute" {"Red"} default {"Yellow"} }
+        Write-Host ("    Overall: {0}" -f $Verdict.overall.ToUpper()) -ForegroundColor $oColor
+        if ($Verdict.summary) { Write-Host ("    {0}" -f $Verdict.summary) -ForegroundColor White }
+        $llmConfirm = ($Verdict.overall -eq "confirm")
     }
 
-    foreach ($c in @($Verdict.perClaim)) {
-        $color = switch ($c.verdict) { "confirm" {"Green"} "refute" {"Red"} default {"Yellow"} }
-        $mark  = switch ($c.verdict) { "confirm" {"[OK]  "} "refute" {"[X]   "} default {"[?]   "} }
-        Write-Host ("  {0}{1}" -f $mark, $c.claim) -ForegroundColor $color
-        Write-Host ("        -> {0}" -f $c.reason) -ForegroundColor DarkGray
-    }
-
-    $oColor = switch ($Verdict.overall) { "confirm" {"Green"} "refute" {"Red"} default {"Yellow"} }
+    # --- decide the gate + flag any deterministic/LLM disagreement -----------
     Write-Host ""
-    Write-Host ("  Overall: {0}" -f $Verdict.overall.ToUpper()) -ForegroundColor $oColor
-    if ($Verdict.summary) { Write-Host ("  {0}" -f $Verdict.summary) -ForegroundColor White }
-
-    return ($Verdict.overall -eq "confirm")
+    if ($null -ne $numericGate) {
+        # The numeric result is authoritative. Surface a divergence as a signal.
+        if ($null -ne $llmConfirm -and $llmConfirm -ne $numericGate) {
+            Write-Host ("  NOTE: judge ({0}) disagrees with the measurement ({1}). Measurement wins the gate;" -f `
+                ($(if ($llmConfirm) {"confirm"} else {"not-confirm"})), ($(if ($numericGate) {"match"} else {"mismatch"}))) -ForegroundColor Magenta
+            Write-Host "  worth a look - the claim wording or the slice may be misleading the judge." -ForegroundColor Magenta
+        }
+        return $numericGate
+    }
+    # No numeric layer: the LLM is the gate.
+    return ([bool]$llmConfirm)
 }
 
 # ----------------------------------------------------------------------------
