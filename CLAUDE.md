@@ -314,5 +314,38 @@ Drill-jig decision-tree walker — the QUESTION FLOW only (no Creo connection ye
 3. At an `outcome`, parse the label into a catalog query (`Get-CatalogSpec`): "removable"/"drill" → `data\bushings_drill.csv`, "sleeve" → `data\bushings.csv`, plus any `<fraction> ID|OD` constraints.
 4. Three-stage bushing pick (`Invoke-BushingPick`): **OD** (drives the hole diameter) → **length** within that OD → **ID** (always explicit — ID never changes the jig hole, so the user may leave it unspecified). Machinist fractions ("3/4", "1 3/8") are shown from the row `EasyName` via `Get-FracLabel`.
 5. End by printing the chosen path and resolved outcome(s): which catalog subset to show and the hole diameter (= selected bushing OD).
+6. **Handoff to holeinator:** after a completed walk, the resolved hole spec is written to `last_jig_spec.json` in the repo root (file-based handoff, same style as datinator → diminator CSV). If several outcomes resolve a bushing, the LAST pick wins as the active `HoleDiameter`; all picks are kept under `AllPicks`. holeinator reads this file to pre-fill its diameter.
+
+**Handoff contract — `last_jig_spec.json`:** `{ HoleDiameter (= bushing OD, the jig hole Ø), Bushing (EasyName), PartNumber, Outcome (tree label), Path (decision path string), AllPicks[] }`. holeinator only requires `HoleDiameter`; the rest is provenance.
 
 Helpers: `ConvertTo-Decimal` (fraction/number → decimal), `Read-Choice` (numbered menu with Q-to-quit). Main loop offers "Run again?".
+
+### holeinator.cmd
+Creates an **On-Point hole** at every target datum point — piece (C) of the drill-jig configurator (geometry creation), following datinator's point read (A) and jiginator's bushing pick (B). Built on the nodelator skeleton (connect / config-suppress / finally-restore) but the engine is **create-from-scratch**, not duplicate.
+
+**Why On-Point create, not duplicate or extrude-cut:** there is no example feature to copy (`IpfcSolid.CreateFeature` is "not implemented" on this build, so a pure-API hole is out). An extrude-cut would need a circle sketched + dimensioned onto each point, and sketch placement needs a human screen pick (boxinator's lesson) — that does not scale to N points. Creo's native Hole tool in **On Point** placement drops a hole coaxial to a datum point with NO sketch, so the whole loop runs unattended, selecting each point **by ID** (the proven nodelator/radinator tree-search pattern — no screen picks).
+
+**Verification is geometric** (boxinator/radinator ethos): count cylindrical surfaces at the hole radius before/after and assert the increase. "Done (confirmed)" means holes were *measured* on the solid, not that macros fired. All cylinder reads use radinator's confirmed accessors (`GetSurfaceDescriptor` → `GetSurfaceType()` == 1 → `$desc.Radius`).
+
+**Flow (read-only analysis first, mutation last):**
+1. Connect, get active model, null-check, print filename.
+2. **Mode guard:** if the active model filename matches `.asm` → STOP (assembly mode resolves datum points / by-ID selection against the `.asm`, not the part to drill); non-`.prt`/non-`.asm` → warn + y/N. Keys off the filename extension, NOT `EpfcModelType` (enum ints unconfirmed on this build).
+3. **Capture + validate points:** build the real datum-point ID set via `ListItems(ITEM_POINT)`; reject buffer items that aren't datum points; dedup IDs. Cache each point's xyz (`IpfcPoint.Point`) for reuse.
+4. **Diameter (REQUIRED — it drives creation):** pre-filled from jiginator's `last_jig_spec.json`; user accepts (ENTER) or overrides; loops until a positive value. `targetRadius = Ø/2`.
+5. **Off-plane filter:** mirrors datinator's projection EXACTLY — same CSYS-frame choice (none→world / one / many→pick) and `off = (P-O)·Z` at tol `1e-4`. Points off the jig face get an `[S]kip / [A]ll / [Q]uit` prompt. Identical math means holeinator's verdict matches datinator's `OffPlane` column.
+6. **Baseline** cylinder count at the radius.
+7. **Idempotency:** read existing same-radius cylinder axes (`Get-CylinderAxes` via the descriptor's `.Origin` `IpfcTransform3D` → `GetOrigin()`/`GetZAxis()`); skip any point lying on one (perpendicular distance ≤ `1e-3`, `Dist-PointToAxis`). Re-running drills only NEW points; all-already-drilled → clean no-op exit. Purely geometric — no sidecar log.
+8. **Placeholder guard:** the hole-dashboard macro is still a scaffold with `<<...>>` tokens (no recorded hole trail yet). The guard scans the built macro for `<<...>>` and **SAFE-STOPs** if any remain, so literal placeholder text can never be fired into Creo.
+9. **Mutate gate:** explicit y/N before any geometry changes (everything above is read-only).
+10. **Create loop:** per point, ONE atomic `RunMacro` = select-point-by-ID + hole dashboard (invoke → On-Point → diameter → through-all → blur `Quit` → `dashInst0.Done`). A **canary** validates hole #1 geometrically before committing to the rest; a **circuit breaker** aborts after 3 consecutive no-ops (`VersionStamp` unchanged).
+11. **Geometric verify + honest report:** compare created-vs-*attempted* (attempted may be < points if aborted); track macro-threw and no-op counts separately; green only if clean AND measured, else yellow/red with counts.
+
+**Key facts:**
+- **No example feature** — each hole is created natively. Diameter is set directly in the hole dashboard (never written-then-regenerated), so the sketch-dim snap-back trap never applies.
+- **The hole dashboard MUST fire as ONE atomic `RunMacro`** (select + invoke + diameter + depth + confirm) — a dashboard's command context does not survive across `RunMacro` calls (boxinator extrude lesson). `Build-HoleMacro` concatenates the whole sequence.
+- Shared helpers hoisted so analysis sections can't diverge: `Get-Comp`/`Dot` (datinator), `Get-AllSurfaces` (one surface walk feeding both the counter and the axis reader), `Dist-PointToAxis`.
+- Verify is radius-aware: holes at a different Ø don't count as "already drilled," so two-diameter passes over overlapping points work.
+
+**LIVE-RECORDING TODO (the one real blocker):** the hole-dashboard fragment in `Build-HoleMacro` carries 4 `<<placeholder>>` tokens (`<<ProCmdInsertHole>>`, `<<hole_placement_onpoint>>`, `<<maindashInst0.dia_field>>`, `<<maindashInst0.depth_thruall>>`) — there is no recorded hole trail in the toolkit. Record it live (`visible_mapkeys yes`, drop one On-Point hole by hand, read the trail) and replace the tokens with the real command/widget names. Until then the placeholder guard SAFE-STOPs; the entire read-only pipeline (steps 1–9) runs and is unit-tested, but no geometry is produced.
+
+**Current status:** Read-only analysis pipeline (connect, mode guard, point validation/dedup, diameter handoff, off-plane filter, idempotency, placeholder guard, mutate gate) built and parses clean; off-plane and idempotency math unit-tested. Create loop + canary + circuit breaker + geometric verify scaffolded. Blocked on the one live hole-dashboard recording above before it can create real geometry.

@@ -59,6 +59,11 @@ try {
 # normalize to an array either way.
 $roots = @($tree)
 
+# Handoff file: when an outcome resolves a bushing, the resolved OD (= jig hole
+# diameter) is written here so holeinator can pick it up and pre-fill its verify
+# diameter -- the same file-based handoff style as datinator -> diminator.
+$handoffPath = Join-Path $ScriptDir 'last_jig_spec.json'
+
 # --- catalog -----------------------------------------------------------------
 
 $dataDir = Join-Path $ScriptDir 'data'
@@ -333,6 +338,13 @@ function Invoke-Walk {
                 if ($pick) {
                     $od = [double]$pick.OD
                     [void]$Outcomes.Add(("Bushing: {0}  ->  hole diameter = {1}`" (OD)" -f $pick.EasyName, $od))
+                    # record the resolved hole spec for the holeinator handoff
+                    [void]$script:Picks.Add([pscustomobject]@{
+                        HoleDiameter = $od
+                        Bushing      = $pick.EasyName
+                        PartNumber   = $pick.PartNumber
+                        Outcome      = $Node.label
+                    })
                 } else {
                     [void]$Outcomes.Add("(no bushing selected) $($Node.label)")
                 }
@@ -377,6 +389,7 @@ Write-Host "Reading tree: $treePath" -ForegroundColor DarkGray
 do {
     $path     = [System.Collections.ArrayList]::new()
     $outcomes = [System.Collections.ArrayList]::new()
+    $script:Picks = [System.Collections.ArrayList]::new()
 
     $quit = $false
     foreach ($root in $roots) {
@@ -399,6 +412,30 @@ do {
     foreach ($o in $outcomes) { Write-Host "  $o" -ForegroundColor White }
     Write-Host "----------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
+
+    # --- handoff to holeinator -------------------------------------------------
+    # Persist the resolved hole spec(s) so holeinator can pre-fill its diameter.
+    # If several outcomes resolved a bushing, the LAST pick wins as the active
+    # hole diameter (matches the on-screen "most recent decision" model); all
+    # picks are kept under .AllPicks for reference.
+    if ($script:Picks.Count -gt 0) {
+        $active = $script:Picks[$script:Picks.Count - 1]
+        $handoff = [pscustomobject]@{
+            HoleDiameter = $active.HoleDiameter
+            Bushing      = $active.Bushing
+            PartNumber   = $active.PartNumber
+            Outcome      = $active.Outcome
+            Path         = ($path -join ' > ')
+            AllPicks     = @($script:Picks)
+        }
+        try {
+            $handoff | ConvertTo-Json -Depth 5 | Set-Content -Path $handoffPath -Encoding UTF8
+            Write-Host ("Saved hole spec for holeinator: diameter {0}`" -> {1}" -f $active.HoleDiameter, (Split-Path $handoffPath -Leaf)) -ForegroundColor DarkGray
+            Write-Host ""
+        } catch {
+            Write-Host "  (could not write handoff file: $($_.Exception.Message))" -ForegroundColor Yellow
+        }
+    }
 
     $again = Read-Host "Run again? (y/N)"
 } while ($again -match '^[Yy]')
