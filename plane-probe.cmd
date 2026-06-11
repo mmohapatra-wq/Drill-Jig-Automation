@@ -8,6 +8,12 @@ exit /b %errorlevel%
 $Host.UI.RawUI.WindowTitle = "PLANE-PROBE"
 $ErrorActionPreference = "Stop"
 
+# --probe-judge : validate the BlueGPT REST judge round-trip (endpoint + auth)
+# with a synthetic packet, then exit. No Creo connection, no model touched.
+# Use this once to confirm the gateway is reachable before relying on the blind
+# evaluator in a live run.
+$ProbeJudge = ($ScriptArgs -match '(?i)(^|\s)-{1,2}probe-judge(\s|$)')
+
 # ============================================================================
 # PLANE-PROBE  (boxinator-parametric branch — EXPERIMENT, not production)
 # ============================================================================
@@ -112,26 +118,9 @@ function Invoke-ForceRegen {
     try { $Model.Regenerate($null) } catch {}
 }
 
-# Snapshot every LINEAR dimension symbol on the model -> value. New offset dims
-# are found by diffing this before vs after each plane creation, so we never have
-# to guess the dim symbol. ListItems(ITEM_DIMENSION) is the proven Solid path.
-function Get-LinearDimMap {
-    param($Model, $TypeObj)
-    $map = @{}
-    try {
-        foreach ($d in $Model.ListItems($TypeObj.ITEM_DIMENSION)) {
-            try { if ($d.DimType -eq 0) { $map[[string]$d.Symbol] = [double]$d.DimValue } } catch {}
-        }
-    } catch {}
-    return $map
-}
-
-# Re-read one dim's value by symbol with a FRESH handle (old COM handles can go
-# stale across a regen).
-function Read-DimValue {
-    param($Model, $TypeObj, [string]$Sym)
-    try { return [double]$Model.GetItemByName($TypeObj.ITEM_DIMENSION, $Sym).DimValue } catch { return $null }
-}
+# NOTE: Get-LinearDimMap and Read-DimValue now live in lib\creo_geometry.ps1
+# (dot-sourced above) — they were identical to the inline copies here and are
+# shared with the blind evaluator so every tool reads dims the same way.
 
 # Snapshot every feature ID on the model. The new datum-plane feature is found by
 # diffing this before vs after creation (same approach boxinator uses to find a
@@ -160,10 +149,16 @@ function Read-SelectedId {
 # the given ID INTO the buffer. The caller appends whatever command should
 # consume that buffered selection (ProCmdDatumPlane, ProCmdDatumSketCurve,
 # ProCmdViewShow@PopupMenuTree, the extrude's toselected, ...). Centralising the
-# string keeps the four call sites from drifting apart.
+# string keeps the call sites from drifting apart.
+#
+# -NoClear omits the leading buffer_clean. Use it when feeding a dashboard
+# reference collector that is already open and waiting for a pick (surfenator
+# proves a tree search feeds the open up-to-plane collector this way; clearing
+# the buffer mid-dashboard can deactivate that collector).
 function Get-SelectByIdMacro {
-    param([int]$FeatId)
-    return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+    param([int]$FeatId, [switch]$NoClear)
+    $clear = if ($NoClear) { "" } else { "~ Activate ``main_dlg_cur`` ``buffer_clean``;" }
+    return $clear +
         "~ Command ``ProCmdMdlTreeSearch``;" +
         "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
         "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
@@ -197,20 +192,24 @@ function New-OffsetPlane {
         "~ FocusOut ``Odui_Dlg_00`` ``t1.constr_dim1``;" +
         "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
 
-    $stamp = $null
-    try { $stamp = $Model.VersionStamp } catch {}
     Invoke-Macro "$Label plane: open + offset $Offset + OK" $macro
 
-    # Give Creo a moment to commit the feature before diffing dims.
-    if ($null -ne $stamp) {
-        for ($i = 0; $i -lt 40; $i++) {
-            try { if ($Model.VersionStamp -ne $stamp) { break } } catch {}
-            Start-Sleep -Milliseconds 50
-        }
+    # POLL for the new offset dim to appear, rather than waiting a fixed interval
+    # and checking once. A heavier model commits the datum plane more slowly, and
+    # the old fixed ~2s wait diffed the dim set BEFORE the offset dim was
+    # enumerable (symptom: "No new linear dim" even though the plane was made and
+    # the macro returned ok). This breaks the instant a new symbol shows up, so a
+    # fast model stays fast; a slow one just waits longer (up to ~MaxWaitSec).
+    $MaxWaitSec = 20
+    $newSyms    = @()
+    $after      = $before
+    for ($i = 0; $i -lt ($MaxWaitSec * 10); $i++) {
+        $after   = Get-LinearDimMap -Model $Model -TypeObj $TypeObj
+        $newSyms = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
+        if ($newSyms.Count -ge 1) { break }
+        if ($i -eq 20) { Write-Host "    (waiting for Creo to commit the $Label plane...)" -ForegroundColor DarkGray }
+        Start-Sleep -Milliseconds 100
     }
-
-    $after   = Get-LinearDimMap -Model $Model -TypeObj $TypeObj
-    $newSyms = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
 
     # The new datum-plane feature ID, by feature-set diff (used later to show it).
     $afterFeat = Get-FeatureIdSet -Model $Model -TypeObj $TypeObj
@@ -218,9 +217,10 @@ function New-OffsetPlane {
     $newFeatId = if ($newFeats.Count -ge 1) { [int]$newFeats[0] } else { $null }
 
     if ($newSyms.Count -eq 0) {
-        Write-Host "    No new linear dim appeared for the $Label plane. Either the base" -ForegroundColor Yellow
-        Write-Host "    plane ID ($BaseId) didn't select (wrong ID / not a Feature?), or the" -ForegroundColor Yellow
-        Write-Host "    widget names (t1.constr_dim1 / stdbtn_1) differ on this build." -ForegroundColor Yellow
+        Write-Host "    No new linear dim appeared for the $Label plane after ${MaxWaitSec}s." -ForegroundColor Yellow
+        Write-Host "    The plane may still have been created (feature id $newFeatId) — if so this" -ForegroundColor Yellow
+        Write-Host "    is a dim-enumeration issue, not a creation failure. Otherwise the base" -ForegroundColor Yellow
+        Write-Host "    plane ID ($BaseId) didn't select, or t1.constr_dim1/stdbtn_1 differ." -ForegroundColor Yellow
         return [pscustomobject]@{ Symbol = $null; FeatId = $newFeatId }
     }
     if ($newSyms.Count -gt 1) {
@@ -237,6 +237,35 @@ function New-OffsetPlane {
 Write-Host ""
 Write-Host "  PLANE-PROBE — three offset planes (Front/Side/Top) = parametric box" -ForegroundColor Cyan
 Write-Host "  (boxinator-parametric branch — does NOT modify boxinator.cmd)" -ForegroundColor DarkGray
+Write-Host ""
+
+# ============================================
+# SHARED LIBRARY (geometry reads + blind evaluator)
+# ============================================
+# Dot-source the shared helpers. creo_geometry.ps1 supplies the pure measurement
+# functions (Measure-Extents, Get-LinearDimMap, Read-DimValue, ...) that used to
+# be copy-pasted into each tool; blind_evaluator.ps1 supplies the convergence
+# layer (claim -> sliced truth -> blind LLM judge -> gated report).
+. (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
+. (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')
+
+# --probe-judge: validate the REST judge in isolation, then exit (no Creo).
+if ($ProbeJudge) {
+    $ok = Invoke-JudgeProbe -RepoRoot $ScriptDir -Model "sonnet"
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit ([int](-not $ok))
+}
+
+# Resolve the judge config once up front so the build/resize sections can use it.
+# $null is fine — the evaluator then just writes the packet and skips the REST call.
+$judgeCfg = Get-JudgeConfig -RepoRoot $ScriptDir -DefaultModel "sonnet"
+if ($null -eq $judgeCfg) {
+    Write-Host "  (blind judge not configured — eval packets will be written for offline judging)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  Blind judge: $($judgeCfg.base) [$($judgeCfg.model)]" -ForegroundColor DarkGray
+}
 Write-Host ""
 
 # ============================================
@@ -343,15 +372,6 @@ foreach ($p in $planes) {
     Write-Host ""
 }
 
-$made = @($planes | Where-Object { $null -ne $_.Sym })
-if ($made.Count -eq 0) {
-    throw "No offset planes were created — nothing to drive."
-}
-if ($made.Count -lt 3) {
-    Write-Host "  WARNING: only $($made.Count) of 3 planes produced a drivable dim." -ForegroundColor Yellow
-    Write-Host ""
-}
-
 # ============================================
 # 1c. SHOW (UNHIDE) ALL THREE OFFSET PLANES
 # ============================================
@@ -359,6 +379,11 @@ if ($made.Count -lt 3) {
 # reusable as-is. Instead, for each plane we just created, select it BY ID
 # (tree-search) then fire ProCmdViewShow@PopupMenuTree — the show command from
 # the recording — so all three offset planes are made visible.
+#
+# This runs on FeatId (was the plane physically created?), BEFORE the $made /
+# drivable-dim gate below — so a plane still gets shown even if its offset dim
+# wasn't captured. (Previously the "nothing to drive" throw pre-empted the show
+# step, which is why a run that failed dim detection also showed no planes.)
 $toShow = @($planes | Where-Object { $null -ne $_.FeatId })
 if ($toShow.Count -gt 0) {
     Write-Host "  Showing the $($toShow.Count) new offset plane(s)..." -ForegroundColor Cyan
@@ -368,6 +393,16 @@ if ($toShow.Count -gt 0) {
             "~ Command ``ProCmdViewShow@PopupMenuTree``;"
         Invoke-Macro "show $($p.Label) plane (id $($p.FeatId))" $showMacro
     }
+    Write-Host ""
+}
+
+# Gate the parametric/resize half on planes that produced a DRIVABLE dim.
+$made = @($planes | Where-Object { $null -ne $_.Sym })
+if ($made.Count -eq 0) {
+    throw "No offset planes produced a drivable dim — nothing to resize. (Any planes that WERE created have been shown above.)"
+}
+if ($made.Count -lt 3) {
+    Write-Host "  WARNING: only $($made.Count) of 3 planes produced a drivable dim." -ForegroundColor Yellow
     Write-Host ""
 }
 
@@ -392,66 +427,154 @@ Show-BoxState -Made $made
 Write-Host ""
 
 # ============================================
-# 2b. CREATE THE BOX — corner-rectangle sketch, extrude UP TO the SIDE plane
+# BLIND-EVALUATOR HOOK — converge on "the SOLID matches the claim"
 # ============================================
-# Goal: build the actual solid whose depth is parametrically driven by the SIDE
-# offset plane. Resizing SIDE later (section 3) then resizes the box depth.
+# The whole premise of this probe — "resizing the planes IS resizing the box" —
+# was, until now, ASSERTED, never measured: Set-PlaneOffset re-reads the dim
+# symbol and calls it "held", but a dim can hold symbolically while the solid did
+# not actually resize (broken coupling). This hook closes that gap the way the
+# wiki's blind evaluator does: measure the finished SOLID (EvalOutline, via the
+# shared Measure-Extents), state the claim ("box width = Side offset"), and let an
+# independent judge — which never saw the mapkeys or the offset->extent mapping —
+# decide from the geometry alone whether the claim holds. It matches by VALUE, so
+# it also catches a width/height/depth swap that a symbol re-read cannot.
 #
-# Flow (mirrors boxinator's proven sketch path, corner rectangle instead of
-# center). Both reference picks are captured BY ID UP FRONT (same trick as the
-# offset planes), so the only manual step left is drawing the rough rectangle —
-# the references are re-selected by ID at the moment each command needs them:
-#   0. User CLICKS the sketch plane, ENTER; then CLICKS the extrude-to plane,
-#      ENTER. The script records both feature IDs. No commands fire here.
-#   1. Re-select the sketch plane BY ID -> ProCmdDatumSketCurve opens
-#      pre-populated -> stdbtn_1 enters the sketcher.
-#   2. ProCmdSketRectangle 1 (CORNER rectangle — confirmed in CLAUDE.md Sketch
-#      tools) -> user draws a rough rectangle (2 corner clicks), presses ENTER.
-#   3. ProCmdSketDone exits the sketcher. User presses ENTER in PowerShell.
-#   4. Re-select the extrude-to plane BY ID -> extrude UP TO it so depth tracks
-#      that plane parametrically.
+# Returns $true only if the judge's overall verdict is "confirm". On no-config or
+# a judge error it writes the packet (for offline judging) and returns $false.
+function Invoke-BoxEval {
+    param([string]$Operation, [string[]]$Claims)
+
+    # Measure the solid itself (datum-excluded), sorted desc so the judge never
+    # needs an axis order. $model / $pfcType / $judgeCfg / $ScriptDir / $made are
+    # read from the enclosing scope (same dynamic-scope pattern Set-PlaneOffset uses).
+    $excl = New-ExcludeTypes -TypeObj $pfcType
+    $ext  = Measure-Extents -Solid $model -ExcludeTypes $excl
+
+    $truth = @{}
+    if ($null -ne $ext) {
+        $sorted = @($ext | Sort-Object -Descending)
+        $truth["measured_extents_sorted_desc"] = @([math]::Round([double]$sorted[0],4), [math]::Round([double]$sorted[1],4), [math]::Round([double]$sorted[2],4))
+    } else {
+        $truth["measured_extents_sorted_desc"] = $null
+        $truth["note"] = "EvalOutline returned no outline (the solid may not exist yet)"
+    }
+
+    # Re-read the current offset of every created plane, labeled by box dimension.
+    $offsets = @{}
+    foreach ($mp in $made) {
+        $dim = switch ($mp.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$mp.Label} }
+        $offsets[$dim] = Read-DimValue -Model $model -TypeObj $pfcType -Sym $mp.Sym
+    }
+    $truth["offset_dims"] = $offsets
+
+    $modelName = try { [string]$model.FileName } catch { "(unknown)" }
+    $claim = New-EvalClaim -Tool "plane-probe" -Operation $Operation -Claims $Claims
+    $slice = Get-GeometrySlice -Model $modelName -Truth $truth
+
+    $base = ($modelName -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
+    $packetPath = Join-Path $ScriptDir ($base + "_eval.json")
+    $when = (Get-Date).ToString("o")
+    Write-EvalPacket -Path $packetPath -Claim $claim -Slice $slice -WhenIso $when | Out-Null
+    Write-Host "  Eval packet -> $packetPath" -ForegroundColor DarkGray
+
+    # Judge the PERSISTED packet (reload), so what is judged == what is on disk.
+    $packetObj = Get-Content $packetPath -Raw | ConvertFrom-Json
+    $verdict = Invoke-BlindJudge -Packet $packetObj -Config $judgeCfg
+    return (Show-ConvergenceReport -Verdict $verdict -Title "Blind evaluator: $Operation")
+}
+
+# ============================================
+# 2b. CREATE THE BOX — EXTRUDE-FIRST with an INTERNAL sketch (v2 algorithm)
+# ============================================
+# Goal: build the solid whose depth is parametrically driven by the SIDE offset
+# plane. This v2 path clicks Extrude FIRST and creates the sketch INSIDE the
+# extrude (an internal sketch the feature owns), rather than extruding a separate
+# standalone sketch. The section is bound to the feature from the start, which
+# removes the standalone-sketch section-binding fragility of the v1 flow.
 #
-# Widget names all confirmed from a live `visible_mapkeys yes` recording:
-#   ProCmdDatumSketCurve / Odui_Dlg_00 stdbtn_1 / ProCmdSketRectangle 1 (CORNER) /
-#   ProCmdSketDone / ProCmdFtExtrude / main_dlg_cur dashInst0.Done, plus the
-#   up-to-plane depth option (maindashInst0.depth_flyout + maindashInst0.toselected)
-#   wired into $mkUpToPlaneOption below.
+# DIRECTION: sketch ON the offset plane and extrude UP TO the og / default datum,
+# so the box grows og -> offset (the natural-reading direction). It stays
+# parametric because the offset plane sits exactly the offset dim away from the og
+# datum, so the up-to-datum depth equals the offset value — driving the offset dim
+# still resizes the box. (Earlier the roles were reversed and the feature read
+# offset -> og, which confused users even though the geometry was correct.)
+#
+# Both plane references are captured BY ID up front and re-selected by ID, so the
+# ONLY manual step is drawing the rough rectangle. The rectangle draw is 4 screen
+# picks that a RunMacro cannot perform, so it forces ONE split: macro A arms the
+# rectangle tool, the user draws, macro B finishes the sketch + extrude.
+#
+# Transcribed from the user's live recording (current-build widget names):
+#   ~ Command `ProCmdFtExtrude`;
+#   ~ Select `main_dlg_cur` `PHTLeft.AssyTree` 1 `T3 1`;   <- sketch plane pick (-> select-by-ID)
+#   ~ Command `ProCmdViewSketchView`;
+#   ~ Command `ProCmdSketRectangle` 1;
+#   @PAUSE x4                                              <- the manual rectangle draw (split here)
+#   ~ Command `ProCmdSketDone`;
+#   ~ Select/Close `maindashInst0.depth_flyout`; ~ Activate `maindashInst0.toselected` 1;
+#   ~ Trigger `extrev_1_placement.0.0` `PH.section_select_list` `0`/``;
+#   @PAUSE                                                 <- up-to plane pick (-> select-by-ID, NoClear)
+#   ~ Enter/Exit `dashInst0.Quit`; ~ Activate `dashInst0.Done`;
+#
+# Two recorded screen picks are replaced by tree-search select-BY-ID: the sketch
+# plane (after ProCmdFtExtrude opens, while it waits for a plane) and the up-to
+# plane (feeding the open depth collector — surfenator proves a tree search feeds
+# that collector; -NoClear avoids deactivating it).
+#
+# THREE THINGS TO WATCH LIVE (all new to v2):
+#   (1) Does select-by-ID feed the extrude's sketch-plane request the same way the
+#       recorded PHTLeft.AssyTree click did? If the extrude doesn't drop into the
+#       sketcher, try surfenator's order instead (select plane BY ID *before*
+#       ProCmdFtExtrude).
+#   (2) Does the parked extrude dashboard survive the RunMacro boundary at the
+#       draw split? The internal sketcher is a modal sub-context of the extrude;
+#       ProCmdSketDone should return to it, but a dashboard's command context not
+#       surviving across RunMacro calls is a known gotcha (see CLAUDE.md).
+#   (3) Does select-by-ID (NoClear) feed the toselected/section_select_list
+#       collector while the dashboard is open (as in v1's flagged assumption)?
 
 $sidePlane = @($made | Where-Object { $_.Label -eq "Side" })
 $sidePlane = if ($sidePlane.Count -gt 0) { $sidePlane[0] } else { $null }
 
-Write-Host "  Build the box now? It will be extruded UP TO the SIDE plane." -ForegroundColor Cyan
+$sketchPlaneId = $null
+Write-Host "  Build the box now? (v2: Extrude-first, internal sketch; og -> offset direction)" -ForegroundColor Cyan
 $doBox = Read-Host "    (y to create the box, anything else to skip and go straight to resize)"
 if ($doBox.Trim().ToUpper() -eq "Y") {
     if ($null -eq $sidePlane) {
-        Write-Host "  No SIDE plane was created, so there is nothing to extrude up to. Skipping box." -ForegroundColor Yellow
+        Write-Host "  No SIDE plane was created, so there is nothing to build against. Skipping box." -ForegroundColor Yellow
     } else {
 
         # --- capture BOTH reference IDs UP FRONT (no commands fire here) ---
-        # 1) the datum plane to sketch the footprint on, 2) the plane to extrude
-        # up to. Both are recorded by feature ID so the build re-selects them by ID
-        # (no mid-flow clicks). The extrude-to defaults to the SIDE offset plane we
-        # already created (its FeatId is known) if nothing is selected.
+        # DIRECTION: sketch ON the og / default datum, extrude UP TO the OFFSET
+        # plane. The arrow then reads og -> offset (what we want). This stays
+        # parametric because the og datum and the offset plane are separated by
+        # EXACTLY the offset dim, so "up to the offset plane" depth == the offset
+        # value; driving the offset dim still resizes the box.
+        #   1) sketch plane = the og / default datum the user clicks (required;
+        #      there's no auto-default — the og datums aren't the planes we made),
+        #   2) extrude-to   = OFFSET plane (defaults to the SIDE plane we just made).
+        # Both recorded by feature ID and re-selected by ID (no mid-flow clicks).
         Write-Host ""
-        Write-Host "  In Creo: CLICK the datum plane to sketch the box footprint on," -ForegroundColor White
-        Write-Host "  then press ENTER here." -ForegroundColor White
+        Write-Host "  In Creo: CLICK the og/default datum to sketch the box footprint on," -ForegroundColor White
+        Write-Host "  then press ENTER." -ForegroundColor White
         Read-Host
         $sketchPlaneId = Read-SelectedId
         if ($null -eq $sketchPlaneId) {
             Write-Host "  Nothing selected for the sketch plane — skipping box." -ForegroundColor Yellow
-            $sketchPlaneId = $null
+        } else {
+            Write-Host "      sketch plane feature ID = $sketchPlaneId" -ForegroundColor DarkGray
         }
 
         if ($null -ne $sketchPlaneId) {
             Write-Host ""
-            Write-Host "  In Creo: CLICK the plane to extrude UP TO (the SIDE offset plane," -ForegroundColor White
-            Write-Host "  to keep depth parametric), then press ENTER. Or just press ENTER to" -ForegroundColor White
-            Write-Host "  use the SIDE plane automatically." -ForegroundColor White
+            Write-Host "  In Creo: CLICK the OFFSET plane to extrude UP TO (the box grows" -ForegroundColor White
+            Write-Host "  from the og plane toward this datum), then press ENTER. Or just" -ForegroundColor White
+            Write-Host "  press ENTER to use the SIDE offset plane." -ForegroundColor White
             Read-Host
             $extrudeToId = Read-SelectedId
             if ($null -eq $extrudeToId) {
                 $extrudeToId = $sidePlane.FeatId
-                Write-Host "      using SIDE plane (id $extrudeToId)" -ForegroundColor DarkGray
+                Write-Host "      extruding up to SIDE offset plane (id $extrudeToId)" -ForegroundColor DarkGray
             } else {
                 Write-Host "      extrude-to feature ID = $extrudeToId" -ForegroundColor DarkGray
             }
@@ -460,70 +583,51 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
 
     if ($null -ne $sketchPlaneId) {
 
-        # --- enter the sketcher: re-select the sketch plane BY ID, then open ---
         $stamp = $null
         try { $stamp = $model.VersionStamp } catch {}
 
-        Invoke-Macro "select sketch plane (id $sketchPlaneId) + open sketch tool" `
-            ((Get-SelectByIdMacro -FeatId $sketchPlaneId) + "~ Command ``ProCmdDatumSketCurve``;")
-        Start-Sleep -Milliseconds 300
-        Invoke-Macro "enter sketcher" "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
-
-        # Orient the view normal to the sketch plane (Sketch View) right after the
-        # sketcher opens, so the rough-rectangle picks land on a flat-on plane.
-        Invoke-Macro "orient sketch view (normal)" "~ Command ``ProCmdViewSketchView``;"
-
-        # CORNER rectangle (not center) — confirmed command name in CLAUDE.md.
-        Invoke-Macro "activate corner-rectangle tool" "~ Command ``ProCmdSketRectangle`` 1;"
-
-        Write-Host ""
-        Write-Host "  In Creo sketcher: click one corner of the rectangle, then the opposite" -ForegroundColor White
-        Write-Host "  corner. Size doesn't matter for this probe. Press Esc to finish, then" -ForegroundColor White
-        Write-Host "  press ENTER here." -ForegroundColor White
-        Read-Host
-
-        Invoke-Macro "exit sketcher" "~ Command ``ProCmdSketDone``;"
+        # --- MACRO A: select sketch plane BY ID -> ProCmdFtExtrude -> orient -> arm
+        #     the corner-rectangle tool. Stops before the manual draw. ---
+        # ORDER MATTERS: the select-by-ID runs FIRST so its leading buffer_clean
+        # wipes the offset plane left in the buffer by the extrude-to capture pick,
+        # and leaves ONLY the og datum selected. THEN ProCmdFtExtrude opens and
+        # consumes that buffered og datum as its sketch plane (surfenator's proven
+        # select-then-extrude order). The earlier version fired ProCmdFtExtrude
+        # first, so the extrude grabbed the stale OFFSET plane from the buffer before
+        # the by-ID select ran — which is why the sketch kept landing on the offset
+        # plane. Then orient + corner-rectangle, leaving the sketcher armed for the
+        # user's 2-corner draw.
+        $mkArm =
+            (Get-SelectByIdMacro -FeatId $sketchPlaneId) +
+            "~ Command ``ProCmdFtExtrude``;" +
+            "~ Command ``ProCmdViewSketchView``;" +
+            "~ Command ``ProCmdSketRectangle`` 1;"
+        Invoke-Macro "select sketch plane (id $sketchPlaneId) + extrude + arm rectangle" $mkArm
 
         Write-Host ""
-        Write-Host "  Sketch done. Press ENTER to extrude the box up to the chosen plane." -ForegroundColor Cyan
+        Write-Host "  In Creo (internal sketcher): click one corner of the rectangle, then" -ForegroundColor White
+        Write-Host "  the opposite corner. Size doesn't matter. Press Esc to finish the" -ForegroundColor White
+        Write-Host "  rectangle, then press ENTER here." -ForegroundColor White
         Read-Host
 
-        # --- extrude UP TO the chosen plane (re-selected BY ID, no manual pick) ---
-        # Depth-option lines confirmed from a live `visible_mapkeys yes` recording:
-        #   ~ Select   `main_dlg_cur` `maindashInst0.depth_flyout`;
-        #   ~ Close     `main_dlg_cur` `maindashInst0.depth_flyout`;
-        #   ~ Activate `main_dlg_cur` `maindashInst0.toselected` 1;
-        #   @PAUSE_FOR_SCREEN_PICK;                 <- recording's manual target pick
-        #   ~ Activate `main_dlg_cur` `dashInst0.Done`;
-        # We replace the @PAUSE with a tree-search select-BY-ID of the extrude-to
-        # plane (same pattern that drives the offset planes / show). ORDER MATTERS,
-        # all inside ONE atomic macro:
-        #   1. ProCmdFtExtrude FIRST — so the just-exited sketch locks in as the
-        #      section before we touch the buffer. (Selecting the plane first would
-        #      clobber the sketch-section selection.)
-        #   2. depth_flyout open/close -> toselected 1 — opens the up-to reference
-        #      collector (mirrors the recording: collector opens, THEN the pick).
-        #   3. select the extrude-to plane BY ID — feeds the open collector the way
-        #      the recorded screen pick did.
-        #   4. dashInst0.Done — confirm.
-        # UNVERIFIED ASSUMPTION (watch live): that a tree-search selection feeds the
-        # toselected collector while the extrude dashboard is open. If the extrude
-        # stalls with the dashboard waiting for a plane pick, the collector didn't
-        # take the by-ID selection and we'll need to split the pick back out.
-        $mkUpToPlaneOption =
+        # --- MACRO B: finish the internal sketch, set depth UP TO the extrude-to
+        #     plane (re-selected BY ID), blur the field, confirm. ---
+        # Mirrors the recording after the draw. The recorded up-to-plane @PAUSE is
+        # replaced by select-by-ID (-NoClear, so the open depth collector stays
+        # active). The section_select_list Triggers + the Enter/Exit Quit blur are
+        # kept verbatim from the recording.
+        $mkFinish =
+            "~ Command ``ProCmdSketDone``;" +
             "~ Select ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
             "~ Close ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
-            "~ Activate ``main_dlg_cur`` ``maindashInst0.toselected`` 1;"
-
-        $stamp = $null
-        try { $stamp = $model.VersionStamp } catch {}
-
-        $mkExtrude =
-            "~ Command ``ProCmdFtExtrude``;" +
-            $mkUpToPlaneOption +
-            (Get-SelectByIdMacro -FeatId $extrudeToId) +
+            "~ Activate ``main_dlg_cur`` ``maindashInst0.toselected`` 1;" +
+            "~ Trigger ``extrev_1_placement.0.0`` ``PH.section_select_list`` ``0``;" +
+            "~ Trigger ``extrev_1_placement.0.0`` ``PH.section_select_list`` ````;" +
+            (Get-SelectByIdMacro -FeatId $extrudeToId -NoClear) +
+            "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
+            "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
             "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-        Invoke-Macro "extrude up to plane id $extrudeToId (parametric) + confirm" $mkExtrude
+        Invoke-Macro "finish sketch + extrude up to plane id $extrudeToId + confirm" $mkFinish
 
         if ($null -ne $stamp) {
             for ($i = 0; $i -lt 100; $i++) {
@@ -531,6 +635,19 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
                 Start-Sleep -Milliseconds 50
             }
         }
+        Write-Host ""
+
+        # --- BLIND EVALUATE the freshly built box -------------------------------
+        # Claim: each box extent equals its driving offset. The judge measures the
+        # solid and confirms/refutes from geometry alone (no axis map handed to it).
+        $buildClaims = @()
+        foreach ($mp in $made) {
+            $dim = switch ($mp.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$mp.Label} }
+            $val = Read-DimValue -Model $model -TypeObj $pfcType -Sym $mp.Sym
+            if ($null -ne $val) { $buildClaims += ("the box {0} is {1}" -f $dim.ToLower(), $val) }
+        }
+        $buildClaims += "the solid's three measured extents each equal one of the three offset dims"
+        $script:buildConfirmed = Invoke-BoxEval -Operation "build-box" -Claims $buildClaims
         Write-Host ""
     }
 }
@@ -588,6 +705,14 @@ while ($true) {
         Write-Host ""
         Show-BoxState -Made $made
         Write-Host ""
+        # Blind-evaluate the WHOLE resized box: the dim "held" symbolically above,
+        # but did the SOLID actually take those sizes? The judge measures and decides.
+        $resizeClaims = foreach ($t in $targets) {
+            $dim = switch ($t.Plane.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$t.Plane.Label} }
+            "the box $($dim.ToLower()) is $($t.Want)"
+        }
+        if (@($resizeClaims).Count -gt 0) { $null = Invoke-BoxEval -Operation "resize-all" -Claims @($resizeClaims) }
+        Write-Host ""
         continue
     }
 
@@ -607,6 +732,10 @@ while ($true) {
     } else {
         Write-Host "    $($p.Label) $($p.Sym) = $now  (wanted $v — did NOT hold)" -ForegroundColor Yellow
     }
+    # Blind-evaluate this single resize against the measured solid (dim "held" is
+    # necessary but not sufficient — confirm one measured extent actually became $v).
+    $dimName = switch ($p.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$p.Label} }
+    $null = Invoke-BoxEval -Operation "resize-$($dimName.ToLower())" -Claims @("the box $($dimName.ToLower()) is $v")
 }
 
 Write-Host ""
@@ -614,6 +743,17 @@ if ($script:macroFailures -eq 0) {
     Write-Host "  Probe complete (no mapkey failures)." -ForegroundColor Cyan
 } else {
     Write-Host "  Probe complete with $($script:macroFailures) mapkey failure(s) — see red lines above." -ForegroundColor Yellow
+}
+# Honest final word on the box build: green only if the BLIND judge measured the
+# solid and confirmed the claim (not merely that the mapkeys fired or a dim symbol
+# read back). $script:buildConfirmed is unset if no box was built this run.
+if ($null -ne $script:buildConfirmed) {
+    if ($script:buildConfirmed) {
+        Write-Host "  Box build: independently confirmed by the blind evaluator (solid measured)." -ForegroundColor Green
+    } else {
+        Write-Host "  Box build: NOT independently confirmed — see the blind-evaluator verdict above." -ForegroundColor Yellow
+        Write-Host "  (An eval packet was written; it can also be judged offline.)" -ForegroundColor DarkGray
+    }
 }
 
 } finally {
