@@ -5,3 +5,7 @@ CREO_MAPKEY_AUTOMATION_GUIDE.md
 
 # Ignore CSV files
 *.csv
+
+# Blind-evaluator artifacts and judge config (secret)
+*_eval.json
+.bluegpt_judge.json

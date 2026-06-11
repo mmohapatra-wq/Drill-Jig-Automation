@@ -56,6 +56,59 @@ When writing or debugging Creo VB API code, consult the vb-docs MCP server
 (`mcp__vb-docs__*`) to verify method signatures, parameters, and return types
 before relying on memory.
 
+## Shared Library (`lib\`)
+Dot-sourceable PowerShell modules that end the copy-paste of geometric-read code across the
+`.cmd` tools. Load them inside the hybrid header pattern after `$ScriptDir` is set:
+```powershell
+. (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
+. (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')
+```
+- **`lib\creo_geometry.ps1`** — pure READS, no mutation. `Get-Comp`, `Dot`, `Dist-PointToAxis`,
+  `New-ExcludeTypes`, `Get-OutlineExtents`, `Measure-Extents` (was boxinator's `Measure-BoxExtents`),
+  `Get-AllSurfaces`, `Count-Cylinders`, `Get-CylinderAxes`, `Get-LinearDimMap`, `Read-DimValue`.
+  Each takes its COM objects as params (no module-level `$session`/`$model`) so it loads in a
+  plain host with stubbed objects for the unit tests.
+- **`lib\blind_evaluator.ps1`** — the convergence layer (below).
+- **`lib\tests\run_tests.ps1`** — offline unit tests (no Creo, no network). Run:
+  `powershell -ExecutionPolicy Bypass -File lib\tests\run_tests.ps1` (exit 0 = all pass).
+
+## Blind Evaluator / Convergence Layer
+Adapts mlogsdon's PLC "blind evaluator" idea (see `docs\blind_evaluator_architecture.md`) to
+Creo: **derive a claim cheaply, then converge by checking it against a narrowly-sliced ground
+truth with a judge that never saw HOW the claim was produced** — to catch *bad generalizations*
+(the silent-wrong-dim / wrong-feature / mis-classified-edge class this toolkit keeps hitting).
+
+**Loop:** tool states a CLAIM (`New-EvalClaim`) → measure only the in-scope geometry into a SLICE
+(`Get-GeometrySlice`; `Measure-Extents`/`Count-Cylinders`/`Read-DimValue` — and NOTHING about
+mapkeys/heuristics/axis maps, that omission is what makes the judge blind) → `Write-EvalPacket`
+to `<model>_eval.json` (durable, repo-convention artifact like the gauginator/datinator CSVs) →
+`Invoke-BlindJudge` → `Show-ConvergenceReport` returns a bool the caller uses to gate green "Done".
+
+**Transport (verified live 2026-06-11):** BlueGPT is LiteLLM-fronted / OpenAI-compatible —
+`POST {base}/v1/chat/completions`, `Authorization: Bearer <token>`, `response_format` =
+`json_schema` (strict). `Get-JudgeConfig` resolves `{base,token,model}` from, in order: a
+gitignored `.bluegpt_judge.json`, then `ANTHROPIC_BASE_URL`+`ANTHROPIC_AUTH_TOKEN` (already set
+for Claude Code on this machine → `https://litellm.leap.blueorigin.com`), then
+`BLUEGPT_API_BASE`+`BLUEGPT_API_KEY`. If none resolve, the packet is still written and the REST
+call is skipped — the tool degrades to offline-judge, never fails. Validate the gateway in
+isolation with `--probe-judge` (`Invoke-JudgeProbe`): sends a synthetic true+false packet and
+expects confirm+refute.
+
+**Key facts:**
+- The judge is told it is BLIND and to match claims **by VALUE**, never by axis order — so it
+  catches a width/height/depth swap a dimension-symbol re-read cannot. Keep claims atomic
+  ("the box width is 4.0"), one verdict each.
+- A slice must carry measured geometry ONLY. The unit tests assert no mapkey/heuristic text
+  (`RunMacro`, `ProCmd`, `dashInst`, `DimValue write`, ...) leaks into the judge input.
+- Numeric truth still comes from `EvalOutline`/COM (the deterministic lib). The LLM's job is the
+  *semantic* "does this geometry back the claim / which extent is which / is this a bad
+  generalization" call — not the measurement itself.
+- `*_eval.json` and `.bluegpt_judge.json` are gitignored.
+
+**Wired:** `plane-probe.cmd` (build + per-resize evaluation; final report gated on the judge, not
+on "the mapkey fired"). **Next (contracts in the memo):** radinator (re-decide each matched edge
+is really a node-to-stiffener fillet), holeinator (independent cylinder-count judge).
+
 ## Mapkey Patterns
 
 **Select by ID (tree search):**

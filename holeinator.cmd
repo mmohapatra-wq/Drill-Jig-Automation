@@ -241,11 +241,90 @@ if ($modelFile -notmatch '\.prt(\.\d+)?$' -and $modelFile -ne "") {
 # ============================================
 # Used by the off-plane filter, the idempotency check, and the geometric verify.
 # Defined once up here so every section shares the exact same component reads.
+# Try hard to turn one value into a scalar [double]. Returns $null if it isn't
+# numeric. Handles a bare number, a numeric string, or a 1-element array wrapping
+# a number (drills in). Does NOT throw.
+function ConvertTo-ScalarOrNull {
+    param($x)
+    $guard = 0
+    while ($guard -lt 8 -and $null -ne $x -and `
+           ($x -is [Array] -or ($x -is [System.Collections.IEnumerable] -and $x -isnot [string]))) {
+        $x = @($x)[0]; $guard++
+    }
+    if ($null -eq $x) { return $null }
+    $d = 0.0
+    if ([double]::TryParse([string]$x, [ref]$d)) { return $d }
+    try { return [double]$x } catch { return $null }
+}
+
+# Read the 3 components of an IpfcPoint3D / IpfcVector3D into a flat double[3].
+# The COM marshaling shape here has defied three assumptions, so this no longer
+# assumes ANY shape: it gathers candidate components four ways (bracket index,
+# .Item(i), recursive enumeration of leaves, and x/y/z-ish properties), takes the
+# first that yields 3 numbers. If NONE do, it THROWS naming the real .NET type --
+# so a failure tells us exactly what the object is instead of surfacing later as
+# a vague op_Subtraction.
 function Get-Comp {
-    # Read the 3 components of an IpfcPoint3D/IpfcVector3D (bracket idx, .Item fallback).
     param($V)
-    try   { return @([double]$V[0], [double]$V[1], [double]$V[2]) }
-    catch { return @([double]$V.Item(0), [double]$V.Item(1), [double]$V.Item(2)) }
+    if ($null -eq $V) { throw "Get-Comp: value is null" }
+
+    # strategy 1: integer index $V[0..2]
+    $byIndex = @()
+    for ($i = 0; $i -lt 3; $i++) {
+        $e = $null; try { $e = $V[$i] } catch {}
+        $s = ConvertTo-ScalarOrNull $e
+        if ($null -eq $s) { $byIndex = $null; break }
+        $byIndex += $s
+    }
+    if ($byIndex -and $byIndex.Count -eq 3) { return ,([double[]]$byIndex) }
+
+    # strategy 2: .Item(0..2)
+    $byItem = @()
+    for ($i = 0; $i -lt 3; $i++) {
+        $e = $null; try { $e = $V.Item($i) } catch {}
+        $s = ConvertTo-ScalarOrNull $e
+        if ($null -eq $s) { $byItem = $null; break }
+        $byItem += $s
+    }
+    if ($byItem -and $byItem.Count -eq 3) { return ,([double[]]$byItem) }
+
+    # strategy 3: recursively collect numeric leaves if $V is enumerable
+    if ($V -is [System.Collections.IEnumerable] -and $V -isnot [string]) {
+        $leaves = New-Object System.Collections.Generic.List[double]
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($V); $iter = 0
+        while ($stack.Count -gt 0 -and $iter -lt 1000 -and $leaves.Count -lt 3) {
+            $iter++
+            $cur = $stack.Pop()
+            $sc = ConvertTo-ScalarOrNull $cur
+            if ($null -ne $sc -and -not ($cur -is [System.Collections.IEnumerable] -and $cur -isnot [string])) {
+                $leaves.Add($sc); continue
+            }
+            if ($cur -is [System.Collections.IEnumerable] -and $cur -isnot [string]) {
+                $items = @($cur)
+                for ($k = $items.Count - 1; $k -ge 0; $k--) { $stack.Push($items[$k]) }
+            }
+        }
+        if ($leaves.Count -ge 3) { return ,([double[]]@($leaves[0], $leaves[1], $leaves[2])) }
+    }
+
+    # strategy 4: x/y/z style properties
+    foreach ($trip in @(@('x','y','z'), @('X','Y','Z'))) {
+        $byProp = @()
+        foreach ($p in $trip) {
+            $e = $null; try { $e = $V.$p } catch {}
+            $s = ConvertTo-ScalarOrNull $e
+            if ($null -eq $s) { $byProp = $null; break }
+            $byProp += $s
+        }
+        if ($byProp -and $byProp.Count -eq 3) { return ,([double[]]$byProp) }
+    }
+
+    # nothing worked -- surface the REAL type so we stop guessing
+    $tn = try { $V.GetType().FullName } catch { "<unknown>" }
+    $e0 = try { $V[0] } catch { "<no idx>" }
+    $e0t = try { $e0.GetType().FullName } catch { "<n/a>" }
+    throw "Get-Comp: could not extract 3 numbers from a [$tn] (element[0] is [$e0t]). Report this type so the reader can be taught it."
 }
 function Dot { param($A, $B) ($A[0]*$B[0] + $A[1]*$B[1] + $A[2]*$B[2]) }
 
@@ -353,21 +432,19 @@ function Get-CylinderAxes {
 # ============================================
 # CAPTURE: target datum points
 # ============================================
-# Build a map of REAL datum points in the model up front, keyed by ID (datinator's
-# proven ListItems(ITEM_POINT) + $pt.Id). The map holds the IpfcPoint OBJECT, not
-# just a bool, because the off-plane filter below needs each point's .Point xyz.
-# Captured selections are validated against this map, so a stray surface/edge in
-# the buffer, or a stale ID, is rejected before anything mutates the model.
+# Validate each SELECTED item directly -- do NOT cross-reference a model-wide
+# ListItems(ITEM_POINT) map. Two reasons that map approach failed live:
+#   (1) ListItems() THROWS IpfcXToolkitMultibodyUnsupported on a multi-body part
+#       (confirmed in the VB API docs) -- a jig is multi-body, so the map came
+#       up empty/partial and every real selection got rejected.
+#   (2) selecting a datum point in the tree can yield the point FEATURE (a
+#       different id space) rather than the point geometry whose id is in the map.
+# Instead: a thing is a usable datum point IFF reading IpfcPoint.Point off the
+# SelItem returns an xyz (datinator's confirmed geometry read). That works
+# regardless of body count and regardless of how the point was selected. We
+# capture id + xyz here, so the off-plane filter and idempotency reuse it with
+# no second COM read.
 $pfcType = New-Object -ComObject pfcls.pfcModelItemType
-$pointById = @{}
-try {
-    foreach ($pt in @($model.ListItems($pfcType.ITEM_POINT))) {
-        try { $pointById[[int]$pt.Id] = $pt } catch {}
-    }
-} catch {}
-if ($pointById.Count -eq 0) {
-    throw "No datum points exist in the active model -- nothing to drill. Create datum points first."
-}
 
 $points = ($session.CurrentSelectionBuffer()).Contents
 if ($points -eq $null) {
@@ -378,24 +455,77 @@ if ($points -eq $null) {
 }
 if ($points -eq $null) { throw "Selection buffer is empty -- no datum points selected." }
 
-# Dedup + validate: keep first occurrence of each ID that is a real datum point.
-$pointIDs = @()
-$seen = @{}
-$rejected = 0
-foreach ($item in $points) {
-    $id = $null
-    try { $id = [int]$item.SelItem.Id } catch { continue }
-    if ($seen.ContainsKey($id)) { continue }                 # duplicate selection
-    $seen[$id] = $true
-    if ($pointById.ContainsKey($id)) { $pointIDs += $id }    # real datum point
-    else { $rejected++ }                                     # not a datum point
+# Dedup by id; accept an item iff its SelItem yields a readable .Point xyz.
+# Resolve a selected item into zero-or-more point records @{ Id; Xyz }.
+# A datum point can reach the buffer two ways:
+#   (a) the point GEOMETRY itself  -> $si.Point reads directly.
+#   (b) the datum-point FEATURE (IpfcDatumPointFeat extends IpfcFeature; this is
+#       what you get selecting the point in the tree) -- it has NO .Point; the
+#       point geometry lives inside it as ITEM_POINT sub-items. A point-ARRAY
+#       feature holds many. We pull them via ListSubItems(ITEM_POINT).
+# Either way we want the geometry point id (that's what the hole macro's by-ID
+# tree search selects) plus its xyz.
+function Resolve-PointItems {
+    param($SelItem, $PfcType)
+    $out = @()
+    # (a) direct point geometry. Let a Get-Comp THROW propagate (don't swallow):
+    # if the COM marshaling is an unknown shape, Get-Comp throws naming the real
+    # .NET type, and we want that diagnostic to reach the user -- NOT be hidden.
+    $pt = $null
+    try { $pt = $SelItem.Point } catch {}
+    if ($null -ne $pt) {
+        $xyz = Get-Comp $pt           # may throw with type info -- intentional
+        $out += [pscustomobject]@{ Id = [int]$SelItem.Id; Xyz = $xyz }
+        return $out
+    }
+    # (b) feature -> its ITEM_POINT sub-items
+    $subs = @()
+    try { $subs = @($SelItem.ListSubItems($PfcType.ITEM_POINT)) } catch {}
+    foreach ($p in $subs) {
+        $ppt = $null
+        try { $ppt = $p.Point } catch {}
+        if ($null -ne $ppt) {
+            $pxyz = Get-Comp $ppt     # may throw with type info -- intentional
+            $out += [pscustomobject]@{ Id = [int]$p.Id; Xyz = $pxyz }
+        }
+    }
+    return $out
 }
 
-if ($rejected -gt 0) {
-    Write-Host ("  Ignored {0} selected item(s) that are not datum points." -f $rejected) -ForegroundColor Yellow
+$pointIDs = @()
+$xyzById  = @{}
+$seen = @{}
+$rejected = @()                       # collect (id,type) of rejects for an honest report
+foreach ($item in $points) {
+    $si = $null
+    try { $si = $item.SelItem } catch { continue }
+    if ($null -eq $si) { continue }
+
+    $recs = @(Resolve-PointItems -SelItem $si -PfcType $pfcType)
+    if ($recs.Count -eq 0) {
+        # nothing point-like in this selection -- report its id+type honestly
+        $rid = "?"; $tname = "?"
+        try { $rid = [int]$si.Id } catch {}
+        try { $tname = [string]$si.Type } catch {}
+        $rejected += [pscustomobject]@{ Id = $rid; Type = $tname }
+        continue
+    }
+    foreach ($rec in $recs) {
+        if ($seen.ContainsKey($rec.Id)) { continue }         # dedup across the whole selection
+        $seen[$rec.Id] = $true
+        $pointIDs += $rec.Id
+        $xyzById[$rec.Id] = $rec.Xyz
+    }
+}
+
+if ($rejected.Count -gt 0) {
+    Write-Host ("  Ignored {0} selected item(s) with no point geometry (and no point sub-items):" -f $rejected.Count) -ForegroundColor Yellow
+    foreach ($r in ($rejected | Select-Object -First 10)) {
+        Write-Host ("      id {0,-8} type {1}" -f $r.Id, $r.Type) -ForegroundColor DarkGray
+    }
 }
 if ($pointIDs.Count -eq 0) {
-    throw "No valid datum points in the selection (selected items were not datum points)."
+    throw "No datum points in the selection (no selected item, or its sub-items, returned point geometry -- see the id/type list above)."
 }
 Write-Host ("  Captured {0} valid target point(s)." -f $pointIDs.Count) -ForegroundColor Green
 
@@ -538,22 +668,18 @@ if ($csysList.Count -ge 1) {
 Write-Host ("  Plane-check frame: {0}" -f $csysName) -ForegroundColor Green
 
 # --- filter the captured points by off-plane distance ---
-# Cache each point's xyz as we read it so the idempotency check below doesn't
-# have to call .Point a second time.
+# xyz was already read at capture time into $xyzById, so this just projects.
 $offTol = 1e-4                              # same threshold datinator flags at
 $onPlane = @()
 $offPlane = @()
-$xyzById = @{}
 foreach ($id in $pointIDs) {
-    $pt = $pointById[$id]
-    $xyz = $null
-    try { $xyz = Get-Comp $pt.Point } catch {}
+    $xyz = $xyzById[$id]
     if ($null -eq $xyz) {
-        # cannot read coords -> cannot vouch it's on-plane; treat as off-plane
+        # should not happen (capture only keeps points with readable xyz), but
+        # be defensive: cannot vouch it's on-plane -> treat as off-plane
         $offPlane += [pscustomobject]@{ Id = $id; Off = [double]::NaN }
         continue
     }
-    $xyzById[$id] = $xyz
     $d = @($xyz[0] - $origin[0], $xyz[1] - $origin[1], $xyz[2] - $origin[2])
     $off = Dot $d $zAxis
     if ([Math]::Abs($off) -le $offTol) { $onPlane += $id }
