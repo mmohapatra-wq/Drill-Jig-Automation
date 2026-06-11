@@ -22,16 +22,25 @@ $ErrorActionPreference = "Stop"
 # plane's OFFSET distance, by contrast, is a feature-level dim — the same
 # reliable path boxinator uses for extrude depth — so a DimValue write sticks.
 #
-# Per-plane flow (one atomic macro, run 3x):
-#   1. Snapshot the linear dim-symbol set.
-#   2. User CLICKS the base reference plane in Creo (into the selection buffer),
-#      presses ENTER.
-#   3. ONE atomic RunMacro: ProCmdDatumPlane (opens with the buffered ref pre-
-#      loaded as an Offset constraint) -> type offset into t1.constr_dim1 ->
-#      Update -> FocusOut (blur so it lands) -> OK stdbtn_1.
-#      Must be a single RunMacro — a dialog's command context does NOT survive
-#      across separate RunMacro calls (same rule as the extrude dashboard).
-#   4. Diff the dim-symbol set; the ONE new symbol is that plane's offset dim.
+# Flow — collect everything up front, then fire all three with NO further clicks:
+#   0. Ask for all three offset distances (TOP/SIDE/FRONT).
+#   1. User picks the three BASE reference planes once each (quick clicks); the
+#      script records each base plane's FEATURE ID from the selection buffer.
+#      Nothing is created during this step.
+#   2. For each plane (loop runs with zero human interaction):
+#      a. Snapshot the linear dim-symbol set.
+#      b. ONE atomic RunMacro: tree-search-select the base plane BY ID (so the
+#         buffer holds the right ref) -> ProCmdDatumPlane (opens with the
+#         buffered ref pre-loaded as an Offset constraint) -> type offset into
+#         t1.constr_dim1 -> Update -> FocusOut (blur so it lands) -> OK stdbtn_1.
+#         Must be a single RunMacro — a dialog's command context does NOT survive
+#         across separate RunMacro calls (same rule as the extrude dashboard).
+#      c. Diff the dim-symbol set; the ONE new symbol is that plane's offset dim.
+#
+# Selecting the base plane by ID (the nodelator/flipenator tree-search pattern)
+# is what lets all three fire back-to-back: the old version made you click a base
+# plane and press ENTER between every plane because ProCmdDatumPlane consumes the
+# buffer. Capturing the IDs up front removes that interleaving.
 #
 # After all three are created, a parametric loop lets you resize the whole box
 # (all three at once) or any single plane — write its offset DimValue +
@@ -124,17 +133,64 @@ function Read-DimValue {
     try { return [double]$Model.GetItemByName($TypeObj.ITEM_DIMENSION, $Sym).DimValue } catch { return $null }
 }
 
-# Create ONE offset plane from a buffered base reference and return its new
-# offset dim symbol (or $null if none/ambiguous appeared). Splits the work the
-# proven way: caller stages the pick + ENTER, this fires the single atomic macro
-# and resolves the new symbol by dim-set diff.
+# Snapshot every feature ID on the model. The new datum-plane feature is found by
+# diffing this before vs after creation (same approach boxinator uses to find a
+# fresh extrude), so we capture the plane's feature ID without guessing.
+function Get-FeatureIdSet {
+    param($Model, $TypeObj)
+    $set = @{}
+    try {
+        foreach ($f in $Model.ListItems($TypeObj.ITEM_FEATURE)) {
+            try { $set[[int]$f.Id] = $true } catch {}
+        }
+    } catch {}
+    return $set
+}
+
+# Read the (last) selected feature ID from Creo's selection buffer, or $null.
+# Same buffer read used to capture the base planes up front.
+function Read-SelectedId {
+    $contents = ($session.CurrentSelectionBuffer()).Contents
+    if ($null -eq $contents -or $contents.Count -eq 0) { return $null }
+    try { return [int]$contents[$contents.Count - 1].SelItem.Id } catch { return $null }
+}
+
+# Build the tree-search select-by-ID macro fragment for a Feature (the proven
+# nodelator/flipenator pattern). Clears the buffer, then selects the feature with
+# the given ID INTO the buffer. The caller appends whatever command should
+# consume that buffered selection (ProCmdDatumPlane, ProCmdDatumSketCurve,
+# ProCmdViewShow@PopupMenuTree, the extrude's toselected, ...). Centralising the
+# string keeps the four call sites from drifting apart.
+function Get-SelectByIdMacro {
+    param([int]$FeatId)
+    return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Feature``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$FeatId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;"
+}
+
+# Create ONE offset plane from a base reference selected BY ID and return a
+# [pscustomobject] with its new offset dim Symbol and new feature Id (either may
+# be $null if none/ambiguous appeared). The base plane's feature ID was captured
+# up front, so this fires with no human interaction: tree-search-select the base
+# BY ID (populates the buffer) -> ProCmdDatumPlane (consumes it) -> offset -> OK,
+# all in one atomic macro. New symbol/feature resolved by before/after diff.
 function New-OffsetPlane {
-    param($Model, $TypeObj, [string]$Label, [double]$Offset)
+    param($Model, $TypeObj, [string]$Label, [double]$Offset, [int]$BaseId)
 
-    $before = Get-LinearDimMap -Model $Model -TypeObj $TypeObj
+    $before     = Get-LinearDimMap   -Model $Model -TypeObj $TypeObj
+    $beforeFeat = Get-FeatureIdSet   -Model $Model -TypeObj $TypeObj
 
-    # ONE atomic macro: open (ref pre-loaded from buffer) -> offset -> blur -> OK.
+    # ONE atomic macro: clear buffer -> tree-search-select base plane BY ID ->
+    # open ProCmdDatumPlane (ref pre-loaded from buffer) -> offset -> blur -> OK.
     $macro =
+        (Get-SelectByIdMacro -FeatId $BaseId) +
         "~ Command ``ProCmdDatumPlane``;" +
         "~ Input  ``Odui_Dlg_00`` ``t1.constr_dim1`` ``$Offset``;" +
         "~ Update ``Odui_Dlg_00`` ``t1.constr_dim1`` ``$Offset``;" +
@@ -156,18 +212,23 @@ function New-OffsetPlane {
     $after   = Get-LinearDimMap -Model $Model -TypeObj $TypeObj
     $newSyms = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
 
+    # The new datum-plane feature ID, by feature-set diff (used later to show it).
+    $afterFeat = Get-FeatureIdSet -Model $Model -TypeObj $TypeObj
+    $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) })
+    $newFeatId = if ($newFeats.Count -ge 1) { [int]$newFeats[0] } else { $null }
+
     if ($newSyms.Count -eq 0) {
-        Write-Host "    No new linear dim appeared for the $Label plane. Either it wasn't" -ForegroundColor Yellow
-        Write-Host "    created (no base plane in the buffer?), or the widget names" -ForegroundColor Yellow
-        Write-Host "    (t1.constr_dim1 / stdbtn_1) differ on this build." -ForegroundColor Yellow
-        return $null
+        Write-Host "    No new linear dim appeared for the $Label plane. Either the base" -ForegroundColor Yellow
+        Write-Host "    plane ID ($BaseId) didn't select (wrong ID / not a Feature?), or the" -ForegroundColor Yellow
+        Write-Host "    widget names (t1.constr_dim1 / stdbtn_1) differ on this build." -ForegroundColor Yellow
+        return [pscustomobject]@{ Symbol = $null; FeatId = $newFeatId }
     }
     if ($newSyms.Count -gt 1) {
         Write-Host "    More than one new dim appeared ($($newSyms -join ', ')); taking the first." -ForegroundColor Yellow
     }
     $sym = [string]$newSyms[0]
     Write-Host "    $Label offset dim: $sym = $($after[$sym])" -ForegroundColor Green
-    return $sym
+    return [pscustomobject]@{ Symbol = $sym; FeatId = $newFeatId }
 }
 
 # ============================================
@@ -229,12 +290,12 @@ $pfcType = New-Object -ComObject pfcls.pfcModelItemType
 # 0. ASK FOR THE THREE BOX OFFSETS
 # ============================================
 # Each label is just descriptive — the actual base plane is whatever you pick.
-# Typical mapping: Front offsets FRONT (depth), Side offsets RIGHT (width),
-# Top offsets TOP (height).
+# The part's default datums on this build are TOP / SIDE / FRONT. Mapping:
+# Top offsets TOP (height), Side offsets SIDE (width), Front offsets FRONT (depth).
 $planes = @(
-    [pscustomobject]@{ Label = "Front"; Hint = "FRONT"; Offset = 0.0; Sym = $null }
-    [pscustomobject]@{ Label = "Side";  Hint = "RIGHT"; Offset = 0.0; Sym = $null }
-    [pscustomobject]@{ Label = "Top";   Hint = "TOP";   Offset = 0.0; Sym = $null }
+    [pscustomobject]@{ Label = "Top";   Hint = "TOP";   Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
+    [pscustomobject]@{ Label = "Side";  Hint = "SIDE";  Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
+    [pscustomobject]@{ Label = "Front"; Hint = "FRONT"; Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
 )
 
 Write-Host "  Enter the three box offsets (blank/0 -> 1.0 so each has a drivable dim):" -ForegroundColor Cyan
@@ -250,17 +311,35 @@ foreach ($p in $planes) {
 Write-Host ""
 
 # ============================================
-# 1. CREATE THE THREE OFFSET PLANES (pick base ref -> one atomic macro, x3)
+# 1a. CAPTURE THE THREE BASE-PLANE IDs (quick picks, up front — nothing created)
 # ============================================
-Write-Host "  Creating three offset planes. For EACH one:" -ForegroundColor Cyan
-Write-Host "    - CLICK the named base plane in Creo (into the selection buffer)," -ForegroundColor White
-Write-Host "    - then press ENTER; the script opens the tool, sets the offset, OKs." -ForegroundColor White
+# Click each base plane once; the script reads its feature ID from the selection
+# buffer. No macro fires here, so there's no waiting between picks. The IDs let
+# section 1b re-select each base by ID and fire all three creations back-to-back.
+Write-Host "  First, identify the three base planes (one quick click each):" -ForegroundColor Cyan
+foreach ($p in $planes) {
+    Read-Host "    Click the $($p.Hint) plane in Creo, then press ENTER"
+    $contents = ($session.CurrentSelectionBuffer()).Contents
+    if ($null -eq $contents -or $contents.Count -eq 0) {
+        throw "Nothing was selected for the $($p.Hint) plane. Click the plane, then press ENTER."
+    }
+    # Take the last-selected item (in case earlier picks are still buffered).
+    $p.BaseId = [int]$contents[$contents.Count - 1].SelItem.Id
+    Write-Host "      $($p.Hint) base feature ID = $($p.BaseId)" -ForegroundColor DarkGray
+}
+Write-Host ""
+
+# ============================================
+# 1b. CREATE THE THREE OFFSET PLANES (select base BY ID -> atomic macro, x3, no clicks)
+# ============================================
+Write-Host "  Creating all three offset planes (no further clicks needed)..." -ForegroundColor Cyan
 Write-Host ""
 
 foreach ($p in $planes) {
-    Write-Host "  --- $($p.Label) plane (offset $($p.Offset) from $($p.Hint)) ---" -ForegroundColor Cyan
-    Read-Host "  (click the $($p.Hint) plane in Creo, then press ENTER)"
-    $p.Sym = New-OffsetPlane -Model $model -TypeObj $pfcType -Label $p.Label -Offset $p.Offset
+    Write-Host "  --- $($p.Label) plane (offset $($p.Offset) from $($p.Hint), id $($p.BaseId)) ---" -ForegroundColor Cyan
+    $res = New-OffsetPlane -Model $model -TypeObj $pfcType -Label $p.Label -Offset $p.Offset -BaseId $p.BaseId
+    $p.Sym    = $res.Symbol
+    $p.FeatId = $res.FeatId
     Write-Host ""
 }
 
@@ -270,6 +349,25 @@ if ($made.Count -eq 0) {
 }
 if ($made.Count -lt 3) {
     Write-Host "  WARNING: only $($made.Count) of 3 planes produced a drivable dim." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+# ============================================
+# 1c. SHOW (UNHIDE) ALL THREE OFFSET PLANES
+# ============================================
+# The recorded mapkey targeted a hard-coded tree node (`T3 6`), so it isn't
+# reusable as-is. Instead, for each plane we just created, select it BY ID
+# (tree-search) then fire ProCmdViewShow@PopupMenuTree — the show command from
+# the recording — so all three offset planes are made visible.
+$toShow = @($planes | Where-Object { $null -ne $_.FeatId })
+if ($toShow.Count -gt 0) {
+    Write-Host "  Showing the $($toShow.Count) new offset plane(s)..." -ForegroundColor Cyan
+    foreach ($p in $toShow) {
+        $showMacro =
+            (Get-SelectByIdMacro -FeatId $p.FeatId) +
+            "~ Command ``ProCmdViewShow@PopupMenuTree``;"
+        Invoke-Macro "show $($p.Label) plane (id $($p.FeatId))" $showMacro
+    }
     Write-Host ""
 }
 
@@ -300,13 +398,18 @@ Write-Host ""
 # offset plane. Resizing SIDE later (section 3) then resizes the box depth.
 #
 # Flow (mirrors boxinator's proven sketch path, corner rectangle instead of
-# center):
-#   1. User CLICKS the sketch plane in Creo (into the buffer), presses ENTER.
-#   2. ProCmdDatumSketCurve opens pre-populated -> stdbtn_1 enters the sketcher.
-#   3. ProCmdSketRectangle 1 (CORNER rectangle — confirmed in CLAUDE.md Sketch
+# center). Both reference picks are captured BY ID UP FRONT (same trick as the
+# offset planes), so the only manual step left is drawing the rough rectangle —
+# the references are re-selected by ID at the moment each command needs them:
+#   0. User CLICKS the sketch plane, ENTER; then CLICKS the extrude-to plane,
+#      ENTER. The script records both feature IDs. No commands fire here.
+#   1. Re-select the sketch plane BY ID -> ProCmdDatumSketCurve opens
+#      pre-populated -> stdbtn_1 enters the sketcher.
+#   2. ProCmdSketRectangle 1 (CORNER rectangle — confirmed in CLAUDE.md Sketch
 #      tools) -> user draws a rough rectangle (2 corner clicks), presses ENTER.
-#   4. ProCmdSketDone exits the sketcher. User presses ENTER in PowerShell.
-#   5. Extrude UP TO the SIDE plane so depth tracks that plane parametrically.
+#   3. ProCmdSketDone exits the sketcher. User presses ENTER in PowerShell.
+#   4. Re-select the extrude-to plane BY ID -> extrude UP TO it so depth tracks
+#      that plane parametrically.
 #
 # Widget names all confirmed from a live `visible_mapkeys yes` recording:
 #   ProCmdDatumSketCurve / Odui_Dlg_00 stdbtn_1 / ProCmdSketRectangle 1 (CORNER) /
@@ -324,16 +427,51 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
         Write-Host "  No SIDE plane was created, so there is nothing to extrude up to. Skipping box." -ForegroundColor Yellow
     } else {
 
-        # --- sketch plane pick + enter sketcher (boxinator's confirmed select-first flow) ---
+        # --- capture BOTH reference IDs UP FRONT (no commands fire here) ---
+        # 1) the datum plane to sketch the footprint on, 2) the plane to extrude
+        # up to. Both are recorded by feature ID so the build re-selects them by ID
+        # (no mid-flow clicks). The extrude-to defaults to the SIDE offset plane we
+        # already created (its FeatId is known) if nothing is selected.
         Write-Host ""
-        Write-Host "  In Creo: CLICK the datum plane you want to sketch the box footprint on" -ForegroundColor White
-        Write-Host "  (it should highlight). Do NOT open any command — just select it, then" -ForegroundColor White
-        Write-Host "  press ENTER here." -ForegroundColor White
+        Write-Host "  In Creo: CLICK the datum plane to sketch the box footprint on," -ForegroundColor White
+        Write-Host "  then press ENTER here." -ForegroundColor White
         Read-Host
+        $sketchPlaneId = Read-SelectedId
+        if ($null -eq $sketchPlaneId) {
+            Write-Host "  Nothing selected for the sketch plane — skipping box." -ForegroundColor Yellow
+            $sketchPlaneId = $null
+        }
 
-        Invoke-Macro "open sketch tool (plane pre-selected)" "~ Command ``ProCmdDatumSketCurve``;"
+        if ($null -ne $sketchPlaneId) {
+            Write-Host ""
+            Write-Host "  In Creo: CLICK the plane to extrude UP TO (the SIDE offset plane," -ForegroundColor White
+            Write-Host "  to keep depth parametric), then press ENTER. Or just press ENTER to" -ForegroundColor White
+            Write-Host "  use the SIDE plane automatically." -ForegroundColor White
+            Read-Host
+            $extrudeToId = Read-SelectedId
+            if ($null -eq $extrudeToId) {
+                $extrudeToId = $sidePlane.FeatId
+                Write-Host "      using SIDE plane (id $extrudeToId)" -ForegroundColor DarkGray
+            } else {
+                Write-Host "      extrude-to feature ID = $extrudeToId" -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    if ($null -ne $sketchPlaneId) {
+
+        # --- enter the sketcher: re-select the sketch plane BY ID, then open ---
+        $stamp = $null
+        try { $stamp = $model.VersionStamp } catch {}
+
+        Invoke-Macro "select sketch plane (id $sketchPlaneId) + open sketch tool" `
+            ((Get-SelectByIdMacro -FeatId $sketchPlaneId) + "~ Command ``ProCmdDatumSketCurve``;")
         Start-Sleep -Milliseconds 300
         Invoke-Macro "enter sketcher" "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+
+        # Orient the view normal to the sketch plane (Sketch View) right after the
+        # sketcher opens, so the rough-rectangle picks land on a flat-on plane.
+        Invoke-Macro "orient sketch view (normal)" "~ Command ``ProCmdViewSketchView``;"
 
         # CORNER rectangle (not center) — confirmed command name in CLAUDE.md.
         Invoke-Macro "activate corner-rectangle tool" "~ Command ``ProCmdSketRectangle`` 1;"
@@ -347,22 +485,31 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
         Invoke-Macro "exit sketcher" "~ Command ``ProCmdSketDone``;"
 
         Write-Host ""
-        Write-Host "  Sketch done. Press ENTER to extrude the box up to the SIDE plane." -ForegroundColor Cyan
+        Write-Host "  Sketch done. Press ENTER to extrude the box up to the chosen plane." -ForegroundColor Cyan
         Read-Host
 
-        # --- extrude UP TO the SIDE plane ---
+        # --- extrude UP TO the chosen plane (re-selected BY ID, no manual pick) ---
         # Depth-option lines confirmed from a live `visible_mapkeys yes` recording:
         #   ~ Select   `main_dlg_cur` `maindashInst0.depth_flyout`;
         #   ~ Close     `main_dlg_cur` `maindashInst0.depth_flyout`;
         #   ~ Activate `main_dlg_cur` `maindashInst0.toselected` 1;
-        #   @PAUSE_FOR_SCREEN_PICK;                 <- user clicks the target plane
+        #   @PAUSE_FOR_SCREEN_PICK;                 <- recording's manual target pick
         #   ~ Activate `main_dlg_cur` `dashInst0.Done`;
-        # The recorded @PAUSE is a real screen pick of the SIDE plane. A RunMacro
-        # string can't pause mid-sequence (and the dashboard must stay atomic), so
-        # we drop the @PAUSE and instead PRE-SELECT the SIDE plane into the buffer
-        # before firing — boxinator's proven select-first trick — letting the
-        # `toselected` option consume the buffered plane. dashInst0.Done is appended
-        # by the caller below, keeping the whole extrude one atomic macro.
+        # We replace the @PAUSE with a tree-search select-BY-ID of the extrude-to
+        # plane (same pattern that drives the offset planes / show). ORDER MATTERS,
+        # all inside ONE atomic macro:
+        #   1. ProCmdFtExtrude FIRST — so the just-exited sketch locks in as the
+        #      section before we touch the buffer. (Selecting the plane first would
+        #      clobber the sketch-section selection.)
+        #   2. depth_flyout open/close -> toselected 1 — opens the up-to reference
+        #      collector (mirrors the recording: collector opens, THEN the pick).
+        #   3. select the extrude-to plane BY ID — feeds the open collector the way
+        #      the recorded screen pick did.
+        #   4. dashInst0.Done — confirm.
+        # UNVERIFIED ASSUMPTION (watch live): that a tree-search selection feeds the
+        # toselected collector while the extrude dashboard is open. If the extrude
+        # stalls with the dashboard waiting for a plane pick, the collector didn't
+        # take the by-ID selection and we'll need to split the pick back out.
         $mkUpToPlaneOption =
             "~ Select ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
             "~ Close ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
@@ -371,25 +518,12 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
         $stamp = $null
         try { $stamp = $model.VersionStamp } catch {}
 
-        # Parametric up-to-plane path. In the recording the plane pick is a
-        # @PAUSE_FOR_SCREEN_PICK that fires AFTER `toselected` activates — i.e.
-        # `toselected` opens a reference collector that waits for a fresh pick. A
-        # RunMacro can't pause, so we PRE-SELECT the SIDE plane into the buffer and
-        # hope `toselected` consumes the buffered selection instead of waiting.
-        # THAT CONSUMPTION IS THE ONE UNVERIFIED ASSUMPTION — watch it live: if the
-        # extrude stalls with the dashboard open waiting for a plane pick, the
-        # collector did NOT take the buffered plane and we'll need to split the pick
-        # out (or keep the buffer warm a different way).
-        Write-Host ""
-        Write-Host "  In Creo: CLICK the SIDE offset plane (so the extrude can bind to it)," -ForegroundColor White
-        Write-Host "  then press ENTER here." -ForegroundColor White
-        Read-Host
-
         $mkExtrude =
             "~ Command ``ProCmdFtExtrude``;" +
             $mkUpToPlaneOption +
+            (Get-SelectByIdMacro -FeatId $extrudeToId) +
             "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-        Invoke-Macro "extrude up to SIDE plane (parametric) + confirm" $mkExtrude
+        Invoke-Macro "extrude up to plane id $extrudeToId (parametric) + confirm" $mkExtrude
 
         if ($null -ne $stamp) {
             for ($i = 0; $i -lt 100; $i++) {
