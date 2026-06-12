@@ -133,6 +133,27 @@ function Get-JudgeConfig {
 }
 
 # ----------------------------------------------------------------------------
+# ConvertTo-AsciiSafeJson - ConvertTo-Json then escape EVERY non-ASCII code point
+# to \uXXXX. This is REQUIRED, not cosmetic: Windows PowerShell 5.1 ConvertTo-Json
+# emits non-ASCII literally (e.g. an arrow as a raw → byte, not →), and some
+# code points (confirmed: ± U+00B1) reach the LiteLLM gateway mis-encoded and it
+# rejects the whole request with a bare 400. Any slice/diff carrying ± / curly
+# quotes / box-draw chars (CLAUDE.md and the tool sources are full of them) would
+# silently 400. \uXXXX is valid JSON and survives any transport encoding, so the
+# judge always gets clean input. Build every request body through this.
+function ConvertTo-AsciiSafeJson {
+    param([Parameter(ValueFromPipeline=$true)]$InputObject, [int]$Depth = 20)
+    $json = $InputObject | ConvertTo-Json -Depth $Depth
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $json.ToCharArray()) {
+        $code = [int][char]$ch
+        if ($code -gt 127) { [void]$sb.AppendFormat('\u{0:x4}', $code) }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+
+# ----------------------------------------------------------------------------
 # Get-BlindJudgeMessages - build the chat messages for a packet. Factored out of
 # Invoke-BlindJudge so the unit tests can assert the prompt is BLIND and the
 # slice carries no mapkey provenance, without any network call.
@@ -232,7 +253,7 @@ function Invoke-BlindJudge {
         max_tokens      = $MaxTokens
         messages        = Get-BlindJudgeMessages -Packet $Packet
         response_format = Get-BlindJudgeSchema
-    } | ConvertTo-Json -Depth 20
+    } | ConvertTo-AsciiSafeJson -Depth 20
 
     $headers = @{ "Authorization" = "Bearer $($Config.token)"; "Content-Type" = "application/json" }
     $uri = "$($Config.base)/v1/chat/completions"

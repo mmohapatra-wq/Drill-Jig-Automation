@@ -129,6 +129,31 @@ entered offsets). **Next (contracts in the memo):** radinator (semantic-gated �
 each matched edge is really a node-to-stiffener fillet, slice MUST exceed the heuristic's inputs),
 holeinator (numeric-gated cylinder count, judged independently of its own surface walk).
 
+## Response Convergence (the loop turned on the AGENT)
+Same blind-evaluator idea aimed at Claude Code's OWN responses: an LLM coding agent fires edits and
+CLAIMS things ("tests pass", "all N call sites updated") — confident producers emit plausible-but-
+wrong claims, exactly what the evaluator catches. `lib\response_eval.ps1` + `lib\run_response_eval.ps1`.
+- **Claim packet** (`.claude\.converge_packet.json`): claims, each with a check of kind `symbol`/`cmd`
+  (DETERMINISTIC floor — the gate), `semantic` (LLM-judged), or `creo` (behavioral → always emitted
+  **UNVERIFIED IN CREO**, never green; headless cannot run Creo).
+- **Blind slice** = the raw `git diff` + each cmd's exit/output — NOT the agent's prose. The judge
+  re-derives from evidence and also flags **unclaimed** substantive diff hunks (anti-gaming: you
+  can't slip a change past it). Unclaimed = warnings by default; opt into hard-fail with
+  `"strictUnclaimed":true` in the packet.
+- **Gate** = deterministic floor all-pass AND no semantic refute. The LLM can't override a failed
+  symbol/cmd check (same flicker argument as the geometry gate). Reuses `Get-JudgeConfig` + the REST
+  transport; bodies go through `ConvertTo-AsciiSafeJson` (a `±`/curly-quote/box-draw char in a diff
+  400s the gateway via PS 5.1's literal-non-ASCII `ConvertTo-Json` — escape to `\uXXXX`).
+- **Automated** via hooks in `.claude\settings.local.json` (gitignored): `UserPromptSubmit`
+  (`converge_prompt.ps1`) resets per-turn state + snapshots the base ref + reminds Claude to write a
+  packet; `Stop` (`converge_stop.ps1`) runs the harness, BLOCKS the stop with refutations if not
+  converged, self-managed iteration cap = 2 (does NOT rely on `stop_hook_active`, which is not in the
+  documented schema), **fails open** on any harness/IO error (a broken verifier must never wedge a
+  turn). **To disable:** delete the `hooks` block from `.claude\settings.local.json`.
+- Offline tests: `lib\tests\run_response_tests.ps1` (26, builds a throwaway git repo). Proven live
+  against this repo: deterministic floor caught a planted false claim; semantic judge cited diff
+  evidence; unclaimed-change sweep flagged real uncovered edits.
+
 ## Mapkey Patterns
 
 **Select by ID (tree search):**
@@ -273,13 +298,16 @@ Note: body ID and feature ID are different — flip operates on the feature, fin
 Applies rounds to node-to-stiffener edges matching a specified length range.
 
 **Flow:**
-1. User inputs edge length target (single + tolerance or min/max range) and radius value
-2. **Scan phase (pure VB API):** traverse all bodies → surfaces → contours → edges. Per edge:
-   - Check length is within range
-   - Check edge is straight (`GetCurveDescriptor()` has endpoints)
-   - Check one adjacent surface is a convex cylinder (type=1, orientation=1) and the other is a plane (type=0 or 9)
-   - Check cylinder radius ≤ 0.875 in
-3. **Round phase (mapkeys):** batch matched edges into groups of 40. Per batch: open tree search once, add each edge ID to selection buffer, close search, fire `ProCmdRound` with radius → `dashInst0.Done`
+1. User inputs edge length target (single + tolerance, default ±0.005 / min/max range) and radius value (default 0.125 in).
+2. **Surface enumeration:** list bodies via `ListItems(ITEM_BODY)` → `body.ListSurfaces()` into one flat list. Fallback to `model.GetDefaultBody().ListSurfaces()` if body enumeration yields nothing.
+3. **Scan phase (pure VB API):** per surface → `ListContours()` → `contour.ListElements()` (edges). `$processedSurfaceIds` / `$processedEdgeIds` hashtables dedup — every edge is shared by two surfaces, so each would otherwise be examined twice. Filters applied cheapest-first; bail on first failure:
+   - Length within `[Min,Max]` (`EvalLength()`)
+   - Edge is straight (`GetCurveDescriptor().End1` is non-null)
+   - One adjacent surface (`Surface1`/`Surface2`) is a convex cylinder (type=1, `GetOrientation()`=1) and the other is a plane (type=0 or 9) — the node-boss-meets-flat-stiffener fingerprint, checked both orderings
+   - Cylinder radius (`desc.Radius`) ≤ 0.875 in (`$maxNodeRadius`)
+   - Survivors pushed to `$matchingEdges` with `Id, Length, SurfaceId, CylinderRadius`. Descriptors/surfaces are `ReleaseComObject`'d inside the loop (a big scan touches thousands of COM objects).
+4. **Round phase (mapkeys):** batch matched edges into groups of 40 (`$batchSize`). Per batch: `ProCmdSelClear` → open tree search once → loop the 40 edge IDs into the selection buffer (`InputIDPanel` → `EvaluateBtn` → `ApplyBtn`, accumulating) → close search → fire `ProCmdRound` with radius → `dashInst0.Done`. One round feature per 40 edges (why it's fast on big models).
+5. **Cleanup:** `finally` restores config, `ReleaseComObject`s everything (bodies, model, session, connection, async) and forces a GC.
 
 Round mapkey (confirmed working):
 ```
@@ -291,7 +319,9 @@ Round mapkey (confirmed working):
 ~ Activate `main_dlg_cur` `dashInst0.Done`;
 ```
 
-Supports `-v` / `--verbose` flag for edge/radius distribution breakdown.
+Supports `-v` / `--verbose` flag for node-diameter (radius×2) and edge-length distribution breakdown before rounds are applied.
+
+**Caveat:** the round-phase `RunMacro` calls are wrapped in error-swallowing `try/catch`, and `$totalSuccess` counts *batches fired*, not rounds Creo actually accepted. A round that silently fails in Creo (e.g. geometry can't take the radius) won't show in the final count — hence the on-screen "Monitor Creo and click Ok if any rounds fail" note. Verify rounds visually after a run.
 
 ### gripenator.cmd
 Interactive menu tool for managing HST fasteners in an assembly.
@@ -398,3 +428,36 @@ Creates an **On-Point hole** at every target datum point — piece **(C)** of th
 **Verification = `VersionStamp` (did the model change), not geometric measurement.** Lighter than boxinator/radinator's cylinder-count proof; "Done" means the model changed for each hole, not that N correct holes were *measured*. Wiring holeinator's verify into the blind-evaluator lib (count cylinders at the hole radius, judge against sliced truth) is the natural next hardening step but is NOT done.
 
 **History / why ID-only:** the original design read each point's xyz via `IpfcPoint.Point` to compute an **off-plane filter** and **idempotency** check. That COM coordinate read crashed repeatedly live (`op_Subtraction on System.Object[]` — the point marshals in an array shape `Get-Comp` didn't expect; multiple shape-coercion attempts all failed on the real object). The fix was architectural, not another patch: **drop coordinate reads entirely** and let the human judge visually. Off-plane filtering, idempotency, dry-run, and the geometric cylinder-count verify were all REMOVED in that rebuild (~50k → ~19k chars). datinator (piece A, the standalone point-reader) was deleted at the same time — nothing consumed its CSV and it carried the same unfixed coordinate bug. If off-plane/idempotency are ever wanted back, the COM point-marshaling shape must be solved first (a shape-agnostic `Get-Comp` that throws-with-type is in git history).
+
+### plane-probe.cmd
+**EXPERIMENT, not production** (lives on the `boxinator-parametric` / `plane-probe-v2` branches — does NOT modify boxinator.cmd). Builds a fully **parametric box** from three offset datum planes, then a solid sized by them, and lets you resize it live. Single-session only (no picker — throws if >1 `xtop.exe`).
+
+**Why offset planes:** a datum plane's OFFSET distance is a **feature-level** dim, so a plain `DimValue` write + regen HOLDS — unlike a SKETCH dim, which snaps back (see [[project_sketch_dim_snapback]]). The three offset planes (TOP/SIDE/FRONT), against the part's three default datums, bound a box whose every extent is driven by an offset dim from PowerShell.
+
+**Flow:**
+1. **Ask all three offsets up front** (TOP/SIDE/FRONT).
+2. **Capture three base-plane IDs up front** — user clicks each default datum once (quick picks; nothing fires between them), script records each feature ID from the selection buffer.
+3. **Create all three planes back-to-back, no clicks** (`New-OffsetPlane`): per plane, ONE atomic macro = select base BY ID → `ProCmdDatumPlane` (consumes the buffered ref as an Offset constraint) → type offset into `t1.constr_dim1` → `FocusOut` (blur) → `stdbtn_1` (OK). The new offset dim symbol is found by **before/after linear-dim-set diff**; the new plane's feature ID by **feature-ID-set diff**.
+4. **Show all three** (`ProCmdViewShow@PopupMenuTree`, select-by-ID per plane). Runs on FeatId BEFORE the drivable-dim gate, so a created plane shows even if its dim wasn't captured.
+5. **Build the box (v2: extrude-first, internal sketch)** — see below.
+6. **Resize loop:** `A` = set all three offsets (resize whole box), `1-N` = one plane, `D` = done. Each write goes through `Set-PlaneOffset` (DimValue + `Invoke-ForceRegen`) and is re-read to confirm it held.
+
+**v2 box build — extrude-first / internal sketch (current algorithm):** clicks Extrude FIRST and creates the sketch INSIDE the extrude (the feature owns the section from the start — no standalone-sketch section-binding fragility). Transcribed from a live recording (current `maindashInst0` widgets). The only manual step is drawing the rough rectangle (4 screen picks a `RunMacro` can't do), which forces ONE split into two macros:
+- **Macro A:** select sketch plane BY ID **FIRST** (its `buffer_clean` wipes the stale extrude-to plane) → `ProCmdFtExtrude` (consumes the og datum) → `ProCmdViewSketchView` → `ProCmdSketRectangle 1` (arm corner-rect). User draws + ENTER.
+- **Macro B:** `ProCmdSketDone` → `maindashInst0.depth_flyout` → `maindashInst0.toselected` → `extrev_1_placement.0.0` `PH.section_select_list` triggers → select extrude-to plane BY ID (**`-NoClear`**, so the open depth collector stays active) → `Enter`/`Exit dashInst0.Quit` (blur) → `dashInst0.Done`.
+
+**DIRECTION (confirmed live):** sketch ON the **og/default datum**, extrude UP TO the **offset plane**, so the feature reads og → offset. Stays parametric because the og datum and offset plane are separated by EXACTLY the offset dim, so the up-to-plane depth equals the offset value — driving the offset dim still resizes the box. The sketch-plane select MUST run before `ProCmdFtExtrude`; firing the extrude first made it grab the stale offset plane from the buffer (sketch landed on the wrong plane).
+
+**Shared helpers (also used by the blind evaluator):**
+- `Get-SelectByIdMacro -FeatId [-NoClear]` — the nodelator/flipenator tree-search select-by-ID fragment, centralised (4 call sites). `-NoClear` omits the leading `buffer_clean` for feeding an already-open dashboard reference collector (clearing mid-dashboard can deactivate it; surfenator proves the tree-search feeds the collector).
+- `Read-SelectedId` — last selected feature ID from the selection buffer.
+- `New-OffsetPlane` **polls** for the new offset dim to appear (up to ~20s) rather than waiting a fixed interval — heavy models commit the datum plane more slowly, and a fixed wait diffed the dim set before the offset dim was enumerable (symptom: "No new linear dim" even though the plane was made).
+- `Invoke-ForceRegen` — boxinator's forced-regen-with-fallback (forced API regen → UI `ProCmdRegenerate` → automatic).
+- `Get-LinearDimMap` / `Read-DimValue` now live in `lib\creo_geometry.ps1` (shared so every tool reads dims the same way).
+
+**Blind-evaluator wired:** build + per-resize claims (the entered offsets), deterministic-gated with LLM advisory — see the blind-evaluator section above. `--probe-judge` validates the BlueGPT REST judge round-trip with a synthetic packet (no Creo) before relying on it live.
+
+**Key facts / gotchas:**
+- Selecting base planes BY ID (captured up front) is what lets all three creations fire back-to-back — `ProCmdDatumPlane` consumes the buffer, so manual picks would otherwise have to interleave.
+- The whole open→offset→OK per plane MUST be one atomic `RunMacro` (a dialog's command context does not survive across `RunMacro` calls — same rule as the extrude dashboard).
+- The v2 extrude's "does select-by-ID feed the open `toselected`/`section_select_list` collector" was the last unverified assumption; confirmed working live.

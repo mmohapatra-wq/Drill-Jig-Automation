@@ -1,0 +1,1334 @@
+<# :
+@echo off
+setlocal
+powershell -ExecutionPolicy Bypass -NoProfile -Command "$ScriptDir='%~dp0'; $ScriptArgs='%*'; & ([scriptblock]::Create((Get-Content -Raw -Encoding UTF8 '%~f0')))"
+exit /b %errorlevel%
+#>
+
+# ============================================================================
+# drilljig.cmd - DRILL-JIG PROTOTYPE (jiginator + plane-probe + holeinator)
+# ============================================================================
+# One end-to-end run of the whole drill-jig flow, in a single console session
+# and a SINGLE Creo connection:
+#
+#   STAGE 1  walk the decision tree (no Creo)        -> resolves the hole OD
+#   STAGE 2  build a parametric box from offset planes (plane-probe v2)
+#   STAGE 3  drill an On-Point hole at every target datum point (holeinator),
+#            using the diameter from STAGE 1
+#
+# This is a MERGE of three working tools (jiginator.cmd / plane-probe.cmd /
+# holeinator.cmd). Those three are LEFT UNTOUCHED and still run standalone. The
+# differences here vs. running them separately:
+#   - the hole diameter is handed STAGE 1 -> STAGE 3 as an in-process variable,
+#     NOT via last_jig_spec.json (the standalone tools still use that file);
+#   - ONE Creo connection / config-suppress / finally wraps STAGES 2 + 3;
+#   - the tree is walked ONCE (jiginator's "run again?" loop is dropped);
+#   - only one press-any-key at the very end.
+#
+# DATUM POINTS: this prototype assumes the target datum points ALREADY EXIST in
+# the CAD file (placed on another plane). STAGE 3 just selects them - no point
+# generation. Open the jig PART (not the .asm) with its default datum planes
+# (FRONT/RIGHT/TOP) plus the pre-placed datum points before running.
+#
+# Provenance of the lifted logic (do not "improve" during the merge):
+#   - jiginator helpers + tree walk (jiginator.cmd)
+#   - plane-probe's v2 extrude-first / internal-sketch box build, the offset-
+#     plane creation, the blind evaluator hook, and the resize loop
+#   - holeinator's Build-HoleMacro (transcribed from a live recording) + canary
+# ============================================================================
+
+$Host.UI.RawUI.WindowTitle = "DRILLJIG"
+$ErrorActionPreference = "Stop"
+
+# --probe-judge : validate the BlueGPT REST judge round-trip (endpoint + auth)
+# with a synthetic packet, then exit. No Creo connection, no model touched.
+$ProbeJudge = ($ScriptArgs -match '(?i)(^|\s)-{1,2}probe-judge(\s|$)')
+
+trap {
+    Write-Host ""
+    Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    $inv = $_.InvocationInfo
+    if ($null -ne $inv) {
+        Write-Host ("  at line {0}: {1}" -f $inv.ScriptLineNumber, $inv.Line.Trim()) -ForegroundColor DarkYellow
+    }
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 1
+}
+
+# ============================================================================
+# STAGE 1 HELPERS - decision-tree walk (lifted from jiginator.cmd)
+# ============================================================================
+
+$dataDir = Join-Path $ScriptDir 'data'
+
+# Turn a machinist fraction or plain number ("3/4", "0.5") into a decimal.
+function ConvertTo-Decimal {
+    param([string]$Text)
+    if ($Text -match '^\s*(\d+)\s*/\s*(\d+)\s*$') {
+        return [double]$matches[1] / [double]$matches[2]
+    }
+    $d = 0.0
+    if ([double]::TryParse($Text, [ref]$d)) { return $d }
+    return $null
+}
+
+# Pull the machinist-fraction label for a dimension out of an EasyName so the
+# menu can show "3/4" / "1 3/8" instead of decimals. EasyName format is
+#   "<tag> | OD <od> x ID <id> x <len> Lg"
+# $Which is 'OD' or 'Lg' (length). Falls back to the decimal value if the name
+# doesn't parse (e.g. drill IDs are stored decimal).
+function Get-FracLabel {
+    param([string]$EasyName, [string]$Which, [string]$Fallback)
+    if ($EasyName) {
+        if ($Which -eq 'OD' -and $EasyName -match 'OD\s+(.+?)\s+x') {
+            return $matches[1].Trim()
+        }
+        if ($Which -eq 'Lg' -and $EasyName -match 'x\s+([^x]+?)\s+Lg') {
+            return $matches[1].Trim()
+        }
+    }
+    return $Fallback
+}
+
+# Parse a free-text outcome label into a catalog query:
+#   { File = '<csv path>'; Filters = @( @{ Column='ID'|'OD'; Values=@(<decimals>) }, ... ) }
+# Returns $null if the label isn't a catalog-show instruction.
+function Get-CatalogSpec {
+    param([string]$Label)
+    if (-not $Label) { return $null }
+    $low = $Label.ToLower()
+
+    # category -> file
+    $file = $null
+    if ($low -match 'removable|drill') {
+        $file = Join-Path $dataDir 'bushings_drill.csv'
+    } elseif ($low -match 'sleeve') {
+        $file = Join-Path $dataDir 'bushings.csv'
+    }
+    if (-not $file) { return $null }
+
+    # constraints: every "<fraction-or-number> ID|OD" token, grouped by column
+    $byCol = @{}
+    $rx = [regex]'(\d+(?:/\d+)?(?:\.\d+)?)\s*(ID|OD)'
+    foreach ($m in $rx.Matches($Label)) {
+        $val = ConvertTo-Decimal $m.Groups[1].Value
+        $col = $m.Groups[2].Value.ToUpper()
+        if ($null -eq $val) { continue }
+        if (-not $byCol.ContainsKey($col)) { $byCol[$col] = @() }
+        $byCol[$col] += $val
+    }
+
+    $filters = @()
+    foreach ($col in $byCol.Keys) {
+        $filters += @{ Column = $col; Values = @($byCol[$col] | Select-Object -Unique) }
+    }
+
+    return @{ File = $file; Filters = $filters }
+}
+
+# Parse a FIXED-OD outcome label -> the hole diameter (decimal), or $null.
+# Some tree leaves declare the hole OD outright instead of showing a catalog,
+# e.g. metal -> PFD: "the OD of the hole will be 3/4 in". There is no bushing to
+# pick (so no length), just a hard diameter. Only catalog labels carry the
+# removable/drill/sleeve keyword, so any label reaching here is NOT a catalog
+# show; we match "OD ... <fraction|number>" and convert it.
+function Get-FixedOdSpec {
+    param([string]$Label)
+    if (-not $Label) { return $null }
+    if ($Label -notmatch '(?i)\bOD\b') { return $null }
+    # the first fraction/number that appears AFTER the word OD is the hole OD
+    if ($Label -match '(?i)\bOD\b[^0-9]*(\d+(?:/\d+)?(?:\.\d+)?)') {
+        return (ConvertTo-Decimal $matches[1])
+    }
+    return $null
+}
+
+# Load + filter the catalog and let the user pick one row.
+# Returns the chosen row (PSCustomObject) or $null on quit / no matches.
+function Invoke-BushingPick {
+    param($Spec)
+
+    if (-not (Test-Path $Spec.File)) {
+        Write-Host "  Catalog file not found: $($Spec.File)" -ForegroundColor Red
+        return $null
+    }
+
+    $rows = @(Import-Csv $Spec.File)
+
+    foreach ($f in $Spec.Filters) {
+        $col = $f.Column
+        $vals = $f.Values
+        $rows = @($rows | Where-Object {
+            $cell = [double]$_.$col
+            ($vals | Where-Object { [math]::Abs($cell - $_) -lt 1e-6 }).Count -gt 0
+        })
+    }
+
+    if ($rows.Count -eq 0) {
+        Write-Host "  No catalog rows match this selection." -ForegroundColor Yellow
+        $crit = ($Spec.Filters | ForEach-Object { "$($_.Column) in {$($_.Values -join ', ')}" }) -join '; '
+        Write-Host "  (file: $(Split-Path $Spec.File -Leaf); filter: $crit)" -ForegroundColor DarkGray
+        return $null
+    }
+
+    # Two-stage pick: OD first (drives the hole), then length within that OD.
+    # The user only needs to see OD + length; everything else is on the row.
+    while ($true) {
+
+        # --- stage 1: distinct ODs, ascending ---
+        $odGroups = @($rows | Group-Object OD | Sort-Object { [double]$_.Name })
+        Write-Host ""
+        Write-Host "  Select OD (hole diameter):" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $odGroups.Count; $i++) {
+            $g = $odGroups[$i]
+            $lenWord = if ($g.Count -eq 1) { 'length' } else { 'lengths' }
+            Write-Host ("    {0,3}) OD {1,-7} [hole = {2:0.###}]   ({3} {4})" -f `
+                ($i + 1), (Get-FracLabel $g.Group[0].EasyName 'OD' $g.Name), $g.Name, $g.Count, $lenWord) `
+                -ForegroundColor White
+        }
+        Write-Host ""
+
+        $odPick = $null
+        while ($true) {
+            $raw = Read-Host "  Pick OD (1-$($odGroups.Count), or Q to skip)"
+            if ($raw -match '^[Qq]$') { return $null }
+            $n = 0
+            if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $odGroups.Count) {
+                $odPick = $odGroups[$n - 1]; break
+            }
+            Write-Host "  Enter a number between 1 and $($odGroups.Count)." -ForegroundColor Yellow
+        }
+
+        $odLabel = Get-FracLabel $odPick.Group[0].EasyName 'OD' $odPick.Name
+
+        # --- stage 2: distinct lengths within the chosen OD, ascending ---
+        # ID is intentionally hidden here - it doesn't change the jig hole (= OD).
+        # If an OD+length has more than one ID, stage 3 offers the ID choice.
+        $backToOd = $false
+        while (-not $backToOd) {
+            $lenGroups = @($odPick.Group | Group-Object Length | Sort-Object { [double]$_.Name })
+            Write-Host ""
+            Write-Host ("  Select length (OD {0}):" -f $odLabel) -ForegroundColor Cyan
+            for ($i = 0; $i -lt $lenGroups.Count; $i++) {
+                $lg = $lenGroups[$i]
+                $lenLbl = Get-FracLabel $lg.Group[0].EasyName 'Lg' $lg.Name
+                $extra = if ($lg.Count -gt 1) { "   ($($lg.Count) ID options)" } else { '' }
+                Write-Host ("    {0,3}) {1,-7} Lg{2}" -f ($i + 1), $lenLbl, $extra) -ForegroundColor White
+            }
+            Write-Host ""
+
+            $lenPick = $null
+            while ($true) {
+                $raw = Read-Host "  Pick length (1-$($lenGroups.Count), B to change OD, or Q to skip)"
+                if ($raw -match '^[Qq]$') { return $null }
+                if ($raw -match '^[Bb]$') { $backToOd = $true; break }
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $lenGroups.Count) {
+                    $lenPick = $lenGroups[$n - 1]; break
+                }
+                Write-Host "  Enter a number between 1 and $($lenGroups.Count) (or B / Q)." -ForegroundColor Yellow
+            }
+            if ($backToOd) { break }          # back to stage 1
+            if ($null -eq $lenPick) { continue }
+
+            # --- stage 3: ID step (ALWAYS explicit - never assume the ID) ---
+            # ID does not change the jig hole (= OD). The user may leave it
+            # unspecified, view the IDs, and from there skip or pick one.
+            $idRows = @($lenPick.Group | Sort-Object { [double]$_.ID })
+            $lenLbl = Get-FracLabel $idRows[0].EasyName 'Lg' $lenPick.Name
+            $tag    = ($idRows[0].EasyName -split '\|')[0].Trim()
+
+            # synthetic "ID unspecified" result - OD still drives the hole.
+            # Carry Length too: the SIDE plane offset (box length) = bushing length,
+            # and that must work even when the user leaves the ID unspecified.
+            $idUnspec = [pscustomobject]@{
+                EasyName   = "$tag | OD $odLabel x ID (any) x $lenLbl Lg"
+                OD         = $idRows[0].OD
+                ID         = '(any)'
+                Length     = $idRows[0].Length
+                PartNumber = '(ID unspecified)'
+            }
+
+            $idWord = if ($idRows.Count -eq 1) { 'is 1 ID' } else { "are $($idRows.Count) IDs" }
+
+            $backToLen = $false
+            while (-not $backToLen) {
+                Write-Host ""
+                Write-Host ("  ID for OD {0} x {1} Lg: there {2} on file." -f $odLabel, $lenLbl, $idWord) -ForegroundColor Cyan
+                Write-Host "  ID does not change the jig hole (= OD); view it only if you need the exact bushing." -ForegroundColor DarkGray
+                Write-Host ""
+                $raw = Read-Host "  View IDs? (Y to list, N to leave ID unspecified, B to change length, Q to skip)"
+                if ($raw -match '^[Qq]$') { return $null }
+                if ($raw -match '^[Bb]$') { $backToLen = $true; break }
+                if ($raw -match '^[Nn]?$') { return $idUnspec }   # N or blank -> unspecified
+                if ($raw -notmatch '^[Yy]$') {
+                    Write-Host "  Enter Y, N, B, or Q." -ForegroundColor Yellow
+                    continue
+                }
+
+                # Y -> list the IDs; user may pick one, skip (unspecified), back, or quit
+                while ($true) {
+                    Write-Host ""
+                    Write-Host ("  Select ID (OD {0} x {1} Lg):" -f $odLabel, $lenLbl) -ForegroundColor Cyan
+                    for ($i = 0; $i -lt $idRows.Count; $i++) {
+                        $r = $idRows[$i]
+                        $bit = if ($r.PSObject.Properties.Name -contains 'DrillBitSize' -and $r.DrillBitSize) { "  ($($r.DrillBitSize))" } else { '' }
+                        Write-Host ("    {0,3}) ID {1,-7}{2}   [{3}]" -f ($i + 1), $r.ID, $bit, $r.PartNumber) -ForegroundColor White
+                    }
+                    Write-Host ""
+                    $raw = Read-Host "  Pick ID (1-$($idRows.Count), S to skip / leave unspecified, B to change length, Q to skip)"
+                    if ($raw -match '^[Qq]$') { return $null }
+                    if ($raw -match '^[Ss]$') { return $idUnspec }
+                    if ($raw -match '^[Bb]$') { $backToLen = $true; break }
+                    $n = 0
+                    if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $idRows.Count) {
+                        return $idRows[$n - 1]
+                    }
+                    Write-Host "  Enter a number between 1 and $($idRows.Count) (or S / B / Q)." -ForegroundColor Yellow
+                }
+            }
+            # backToLen -> re-show length list
+        }
+    }
+}
+
+function Read-Choice {
+    param([array]$Options, [string]$Prompt = 'Select')
+    while ($true) {
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $label = if ($Options[$i].label) { $Options[$i].label } else { '(untitled)' }
+            Write-Host ("  {0}) {1}" -f ($i + 1), $label) -ForegroundColor White
+        }
+        Write-Host ""
+        $raw = Read-Host "$Prompt (1-$($Options.Count), or Q to quit)"
+        if ($raw -match '^[Qq]$') { return $null }
+        $n = 0
+        if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $Options.Count) {
+            return $Options[$n - 1]
+        }
+        Write-Host "  Please enter a number between 1 and $($Options.Count)." -ForegroundColor Yellow
+        Write-Host ""
+    }
+}
+
+# Walk a node. $Path accumulates the chosen labels; $Outcomes collects leaves.
+# Returns $true to continue, $false if the user quit.
+function Invoke-Walk {
+    param($Node, [System.Collections.ArrayList]$Path, [System.Collections.ArrayList]$Outcomes)
+
+    switch ($Node.kind) {
+
+        'question' {
+            $opts = @($Node.children)
+            if ($opts.Count -eq 0) {
+                Write-Host "  (question '$($Node.label)' has no options - nothing to ask)" -ForegroundColor Yellow
+                return $true
+            }
+            Write-Host ""
+            Write-Host ">> $($Node.label)" -ForegroundColor Cyan
+            if ($Node.notes) { Write-Host "   ($($Node.notes))" -ForegroundColor DarkGray }
+            $chosen = Read-Choice -Options $opts -Prompt 'Answer'
+            if ($null -eq $chosen) { return $false }
+            [void]$Path.Add($chosen.label)
+            return (Invoke-Walk -Node $chosen -Path $Path -Outcomes $Outcomes)
+        }
+
+        'option' {
+            # an answer label; descend through its children in order
+            foreach ($child in @($Node.children)) {
+                $cont = Invoke-Walk -Node $child -Path $Path -Outcomes $Outcomes
+                if (-not $cont) { return $false }
+            }
+            return $true
+        }
+
+        'outcome' {
+            $spec = Get-CatalogSpec -Label $Node.label
+            if ($spec) {
+                $pick = Invoke-BushingPick -Spec $spec
+                if ($pick) {
+                    $od = [double]$pick.OD
+                    # Bushing length drives the SIDE plane offset (box length) in
+                    # STAGE 2. Parse defensively - $null if the row has no usable
+                    # Length so the caller can fall back to a manual entry.
+                    $blen = $null
+                    try { if ($null -ne $pick.Length) { $blen = [double]$pick.Length } } catch {}
+                    [void]$Outcomes.Add(("Bushing: {0}  ->  hole diameter = {1}`" (OD), length = {2}`"" -f $pick.EasyName, $od, $blen))
+                    # record the resolved hole spec for the in-process handoff to STAGE 3
+                    [void]$script:Picks.Add([pscustomobject]@{
+                        HoleDiameter  = $od
+                        BushingLength = $blen
+                        Bushing       = $pick.EasyName
+                        PartNumber    = $pick.PartNumber
+                        Outcome       = $Node.label
+                    })
+                } else {
+                    [void]$Outcomes.Add("(no bushing selected) $($Node.label)")
+                }
+            } else {
+                # Not a catalog leaf. Some leaves declare the hole OD outright
+                # (metal -> PFD: "the OD of the hole will be 3/4 in"). Resolve the
+                # diameter straight from the label, with NO bushing pick. There is
+                # no bushing => no length, so BushingLength stays $null and STAGE 2's
+                # SIDE offset falls back to a manual entry (only the OD is fixed).
+                $fixedOd = Get-FixedOdSpec -Label $Node.label
+                if ($null -ne $fixedOd) {
+                    [void]$Outcomes.Add(("Fixed hole diameter = {0}`" (OD) -- {1}" -f $fixedOd, $Node.label))
+                    [void]$script:Picks.Add([pscustomobject]@{
+                        HoleDiameter  = [double]$fixedOd
+                        BushingLength = $null
+                        Bushing       = "(fixed OD, no bushing)"
+                        PartNumber    = "(n/a)"
+                        Outcome       = $Node.label
+                    })
+                } else {
+                    [void]$Outcomes.Add($Node.label)
+                }
+            }
+            return $true
+        }
+
+        'bushing' {
+            # placeholder until the catalog filter + pick is wired in
+            [void]$Outcomes.Add("[BUSHING PICK] $($Node.label)")
+            foreach ($child in @($Node.children)) {
+                $cont = Invoke-Walk -Node $child -Path $Path -Outcomes $Outcomes
+                if (-not $cont) { return $false }
+            }
+            return $true
+        }
+
+        'pattern' {
+            [void]$Outcomes.Add("[PATTERN GROUPING] $($Node.label)")
+            foreach ($child in @($Node.children)) {
+                $cont = Invoke-Walk -Node $child -Path $Path -Outcomes $Outcomes
+                if (-not $cont) { return $false }
+            }
+            return $true
+        }
+
+        default {
+            Write-Host "  (unknown node kind '$($Node.kind)' - skipping)" -ForegroundColor Yellow
+            return $true
+        }
+    }
+}
+
+# ============================================================================
+# STAGE 2 HELPERS - parametric box (lifted from plane-probe.cmd)
+# ============================================================================
+
+# Fire a mapkey and report success/failure instead of swallowing it (boxinator's
+# pattern). A silent no-op from a wrong widget name is the hardest mapkey bug to
+# find, so count failures and surface them.
+$script:macroFailures = 0
+function Invoke-Macro {
+    param([string]$Label, [string]$Macro)
+    Write-Host "    > $Label ..." -NoNewline -ForegroundColor DarkGray
+    try {
+        $session.RunMacro($Macro)
+        Write-Host " ok" -ForegroundColor DarkGray
+    } catch {
+        Write-Host ""
+        Write-Host "      FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        $script:macroFailures++
+    }
+}
+
+# Forced regen with fallbacks (lifted verbatim-in-spirit from boxinator). On this
+# No-Resolve build the API forced regen throws IpfcXToolkitBadContext, so the
+# reliable path is the UI ProCmdRegenerate; automatic regen is the last resort.
+function Invoke-ForceRegen {
+    param($Model)
+    try {
+        $regenCls = New-Object -ComObject pfcls.pfcRegenInstructions
+        $instr    = $regenCls.Create($false, $true, $null)   # Create(AllowFixUI, ForceRegen, FromFeat)
+        $Model.Regenerate($instr)
+        return
+    } catch {}
+    $before = $null
+    try { $before = $Model.VersionStamp } catch {}
+    Invoke-Macro "force regenerate (UI)" "~ Command ``ProCmdRegenerate``;"
+    if ($null -ne $before) {
+        for ($i = 0; $i -lt 30; $i++) {
+            try { if ($Model.VersionStamp -ne $before) { return } } catch {}
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    try { $Model.Regenerate($null) } catch {}
+}
+
+# NOTE: Get-LinearDimMap and Read-DimValue live in lib\creo_geometry.ps1
+# (dot-sourced below) and are shared with the blind evaluator.
+
+# Snapshot every feature ID on the model. The new datum-plane feature is found by
+# diffing this before vs after creation (same approach boxinator uses to find a
+# fresh extrude), so we capture the plane's feature ID without guessing.
+function Get-FeatureIdSet {
+    param($Model, $TypeObj)
+    $set = @{}
+    try {
+        foreach ($f in $Model.ListItems($TypeObj.ITEM_FEATURE)) {
+            try { $set[[int]$f.Id] = $true } catch {}
+        }
+    } catch {}
+    return $set
+}
+
+# Read the (last) selected feature ID from Creo's selection buffer, or $null.
+function Read-SelectedId {
+    $contents = ($session.CurrentSelectionBuffer()).Contents
+    if ($null -eq $contents -or $contents.Count -eq 0) { return $null }
+    try { return [int]$contents[$contents.Count - 1].SelItem.Id } catch { return $null }
+}
+
+# Build the tree-search select-by-ID macro fragment for a Feature (the proven
+# nodelator/flipenator pattern). Clears the buffer, then selects the feature with
+# the given ID INTO the buffer. The caller appends whatever command should
+# consume that buffered selection.
+#
+# -NoClear omits the leading buffer_clean. Use it when feeding a dashboard
+# reference collector that is already open and waiting for a pick (clearing the
+# buffer mid-dashboard can deactivate that collector).
+function Get-SelectByIdMacro {
+    param([int]$FeatId, [switch]$NoClear)
+    $clear = if ($NoClear) { "" } else { "~ Activate ``main_dlg_cur`` ``buffer_clean``;" }
+    return $clear +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Feature``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$FeatId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;"
+}
+
+# Create ONE offset plane from a base reference selected BY ID and return a
+# [pscustomobject] with its new offset dim Symbol and new feature Id (either may
+# be $null if none/ambiguous appeared). The base plane's feature ID was captured
+# up front, so this fires with no human interaction.
+function New-OffsetPlane {
+    param($Model, $TypeObj, [string]$Label, [double]$Offset, [int]$BaseId)
+
+    $before     = Get-LinearDimMap   -Model $Model -TypeObj $TypeObj
+    $beforeFeat = Get-FeatureIdSet   -Model $Model -TypeObj $TypeObj
+
+    # ONE atomic macro: clear buffer -> tree-search-select base plane BY ID ->
+    # open ProCmdDatumPlane (ref pre-loaded from buffer) -> offset -> blur -> OK.
+    $macro =
+        (Get-SelectByIdMacro -FeatId $BaseId) +
+        "~ Command ``ProCmdDatumPlane``;" +
+        "~ Input  ``Odui_Dlg_00`` ``t1.constr_dim1`` ``$Offset``;" +
+        "~ Update ``Odui_Dlg_00`` ``t1.constr_dim1`` ``$Offset``;" +
+        "~ FocusOut ``Odui_Dlg_00`` ``t1.constr_dim1``;" +
+        "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+
+    Invoke-Macro "$Label plane: open + offset $Offset + OK" $macro
+
+    # POLL for the new offset dim to appear, rather than waiting a fixed interval.
+    # A heavier model commits the datum plane more slowly; this breaks the instant
+    # a new symbol shows up, so a fast model stays fast.
+    $MaxWaitSec = 20
+    $newSyms    = @()
+    $after      = $before
+    for ($i = 0; $i -lt ($MaxWaitSec * 10); $i++) {
+        $after   = Get-LinearDimMap -Model $Model -TypeObj $TypeObj
+        $newSyms = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
+        if ($newSyms.Count -ge 1) { break }
+        if ($i -eq 20) { Write-Host "    (waiting for Creo to commit the $Label plane...)" -ForegroundColor DarkGray }
+        Start-Sleep -Milliseconds 100
+    }
+
+    # The new datum-plane feature ID, by feature-set diff (used later to show it).
+    $afterFeat = Get-FeatureIdSet -Model $Model -TypeObj $TypeObj
+    $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) })
+    $newFeatId = if ($newFeats.Count -ge 1) { [int]$newFeats[0] } else { $null }
+
+    if ($newSyms.Count -eq 0) {
+        Write-Host "    No new linear dim appeared for the $Label plane after ${MaxWaitSec}s." -ForegroundColor Yellow
+        Write-Host "    The plane may still have been created (feature id $newFeatId) - if so this" -ForegroundColor Yellow
+        Write-Host "    is a dim-enumeration issue, not a creation failure. Otherwise the base" -ForegroundColor Yellow
+        Write-Host "    plane ID ($BaseId) didn't select, or t1.constr_dim1/stdbtn_1 differ." -ForegroundColor Yellow
+        return [pscustomobject]@{ Symbol = $null; FeatId = $newFeatId }
+    }
+    if ($newSyms.Count -gt 1) {
+        Write-Host "    More than one new dim appeared ($($newSyms -join ', ')); taking the first." -ForegroundColor Yellow
+    }
+    $sym = [string]$newSyms[0]
+    Write-Host "    $Label offset dim: $sym = $($after[$sym])" -ForegroundColor Green
+    return [pscustomobject]@{ Symbol = $sym; FeatId = $newFeatId }
+}
+
+# The three offsets ARE the box dimensions: Side->Width, Top->Height,
+# Front->Depth. With the part's three default datums forming the box's anchored
+# corner, these three offset planes are the three opposite faces.
+function Show-BoxState {
+    param($Made)
+    Write-Host "  Parametric box planes (offset = box extent):" -ForegroundColor Green
+    for ($i = 0; $i -lt $Made.Count; $i++) {
+        $p   = $Made[$i]
+        $now = Read-DimValue -Model $model -TypeObj $pfcType -Sym $p.Sym
+        $dim = switch ($p.Label) { "Side" { "Width" } "Top" { "Height" } "Front" { "Depth" } default { "" } }
+        Write-Host ("    [{0}] {1,-5} ({2,-6}) {3,-6} = {4}" -f ($i + 1), $p.Label, $dim, $p.Sym, $now) -ForegroundColor White
+    }
+}
+
+# Blind-evaluator hook: converge on "the SOLID matches what you ASKED FOR".
+# $Expected is an array of @{ Dim = "Width"; Value = 4.0 } - the values the CALLER
+# intended. Deterministic numeric match gates; the LLM verdict is advisory.
+# $model/$pfcType/$judgeCfg/$ScriptDir come from the enclosing scope.
+function Invoke-BoxEval {
+    param([string]$Operation, $Expected)
+
+    # Measure the solid itself.
+    $excl = New-ExcludeTypes -TypeObj $pfcType
+    $ext  = Measure-Extents -Solid $model -ExcludeTypes $excl
+
+    $truth = @{}
+    $measuredSorted = $null
+    if ($null -ne $ext) {
+        $measuredSorted = @($ext | Sort-Object -Descending | ForEach-Object { [math]::Round([double]$_, 4) })
+        $truth["measured_extents_sorted_desc"] = $measuredSorted
+    } else {
+        $truth["measured_extents_sorted_desc"] = $null
+        $truth["note"] = "EvalOutline returned no outline (the solid may not exist yet)"
+    }
+    # Record what was REQUESTED (intent) in the slice too.
+    $reqMap = @{}
+    foreach ($e in $Expected) { $reqMap[[string]$e.Dim] = [double]$e.Value }
+    $truth["requested_dims"] = $reqMap
+
+    # (1) deterministic by-value match - the gate.
+    $expectedVals = @($Expected | ForEach-Object { [double]$_.Value })
+    $measuredVals = if ($null -ne $measuredSorted) { @($measuredSorted | ForEach-Object { [double]$_ }) } else { @() }
+    $numeric = Test-ExtentsMatch -Expected $expectedVals -Measured $measuredVals -Tol 0.1
+
+    # Human-readable claims (used by the LLM layer + persisted in the packet).
+    $claims = @($Expected | ForEach-Object { "the box {0} is {1}" -f $_.Dim.ToLower(), $_.Value })
+
+    $modelName = try { [string]$model.FileName } catch { "(unknown)" }
+    $claim = New-EvalClaim -Tool "drilljig" -Operation $Operation -Claims $claims
+    $slice = Get-GeometrySlice -Model $modelName -Truth $truth
+
+    $base = ($modelName -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
+    $packetPath = Join-Path $ScriptDir ($base + "_eval.json")
+    $when = (Get-Date).ToString("o")
+    Write-EvalPacket -Path $packetPath -Claim $claim -Slice $slice -WhenIso $when | Out-Null
+    Write-Host "  Eval packet -> $packetPath" -ForegroundColor DarkGray
+
+    # (2) LLM layer - judge the PERSISTED packet (so what is judged == what's on disk).
+    $packetObj = Get-Content $packetPath -Raw | ConvertFrom-Json
+    $verdict = Invoke-BlindJudge -Packet $packetObj -Config $judgeCfg
+
+    # Gate on the deterministic numeric result; LLM verdict is advisory.
+    return (Show-ConvergenceReport -Verdict $verdict -Title "Blind evaluator: $Operation" -Numeric $numeric)
+}
+
+# Write one plane's offset, force a regen, return the value that actually stuck.
+function Set-PlaneOffset {
+    param($Plane, [double]$Value)
+    try {
+        $d = $model.GetItemByName($pfcType.ITEM_DIMENSION, $Plane.Sym)
+        $d.DimValue = $Value
+    } catch {
+        Write-Host "    $($Plane.Label): could not write DimValue: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
+    Invoke-ForceRegen -Model $model
+    return (Read-DimValue -Model $model -TypeObj $pfcType -Sym $Plane.Sym)
+}
+
+# ============================================================================
+# STAGE 3 HELPERS - hole creation (lifted from holeinator.cmd)
+# ============================================================================
+
+$script:lastPct = -1
+function Show-Progress {
+    param([int]$Pct, [string]$Label)
+    if ($Pct -eq $script:lastPct) { return }
+    $script:lastPct = $Pct
+    $filled = [Math]::Floor($Pct / 5)
+    $empty = 20 - $filled
+    $bar = ([char]9608).ToString() * $filled + ([char]9617).ToString() * $empty
+    $color = if ($Pct -ge 100) { "Green" } else { "White" }
+    $shortLabel = if ($Label.Length -gt 20) { $Label.Substring(0, 20) } else { $Label }
+    Write-Host "`r  [$bar] $($Pct.ToString().PadLeft(3))%  $shortLabel   " -NoNewline -ForegroundColor $color
+    if ($Pct -ge 100) { Write-Host "" }
+}
+
+function Wait-ModelModified {
+    # $true if VersionStamp changed within the timeout (macro modified the model).
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::Now -lt $deadline) {
+        try { if ($Model.VersionStamp -ne $PreviousStamp) { return $true } } catch {}
+    }
+    return $false
+}
+
+# Recorded hole macro (transcribed live 2026-06-11). ID-driven; ONE atomic
+# RunMacro -- a dashboard's command context does not survive across RunMacro
+# calls (CLAUDE.md boxinator lesson). `~ Trail`/`~ Timer` recording noise dropped.
+function Build-HoleMacro {
+    param([int]$PointId, [double]$Diameter, [int]$BodyIndex = 0)
+    return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+        # select the target datum point by ID
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        # hole dashboard (recorded)
+        "~ Command ``ProCmdHole``;" +
+        # depth -> through all (open the depth-type flyout, pick Thru All)
+        "~ Select ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
+        "~ Close  ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.StrHoleDepThruAllF`` 1;" +
+        # standard-hole layout + hole-note toggles (as recorded)
+        "~ Activate ``main_dlg_cur`` ``chkbn.std_hle_layout.0`` 1;" +
+        "~ Activate ``main_dlg_cur`` ``chkbn.std_hole_note_layout.0`` 1;" +
+        # body selection: enable the body page, then pick body $BodyIndex
+        "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ``$BodyIndex``;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
+        "~ Focus  ``body_page.1.0`` ``PH.bodyselectrepwdg_list``;" +
+        "~ Select ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` 1 ``$BodyIndex``;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
+        # diameter
+        "~ Input  ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu`` ``$Diameter``;" +
+        "~ Update ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu`` ``$Diameter``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu``;" +
+        "~ FocusOut ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu``;" +
+        # confirm
+        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+}
+
+# ============================================================================
+# HEADER
+# ============================================================================
+Write-Host ""
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host "   DRILLJIG  -  tree -> parametric box -> drill holes (one session)" -ForegroundColor Cyan
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host "  (prototype: merges jiginator + plane-probe + holeinator; originals" -ForegroundColor DarkGray
+Write-Host "   are untouched and still run standalone)" -ForegroundColor DarkGray
+Write-Host ""
+
+# ============================================================================
+# SHARED LIBRARY (geometry reads + blind evaluator)
+# ============================================================================
+. (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
+. (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')
+
+# --probe-judge: validate the REST judge in isolation, then exit (no Creo).
+if ($ProbeJudge) {
+    $ok = Invoke-JudgeProbe -RepoRoot $ScriptDir -Model "sonnet"
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit ([int](-not $ok))
+}
+
+# ============================================================================
+# STAGE 1 -- DECISION TREE (no Creo). Walk ONCE -> the hole diameter.
+# ============================================================================
+$treePath = Join-Path $ScriptDir 'docs\drill_jig_decision_tree.json'
+if (-not (Test-Path $treePath)) {
+    throw "Decision tree not found at: $treePath  (build it in docs\drill_jig_tree_builder.html first)"
+}
+try {
+    $tree = Get-Content $treePath -Raw | ConvertFrom-Json
+} catch {
+    throw "Could not parse the tree JSON: $($_.Exception.Message)"
+}
+# ConvertFrom-Json gives a single object if the root array has one element;
+# normalize to an array either way.
+$roots = @($tree)
+
+Write-Host "  STAGE 1 - Drill-jig decision tree" -ForegroundColor Green
+Write-Host "  Reading tree: $treePath" -ForegroundColor DarkGray
+
+$path     = [System.Collections.ArrayList]::new()
+$outcomes = [System.Collections.ArrayList]::new()
+$script:Picks = [System.Collections.ArrayList]::new()
+
+$quit = $false
+foreach ($root in $roots) {
+    $cont = Invoke-Walk -Node $root -Path $path -Outcomes $outcomes
+    if (-not $cont) { $quit = $true; break }
+}
+
+if ($quit) {
+    Write-Host ""
+    Write-Host "  Cancelled in the decision tree - nothing built, no Creo connection made." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 0
+}
+
+Write-Host ""
+Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
+Write-Host "  Your selections:" -ForegroundColor Green
+Write-Host ("    " + ($path -join "  >  ")) -ForegroundColor White
+Write-Host ""
+Write-Host "  Result:" -ForegroundColor Green
+foreach ($o in $outcomes) { Write-Host "    $o" -ForegroundColor White }
+Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
+Write-Host ""
+
+# In-process handoff: if several outcomes resolved a bushing, the LAST pick wins
+# (matches jiginator's model). NO file is written here - these are carried into
+# STAGES 2/3 as variables:
+#   $holeDia    -> the STAGE 3 hole diameter (= bushing OD), used WITHOUT prompting
+#   $bushingLen -> the STAGE 2 SIDE-plane offset (box length = bushing/sleeve length)
+$holeDia    = $null
+$bushingLen = $null
+if ($script:Picks.Count -gt 0) {
+    $active  = $script:Picks[$script:Picks.Count - 1]
+    $holeDia = [double]$active.HoleDiameter
+    if ($null -ne $active.BushingLength) { $bushingLen = [double]$active.BushingLength }
+    Write-Host ("  Hole diameter from the tree: {0}`"  ({1})" -f $holeDia, $active.Bushing) -ForegroundColor Cyan
+    if ($null -ne $bushingLen) {
+        Write-Host ("  Bushing length from the tree: {0}`"  -> SIDE plane offset (box length)" -f $bushingLen) -ForegroundColor Cyan
+    } else {
+        Write-Host "  (the chosen bushing row had no usable Length - SIDE offset will be entered by hand)" -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "  The decision tree did not resolve a bushing / hole diameter." -ForegroundColor Yellow
+    Write-Host "  You can still build the box now and enter the dimensions by hand." -ForegroundColor DarkGray
+}
+Write-Host ""
+
+# ============================================================================
+# CONNECT ONCE (single session) -- wraps STAGES 2 + 3
+# ============================================================================
+# Resolve the judge config once up front. $null is fine - the evaluator then just
+# writes the packet and skips the REST call.
+$judgeCfg = Get-JudgeConfig -RepoRoot $ScriptDir -DefaultModel "sonnet"
+if ($null -eq $judgeCfg) {
+    Write-Host "  (blind judge not configured - eval packets will be written for offline judging)" -ForegroundColor DarkGray
+} else {
+    Write-Host "  Blind judge: $($judgeCfg.base) [$($judgeCfg.model)]" -ForegroundColor DarkGray
+}
+Write-Host ""
+
+$procs = @(Get-Process | Where-Object { $_.ProcessName -eq "xtop" })
+if ($procs.Count -eq 0) { throw "Creo (xtop.exe) is not running" }
+if ($procs.Count -gt 1) {
+    throw "More than one Creo session is open. This prototype expects exactly ONE (no session picker here)."
+}
+$proc = $procs[0]
+$Env:PRO_DIRECTORY    = $proc.Path.TrimEnd("xtop.exe")
+$Env:PRO_COMM_MSG_EXE = $proc.Path -replace "xtop.exe", "pro_comm_msg.exe"
+
+try { New-Object -ComObject pfcls.pfcAsyncConnection | Out-Null }
+catch {
+    $reg = $proc.Path -replace "Common Files(.*)$", "Parametric\bin\vb_api_register.bat"
+    Start-Process -Wait -FilePath $reg
+}
+
+$async      = New-Object -ComObject pfcls.pfcAsyncConnection
+$connection = $async.Connect($null, $null, $null, $null)
+$session    = $connection.Session
+$model      = $session.GetActiveModel()
+if ($null -eq $model) { throw "No active model. Open the jig PART (default datum planes + the target datum points) first." }
+
+Write-Host "  Connected. Active model: $($model.FileName)" -ForegroundColor Green
+
+# Mode guard: this tool drills a PART. In assembly mode the datum points and
+# by-ID selection resolve against the .asm, not the part to drill. Key off the
+# filename extension (EpfcModelType enum ints are unconfirmed on this build).
+$modelFile = ""
+try { $modelFile = [string]$model.FileName } catch {}
+if ($modelFile -match '\.asm(\.\d+)?$') {
+    Write-Host ""
+    Write-Host "  STOP: the active model is an ASSEMBLY ($modelFile)." -ForegroundColor Yellow
+    Write-Host "  This prototype builds + drills a single PART. Open the jig PART" -ForegroundColor Yellow
+    Write-Host "  itself (activate it in its own window), then re-run." -ForegroundColor Yellow
+    Write-Host ""
+    $connection.Disconnect($null)
+    exit 1
+}
+Write-Host ""
+
+# Suppress UI noise during the run, restore in finally (toolkit convention).
+$origVisibleMapkeys = $null
+$origDynamicPreview = $null
+try {
+    $vals = $session.GetConfigOptionValues("visible_mapkeys")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origVisibleMapkeys = $vals.Item(0) }
+} catch {}
+try {
+    $vals = $session.GetConfigOptionValues("dynamic_preview")
+    if ($null -ne $vals -and $vals.Count -gt 0) { $origDynamicPreview = $vals.Item(0) }
+} catch {}
+try {
+    $session.SetConfigOption("visible_mapkeys", "no") | Out-Null
+    $session.SetConfigOption("dynamic_preview", "no") | Out-Null
+} catch {}
+
+# $pfcType defined ONCE here, shared by STAGES 2 + 3.
+$pfcType = New-Object -ComObject pfcls.pfcModelItemType
+
+try {
+
+# ============================================================================
+# STAGE 2 -- PARAMETRIC BOX (plane-probe v2)
+# ============================================================================
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host "   STAGE 2 - parametric box from three offset datum planes" -ForegroundColor Cyan
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# Each label is descriptive - the actual base plane is whatever you pick.
+# Top offsets TOP (height), Side offsets SIDE (width), Front offsets FRONT (depth).
+$planes = @(
+    [pscustomobject]@{ Label = "Top";   Hint = "TOP";   Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
+    [pscustomobject]@{ Label = "Side";  Hint = "SIDE";  Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
+    [pscustomobject]@{ Label = "Front"; Hint = "FRONT"; Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
+)
+
+# The SIDE plane offset is the box LENGTH and is fixed by the decision tree =
+# the selected bushing/sleeve length ($bushingLen). It is NOT prompted for when
+# the tree resolved a length; the user only enters TOP (height) and FRONT (depth).
+# If the tree gave no length, SIDE falls back to a manual prompt like the others.
+Write-Host "  Enter the box offsets (blank/0 -> 1.0 so each has a drivable dim):" -ForegroundColor Cyan
+foreach ($p in $planes) {
+    if ($p.Label -eq "Side" -and $null -ne $bushingLen) {
+        $p.Offset = [double]$bushingLen
+        Write-Host ("    Side plane offset (box length) = {0} (from the bushing length; not asked)" -f $bushingLen) -ForegroundColor Green
+        continue
+    }
+    $raw = Read-Host "    $($p.Label) plane offset (from $($p.Hint))"
+    $v = 0.0
+    if (-not [double]::TryParse($raw, [ref]$v) -or $v -eq 0) {
+        Write-Host "      using 1.0" -ForegroundColor Yellow
+        $v = 1.0
+    }
+    $p.Offset = $v
+}
+Write-Host ""
+
+# --- capture the three base-plane IDs (quick picks, up front - nothing created) ---
+Write-Host "  First, identify the three base planes (one quick click each):" -ForegroundColor Cyan
+foreach ($p in $planes) {
+    Read-Host "    Click the $($p.Hint) plane in Creo, then press ENTER"
+    $contents = ($session.CurrentSelectionBuffer()).Contents
+    if ($null -eq $contents -or $contents.Count -eq 0) {
+        throw "Nothing was selected for the $($p.Hint) plane. Click the plane, then press ENTER."
+    }
+    $p.BaseId = [int]$contents[$contents.Count - 1].SelItem.Id
+    Write-Host "      $($p.Hint) base feature ID = $($p.BaseId)" -ForegroundColor DarkGray
+}
+Write-Host ""
+
+# --- create the three offset planes (select base BY ID -> atomic macro, x3) ---
+Write-Host "  Creating all three offset planes (no further clicks needed)..." -ForegroundColor Cyan
+Write-Host ""
+foreach ($p in $planes) {
+    Write-Host "  --- $($p.Label) plane (offset $($p.Offset) from $($p.Hint), id $($p.BaseId)) ---" -ForegroundColor Cyan
+    $res = New-OffsetPlane -Model $model -TypeObj $pfcType -Label $p.Label -Offset $p.Offset -BaseId $p.BaseId
+    $p.Sym    = $res.Symbol
+    $p.FeatId = $res.FeatId
+    Write-Host ""
+}
+
+# --- show (unhide) the new offset planes; runs on FeatId, before the dim gate ---
+$toShow = @($planes | Where-Object { $null -ne $_.FeatId })
+if ($toShow.Count -gt 0) {
+    Write-Host "  Showing the $($toShow.Count) new offset plane(s)..." -ForegroundColor Cyan
+    foreach ($p in $toShow) {
+        $showMacro =
+            (Get-SelectByIdMacro -FeatId $p.FeatId) +
+            "~ Command ``ProCmdViewShow@PopupMenuTree``;"
+        Invoke-Macro "show $($p.Label) plane (id $($p.FeatId))" $showMacro
+    }
+    Write-Host ""
+}
+
+# Gate the parametric/resize half on planes that produced a DRIVABLE dim.
+$made = @($planes | Where-Object { $null -ne $_.Sym })
+if ($made.Count -eq 0) {
+    throw "No offset planes produced a drivable dim - nothing to resize. (Any planes that WERE created have been shown above.)"
+}
+if ($made.Count -lt 3) {
+    Write-Host "  WARNING: only $($made.Count) of 3 planes produced a drivable dim." -ForegroundColor Yellow
+    Write-Host ""
+}
+
+Show-BoxState -Made $made
+Write-Host ""
+
+# --- CREATE THE BOX: extrude-first with an internal sketch (plane-probe v2) ---
+# DIRECTION: sketch ON the og/default datum, extrude UP TO the offset plane, so
+# the feature reads og -> offset. Stays parametric because the og datum and the
+# offset plane are separated by exactly the offset dim. Both refs captured BY ID
+# up front; the ONLY manual step is drawing the rough rectangle (forces ONE split
+# into two macros around the user's draw).
+$sidePlane = @($made | Where-Object { $_.Label -eq "Side" })
+$sidePlane = if ($sidePlane.Count -gt 0) { $sidePlane[0] } else { $null }
+
+$sketchPlaneId = $null
+$script:buildConfirmed = $null
+Write-Host "  Build the box now? (Extrude-first, internal sketch; og -> offset direction)" -ForegroundColor Cyan
+$doBox = Read-Host "    (y to create the box, anything else to skip and go straight to resize)"
+if ($doBox.Trim().ToUpper() -eq "Y") {
+    if ($null -eq $sidePlane) {
+        Write-Host "  No SIDE plane was created, so there is nothing to build against. Skipping box." -ForegroundColor Yellow
+    } else {
+
+        Write-Host ""
+        Write-Host "  In Creo: CLICK the og/default datum to sketch the box footprint on," -ForegroundColor White
+        Write-Host "  then press ENTER." -ForegroundColor White
+        Read-Host
+        $sketchPlaneId = Read-SelectedId
+        if ($null -eq $sketchPlaneId) {
+            Write-Host "  Nothing selected for the sketch plane - skipping box." -ForegroundColor Yellow
+        } else {
+            Write-Host "      sketch plane feature ID = $sketchPlaneId" -ForegroundColor DarkGray
+        }
+
+        if ($null -ne $sketchPlaneId) {
+            Write-Host ""
+            Write-Host "  In Creo: CLICK the OFFSET plane to extrude UP TO (the box grows" -ForegroundColor White
+            Write-Host "  from the og plane toward this datum), then press ENTER. Or just" -ForegroundColor White
+            Write-Host "  press ENTER to use the SIDE offset plane." -ForegroundColor White
+            Read-Host
+            $extrudeToId = Read-SelectedId
+            if ($null -eq $extrudeToId) {
+                $extrudeToId = $sidePlane.FeatId
+                Write-Host "      extruding up to SIDE offset plane (id $extrudeToId)" -ForegroundColor DarkGray
+            } else {
+                Write-Host "      extrude-to feature ID = $extrudeToId" -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    if ($null -ne $sketchPlaneId) {
+
+        $stamp = $null
+        try { $stamp = $model.VersionStamp } catch {}
+
+        # MACRO A: select sketch plane BY ID FIRST (its buffer_clean wipes the
+        # stale offset plane), -> ProCmdFtExtrude consumes the og datum -> orient
+        # -> arm the corner-rectangle tool. Stops before the manual draw.
+        $mkArm =
+            (Get-SelectByIdMacro -FeatId $sketchPlaneId) +
+            "~ Command ``ProCmdFtExtrude``;" +
+            "~ Command ``ProCmdViewSketchView``;" +
+            "~ Command ``ProCmdSketRectangle`` 1;"
+        Invoke-Macro "select sketch plane (id $sketchPlaneId) + extrude + arm rectangle" $mkArm
+
+        Write-Host ""
+        Write-Host "  In Creo (internal sketcher): click one corner of the rectangle, then" -ForegroundColor White
+        Write-Host "  the opposite corner. Size doesn't matter. Press Esc to finish the" -ForegroundColor White
+        Write-Host "  rectangle, then press ENTER here." -ForegroundColor White
+        Read-Host
+
+        # MACRO B: finish the internal sketch, set depth UP TO the extrude-to
+        # plane (re-selected BY ID, -NoClear so the open depth collector stays
+        # active), blur the field, confirm.
+        $mkFinish =
+            "~ Command ``ProCmdSketDone``;" +
+            "~ Select ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
+            "~ Close ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
+            "~ Activate ``main_dlg_cur`` ``maindashInst0.toselected`` 1;" +
+            "~ Trigger ``extrev_1_placement.0.0`` ``PH.section_select_list`` ``0``;" +
+            "~ Trigger ``extrev_1_placement.0.0`` ``PH.section_select_list`` ````;" +
+            (Get-SelectByIdMacro -FeatId $extrudeToId -NoClear) +
+            "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
+            "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
+            "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+        Invoke-Macro "finish sketch + extrude up to plane id $extrudeToId + confirm" $mkFinish
+
+        if ($null -ne $stamp) {
+            for ($i = 0; $i -lt 100; $i++) {
+                try { if ($model.VersionStamp -ne $stamp) { break } } catch {}
+                Start-Sleep -Milliseconds 50
+            }
+        }
+        Write-Host ""
+
+        # BLIND EVALUATE the freshly built box. Intent = the offset values the
+        # USER ENTERED ($mp.Offset), NOT a value re-read from the model.
+        $expected = foreach ($mp in $made) {
+            $dim = switch ($mp.Label) { "Side" {"Width"} "Top" {"Height"} "Front" {"Depth"} default {$mp.Label} }
+            [pscustomobject]@{ Dim = $dim; Value = [double]$mp.Offset }
+        }
+        $script:buildConfirmed = Invoke-BoxEval -Operation "build-box" -Expected @($expected)
+        Write-Host ""
+    }
+}
+
+# --- RESIZE LOOP -- A = all three, 1..N = one plane, D/blank = done (-> STAGE 3) ---
+Write-Host "  Resize loop (optional - adjust the box before drilling):" -ForegroundColor Cyan
+Write-Host "    A = set ALL three (resize the box),  1-$($made.Count) = one plane,  D/blank = done -> drill" -ForegroundColor White
+while ($true) {
+    $cmd = Read-Host "  Command (A / 1-$($made.Count) / D)"
+    if ([string]::IsNullOrWhiteSpace($cmd) -or $cmd.Trim().ToUpper() -eq "D") {
+        Write-Host "  Done resizing - moving to drilling." -ForegroundColor Cyan
+        break
+    }
+
+    if ($cmd.Trim().ToUpper() -eq "A") {
+        $targets = @()
+        foreach ($p in $made) {
+            $dim = switch ($p.Label) { "Side" { "Width" } "Top" { "Height" } "Front" { "Depth" } default { "" } }
+            $raw = Read-Host "    $($p.Label) ($dim) new offset"
+            $v = 0.0
+            if (-not [double]::TryParse($raw, [ref]$v)) { Write-Host "      not a number - skipping $($p.Label)." -ForegroundColor Yellow; continue }
+            $targets += [pscustomobject]@{ Plane = $p; Want = $v }
+        }
+        foreach ($t in $targets) {
+            $now = Set-PlaneOffset -Plane $t.Plane -Value $t.Want
+            if ($null -ne $now -and [math]::Abs($now - $t.Want) -lt 1e-4) {
+                Write-Host "    $($t.Plane.Label) $($t.Plane.Sym) = $now  (held)" -ForegroundColor Green
+            } else {
+                Write-Host "    $($t.Plane.Label) $($t.Plane.Sym) = $now  (wanted $($t.Want) - did NOT hold)" -ForegroundColor Yellow
+            }
+        }
+        Write-Host ""
+        Show-BoxState -Made $made
+        Write-Host ""
+        # NOTE: no blind-evaluator call on resize. A single offset value is not a
+        # sorted box extent (and a negative offset never matches a positive
+        # extent), so the build-box numeric check spammed a false "expected vs
+        # measured" mismatch here. The per-plane "held / did NOT hold" line above
+        # (a DimValue re-read) is the right confirmation for a resize.
+        continue
+    }
+
+    $sel = 0
+    if (-not [int]::TryParse($cmd, [ref]$sel) -or $sel -lt 1 -or $sel -gt $made.Count) {
+        Write-Host "    enter A or 1-$($made.Count)." -ForegroundColor Yellow; continue
+    }
+    $p = $made[$sel - 1]
+
+    $valRaw = Read-Host "    New offset for $($p.Label) ($($p.Sym))"
+    $v = 0.0
+    if (-not [double]::TryParse($valRaw, [ref]$v)) { Write-Host "    not a number." -ForegroundColor Yellow; continue }
+
+    $now = Set-PlaneOffset -Plane $p -Value $v
+    if ($null -ne $now -and [math]::Abs($now - $v) -lt 1e-4) {
+        Write-Host "    $($p.Label) $($p.Sym) = $now  (held)" -ForegroundColor Green
+    } else {
+        Write-Host "    $($p.Label) $($p.Sym) = $now  (wanted $v - did NOT hold)" -ForegroundColor Yellow
+    }
+    # No blind-evaluator call on a single-plane resize (see the resize-all note).
+}
+Write-Host ""
+
+# ============================================================================
+# STAGE 3 -- DRILL HOLES (holeinator) at the diameter from STAGE 1
+# ============================================================================
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host "   STAGE 3 - drill an On-Point hole at every target datum point" -ForegroundColor Cyan
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host ""
+
+# --- STEP 1: user selects the PRE-EXISTING datum points ---
+Write-Host "  STEP 1 -- In Creo, select the target datum points (they already exist" -ForegroundColor Cyan
+Write-Host "           in the part, on another plane), then press ENTER here." -ForegroundColor Cyan
+Read-Host
+$points = ($session.CurrentSelectionBuffer()).Contents
+if ($null -eq $points) { throw "Selection buffer is empty -- no datum points selected in Creo." }
+
+# Resolve selections into POINT IDs only (never reads .Point coordinates).
+$pointIDs = @()
+$seen = @{}
+$rejected = @()
+foreach ($item in $points) {
+    $si = $null
+    try { $si = $item.SelItem } catch { continue }
+    if ($null -eq $si) { continue }
+
+    $isPointType = $false
+    try { $isPointType = ([int]$si.Type -eq [int]$pfcType.ITEM_POINT) } catch {}
+
+    $subIds = @()
+    try {
+        foreach ($pt in @($si.ListSubItems($pfcType.ITEM_POINT))) {
+            try { $subIds += [int]$pt.Id } catch {}
+        }
+    } catch {}
+
+    if ($subIds.Count -gt 0) {
+        # a feature that contains points -> use the contained point ids
+        foreach ($sid in $subIds) {
+            if (-not $seen.ContainsKey($sid)) { $seen[$sid] = $true; $pointIDs += $sid }
+        }
+    } elseif ($isPointType) {
+        # the selection IS a datum point -> use its id
+        $id = [int]$si.Id
+        if (-not $seen.ContainsKey($id)) { $seen[$id] = $true; $pointIDs += $id }
+    } else {
+        $tname = "?"; $rid = "?"
+        try { $rid = [int]$si.Id } catch {}
+        try { $tname = [string]$si.Type } catch {}
+        $rejected += "id $rid (type $tname)"
+    }
+}
+
+if ($rejected.Count -gt 0) {
+    Write-Host ("  Ignored {0} selected item(s) that are neither datum points nor point-bearing features:" -f $rejected.Count) -ForegroundColor Yellow
+    foreach ($r in ($rejected | Select-Object -First 10)) { Write-Host "      $r" -ForegroundColor DarkGray }
+}
+if ($pointIDs.Count -eq 0) {
+    throw "No datum point ids resolved from the selection. Select datum points (or a datum-point feature) and try again."
+}
+Write-Host ("  Captured {0} target point id(s): {1}" -f $pointIDs.Count, ($pointIDs -join ", ")) -ForegroundColor Green
+
+# --- STEP 2: user picks the target body ---
+Write-Host ""
+Write-Host "  STEP 2 -- Target body." -ForegroundColor Cyan
+$bodyList = @()
+try { $bodyList = @($model.ListItems($pfcType.ITEM_BODY)) } catch {}
+
+$bodyIndex = 0
+if ($bodyList.Count -gt 1) {
+    Write-Host ("  This part has {0} solid bodies:" -f $bodyList.Count) -ForegroundColor White
+    for ($i = 0; $i -lt $bodyList.Count; $i++) {
+        $bn = try { $bodyList[$i].GetName() } catch { "(unnamed)" }
+        Write-Host ("      {0}) {1}" -f $i, $bn) -ForegroundColor White
+    }
+    Write-Host "  Highlight/verify the body in Creo if unsure, then choose here." -ForegroundColor DarkGray
+    while ($true) {
+        $raw = Read-Host ("  Enter body index (0-{0}), then ENTER" -f ($bodyList.Count - 1))
+        $n = -1
+        if ([int]::TryParse($raw, [ref]$n) -and $n -ge 0 -and $n -lt $bodyList.Count) { $bodyIndex = $n; break }
+        Write-Host ("  Enter a number between 0 and {0}." -f ($bodyList.Count - 1)) -ForegroundColor Yellow
+    }
+} elseif ($bodyList.Count -eq 1) {
+    Write-Host "  Single-body part -- using body index 0." -ForegroundColor DarkGray
+    Read-Host "  Press ENTER to continue"
+} else {
+    Write-Host "  (could not enumerate bodies; defaulting to body index 0)" -ForegroundColor Yellow
+    Read-Host "  Press ENTER to continue"
+}
+Write-Host ("  Target body index: {0}" -f $bodyIndex) -ForegroundColor Green
+
+# --- STEP 3: hole diameter, taken from STAGE 1 (in-process, no prompt) ---
+# The decision tree's resolved OD IS the hole diameter; use it directly and do
+# NOT ask. Only fall back to a manual prompt if the tree produced no diameter
+# (e.g. the walk ended without resolving a bushing).
+Write-Host ""
+Write-Host "  STEP 3 -- Hole diameter." -ForegroundColor Cyan
+$holeDiaFinal = 0.0
+if ($null -ne $holeDia -and [double]$holeDia -gt 0) {
+    $holeDiaFinal = [double]$holeDia
+    Write-Host ("  Using the decision-tree diameter: {0}`" (not asked)" -f $holeDiaFinal) -ForegroundColor Green
+} else {
+    Write-Host "  The decision tree did not resolve a diameter - enter it by hand." -ForegroundColor Yellow
+    while ($holeDiaFinal -le 0) {
+        $raw = Read-Host "  Enter hole diameter (required)"
+        $d = 0.0
+        if ([double]::TryParse($raw.Trim(), [ref]$d) -and $d -gt 0) { $holeDiaFinal = $d }
+        else { Write-Host "  Enter a positive number." -ForegroundColor Yellow }
+    }
+    Write-Host ("  Hole diameter: {0}" -f $holeDiaFinal) -ForegroundColor Green
+}
+
+# --- CONFIRM (last stop before mutating the model) ---
+Write-Host ""
+Write-Host ("  Ready: {0} hole(s), diameter {1}, through all, body index {2}." -f $pointIDs.Count, $holeDiaFinal, $bodyIndex) -ForegroundColor Cyan
+Write-Host "  Do not touch Creo while this runs." -ForegroundColor DarkGray
+$go = Read-Host "  Proceed? (y/N)"
+if ($go -notmatch '^[Yy]$') {
+    Write-Host "  Cancelled -- the box was built but no holes were drilled." -ForegroundColor Yellow
+} else {
+    Write-Host ""
+
+    # --- FIRE -- canary first, then the rest ---
+    $total = $pointIDs.Count
+    $idx = 0
+    $madeHoles = 0
+    $noop = 0
+    $failed = 0
+    $aborted = $false
+
+    foreach ($ptId in $pointIDs) {
+        $idx++
+        Show-Progress ([Math]::Floor(($idx / $total) * 100)) "Hole $idx/$total"
+
+        $macro = Build-HoleMacro -PointId $ptId -Diameter $holeDiaFinal -BodyIndex $bodyIndex
+        $changed = $false
+        try {
+            $stamp = $model.VersionStamp
+            $session.RunMacro($macro)
+            $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp
+        } catch {
+            $failed++
+        }
+        if ($changed) { $madeHoles++ } else { $noop++ }
+
+        # canary: after the FIRST hole, require the model to have changed.
+        if ($idx -eq 1 -and -not $changed) {
+            Show-Progress 100 "Canary failed"
+            Write-Host ""
+            Write-Host "  ABORT: the first hole did not modify the model (VersionStamp" -ForegroundColor Red
+            Write-Host "  unchanged). Stopped after 1 attempt. Check Creo: did the hole" -ForegroundColor Red
+            Write-Host "  dashboard open / error? The recorded widget names may need a" -ForegroundColor Red
+            Write-Host "  refresh for this Creo build." -ForegroundColor Red
+            $aborted = $true
+            break
+        }
+    }
+    if (-not $aborted) { Show-Progress 100 "Done" }
+    Write-Host ""
+
+    # --- REPORT ---
+    Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
+    Write-Host ("  Points targeted   : {0}" -f $total) -ForegroundColor White
+    Write-Host ("  Holes attempted   : {0}" -f $idx) -ForegroundColor White
+    Write-Host ("  Model changed     : {0}" -f $madeHoles) -ForegroundColor White
+    if ($noop   -gt 0) { Write-Host ("  No-op (no change) : {0}" -f $noop) -ForegroundColor Yellow }
+    if ($failed -gt 0) { Write-Host ("  Macro errors      : {0}" -f $failed) -ForegroundColor Yellow }
+    Write-Host ""
+    if ($aborted) {
+        Write-Host "  STOPPED after the canary -- inspect the model in Creo." -ForegroundColor Red
+    } elseif ($madeHoles -eq $total -and $failed -eq 0) {
+        Write-Host "  Done -- $madeHoles hole(s) created (model changed for each)." -ForegroundColor Green
+        Write-Host "  Verify the holes visually in Creo." -ForegroundColor DarkGray
+    } else {
+        Write-Host "  Finished with issues -- $madeHoles of $total changed the model. Inspect Creo." -ForegroundColor Yellow
+    }
+}
+
+# ============================================================================
+# FINAL WORD
+# ============================================================================
+Write-Host ""
+if ($script:macroFailures -eq 0) {
+    Write-Host "  Run complete (no mapkey failures)." -ForegroundColor Cyan
+} else {
+    Write-Host "  Run complete with $($script:macroFailures) mapkey failure(s) - see red lines above." -ForegroundColor Yellow
+}
+if ($null -ne $script:buildConfirmed) {
+    if ($script:buildConfirmed) {
+        Write-Host "  Box build: independently confirmed by the blind evaluator (solid measured)." -ForegroundColor Green
+    } else {
+        Write-Host "  Box build: NOT independently confirmed - see the blind-evaluator verdict above." -ForegroundColor Yellow
+        Write-Host "  (An eval packet was written; it can also be judged offline.)" -ForegroundColor DarkGray
+    }
+}
+
+} finally {
+    try {
+        if ($null -ne $origVisibleMapkeys) { $session.SetConfigOption("visible_mapkeys", $origVisibleMapkeys) | Out-Null }
+        if ($null -ne $origDynamicPreview)  { $session.SetConfigOption("dynamic_preview",  $origDynamicPreview)  | Out-Null }
+    } catch {}
+    try { $connection.Disconnect($null) } catch {}
+}
+
+Write-Host ""
+Write-Host "  Press any key to exit..."
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
