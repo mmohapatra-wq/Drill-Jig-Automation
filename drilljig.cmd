@@ -484,6 +484,51 @@ function Read-SelectedId {
     try { return [int]$contents[$contents.Count - 1].SelItem.Id } catch { return $null }
 }
 
+# Map a datum-plane NAME to its box role by substring (case-insensitive). This is
+# what lets a ONE-SHOT multi-select of all three default datums be sorted into
+# TOP/SIDE/FRONT regardless of the click order - the name carries the role, not
+# the order. SIDE is the important one: it drives the box length AND is the plane
+# the box is sketched on, so the box build can run hands-free once SIDE is known.
+# Returns 'Top'/'Side'/'Front' (matching $planes[].Label) or $null if no keyword
+# is present. SIDE is tested first so a stray match can't shadow it.
+function Resolve-PlaneRole {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+    $u = $Name.ToUpper()
+    if ($u -match 'SIDE')  { return 'Side' }
+    if ($u -match 'TOP')   { return 'Top' }
+    if ($u -match 'FRONT') { return 'Front' }
+    return $null
+}
+
+# Read the CURRENT selection buffer as datum-plane picks: one entry per UNIQUE
+# selected item, each { Id; Name; Role }. Name is the datum's GetName(); Role is
+# Resolve-PlaneRole on that name. ID-and-name only - never reads geometry/coords
+# (the toolkit's hard-won ID-only lesson; plane normals also read $null on this
+# build per project_plane_normal_null, so a name match is the only viable
+# auto-classifier here). De-dups by id. Returns @() if the buffer is empty.
+function Read-SelectionPlanePicks {
+    param($Session)
+    $picks = @()
+    $contents = $null
+    try { $contents = ($Session.CurrentSelectionBuffer()).Contents } catch {}
+    if ($null -eq $contents -or $contents.Count -eq 0) { return @($picks) }
+    $seen = @{}
+    foreach ($item in $contents) {
+        $si = $null
+        try { $si = $item.SelItem } catch { continue }
+        if ($null -eq $si) { continue }
+        $id = $null
+        try { $id = [int]$si.Id } catch { continue }
+        if ($seen.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        $name = $null
+        try { $name = [string]$si.GetName() } catch {}
+        $picks += [pscustomobject]@{ Id = $id; Name = $name; Role = (Resolve-PlaneRole -Name $name) }
+    }
+    return @($picks)
+}
+
 # Build the tree-search select-by-ID macro fragment for a Feature (the proven
 # nodelator/flipenator pattern). Clears the buffer, then selects the feature with
 # the given ID INTO the buffer. The caller appends whatever command should
@@ -500,6 +545,30 @@ function Get-SelectByIdMacro {
         "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
         "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
         "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Feature``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$FeatId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;"
+}
+
+# Select a DATUM PLANE by ID into an ALREADY-OPEN dashboard reference collector
+# (the extrude depth "to selected" collector). This mirrors surfenator's PROVEN
+# up-to-plane feed (surfenator.cmd): the tree search picks type DATUM with
+# LookBy = Feature, which hands the collector a real GEOMETRIC reference.
+#
+# Why a separate helper from Get-SelectByIdMacro: that one selects type FEATURE,
+# which is correct for CONSUMING a buffered ref (ProCmdDatumPlane) or showing a
+# feature, and so the base-plane creation + sketch-plane pick work with it. But a
+# Feature-typed selection does NOT satisfy the depth collector's reference filter
+# -- the symptom being the extrude dashboard sitting OPEN, waiting for a manual
+# plane click (exactly the behavior this replaces). No leading buffer_clean:
+# clearing the buffer mid-dashboard can deactivate the open collector.
+function Get-SelectDatumByIdMacro {
+    param([int]$FeatId)
+    return "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Datum``;" +
+        "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Feature``;" +
         "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
         "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$FeatId``;" +
         "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
@@ -711,6 +780,104 @@ function Build-HoleMacro {
         "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
 }
 
+# ----------------------------------------------------------------------------
+# Build-ReliefHoleMacro - a CHIP-RELIEF hole: coaxial with the through-hole (same
+# on-point datum-point location, so it reuses the proven point-select / body /
+# diameter path verbatim) but BLIND instead of Thru All. ONE atomic RunMacro
+# (dashboard context does not survive across RunMacro calls).
+#
+# *** DEPTH IS SET AFTER CREATION, NOT IN THIS MACRO (boxinator pattern). ***
+# The macro creates the hole as BLIND (StrHoleDepBlindF -- confirmed firing live
+# in trail.txt.3 2026-06-22) but does NOT type the depth value. WHY: the blind
+# depth-VALUE widget name was never recordable -- a guessed '~ Input maindashInst0.
+# depth_*_mip_OptionMenu' was SILENTLY DROPPED by Creo (it never appeared in the
+# trail), so the hole kept Creo's default blind depth and drilled through the
+# plate. A Blind hole's depth is a FEATURE-LEVEL Linear dimension, so the reliable
+# fix (same as boxinator's extrude depth / plane-probe's offset) is: create the
+# blind hole here, then in the caller find its new Linear depth dim by a
+# before/after Get-LinearDimMap diff and write DimValue + Invoke-ForceRegen --
+# a feature-level DimValue write STICKS on a closed feature regardless of regen
+# mode. This sidesteps the unknown depth-VALUE widget entirely.
+#
+# So this macro takes NO depth param: it just makes a blind hole of $Diameter at
+# $PointId on body $BodyIndex with Creo's default depth; the caller fixes depth.
+# (The diameter widget maindashInst0.diameter_mip_OptionMenu IS confirmed -- the
+# through-holes set their diameter through it correctly.)
+# ----------------------------------------------------------------------------
+function Build-ReliefHoleMacro {
+    param([int]$PointId, [double]$Diameter, [int]$BodyIndex = 0)
+    $blindDepthType = "StrHoleDepBlindF"   # CONFIRMED live (trail.txt.3 2026-06-22)
+    return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+        # select the target datum point by ID (identical to the through-hole macro)
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+        # hole dashboard
+        "~ Command ``ProCmdHole``;" +
+        # depth-type -> BLIND (creates a drivable depth dim; value set after regen)
+        "~ Select ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
+        "~ Close  ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.$blindDepthType`` 1;" +
+        # standard-hole layout + hole-note toggles (as recorded)
+        "~ Activate ``main_dlg_cur`` ``chkbn.std_hle_layout.0`` 1;" +
+        "~ Activate ``main_dlg_cur`` ``chkbn.std_hole_note_layout.0`` 1;" +
+        # body selection
+        "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ``$BodyIndex``;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
+        "~ Focus  ``body_page.1.0`` ``PH.bodyselectrepwdg_list``;" +
+        "~ Select ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` 1 ``$BodyIndex``;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
+        # diameter (relief = original + delta) -- this widget IS confirmed working
+        "~ Input  ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu`` ``$Diameter``;" +
+        "~ Update ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu`` ``$Diameter``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu``;" +
+        "~ FocusOut ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu``;" +
+        # confirm
+        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+}
+
+# Drive a freshly-created BLIND hole to its target depth, the boxinator way:
+# diff the model's Linear-dim set before vs after the hole to find its new depth
+# dim (the hole's diameter is a Diameter-type dim, so Get-LinearDimMap -- Linear
+# only -- isolates the depth), write DimValue + force a regen, then re-read to
+# confirm it held. Returns a status string: 'held' / 'wrote-unconfirmed' /
+# 'no-depth-dim' / 'error'. $BeforeMap is the Get-LinearDimMap snapshot taken
+# immediately BEFORE the create macro ran.
+function Set-ReliefHoleDepth {
+    param($BeforeMap, [double]$Depth)
+    $after = Get-LinearDimMap -Model $model -TypeObj $pfcType
+    $newSyms = @($after.Keys | Where-Object { -not $BeforeMap.ContainsKey($_) })
+    if ($newSyms.Count -eq 0) { return @{ Status = 'no-depth-dim'; Sym = $null; Value = $null } }
+    if ($newSyms.Count -gt 1) {
+        # On-point blind hole should add exactly ONE new linear dim (the depth).
+        # If more appear, the largest is the safest depth guess, but warn loudly.
+        Write-Host "      (>1 new linear dim after hole: $($newSyms -join ', '); taking the largest as depth)" -ForegroundColor Yellow
+    }
+    # pick the new linear dim with the LARGEST current value: a default blind depth
+    # is the through-ish value we are shrinking, and any stray placement dim would
+    # be smaller. Deterministic tiebreak when the on-point case isn't clean.
+    $depthSym = $newSyms | Sort-Object { [double]$after[$_] } -Descending | Select-Object -First 1
+    try {
+        $d = $model.GetItemByName($pfcType.ITEM_DIMENSION, [string]$depthSym)
+        $d.DimValue = $Depth
+    } catch {
+        return @{ Status = 'error'; Sym = $depthSym; Value = $null }
+    }
+    Invoke-ForceRegen -Model $model
+    $now = Read-DimValue -Model $model -TypeObj $pfcType -Sym ([string]$depthSym)
+    if ($null -ne $now -and [math]::Abs($now - $Depth) -lt 1e-4) {
+        return @{ Status = 'held'; Sym = $depthSym; Value = $now }
+    }
+    return @{ Status = 'wrote-unconfirmed'; Sym = $depthSym; Value = $now }
+}
+
 # ============================================================================
 # HEADER
 # ============================================================================
@@ -918,16 +1085,83 @@ foreach ($p in $planes) {
 }
 Write-Host ""
 
-# --- capture the three base-plane IDs (quick picks, up front - nothing created) ---
-Write-Host "  First, identify the three base planes (one quick click each):" -ForegroundColor Cyan
-foreach ($p in $planes) {
-    Read-Host "    Click the $($p.Hint) plane in Creo, then press ENTER"
-    $contents = ($session.CurrentSelectionBuffer()).Contents
-    if ($null -eq $contents -or $contents.Count -eq 0) {
-        throw "Nothing was selected for the $($p.Hint) plane. Click the plane, then press ENTER."
+# --- capture the three base-plane IDs ---------------------------------------
+# PREFERRED: ONE multi-select of all three default datums (Ctrl-click TOP, SIDE,
+# FRONT together), then read each pick's NAME and auto-sort them into roles by
+# substring (TOP/SIDE/FRONT). The name carries the role, so click order does not
+# matter. We then show the mapping and confirm ONCE; on accept the box build runs
+# hands-free (SIDE drives the sketch plane + the extrude-to plane). If the buffer
+# does not yield a clean, unambiguous all-three mapping, we fall back to the
+# original per-plane sequential capture (one click each) so the tool never wedges.
+Write-Host "  Identify the three base planes." -ForegroundColor Cyan
+Write-Host "  In Creo, Ctrl-click ALL THREE default datums (TOP, SIDE, FRONT) - any order -" -ForegroundColor White
+Write-Host "  then press ENTER here. (They are matched to roles by NAME, not click order.)" -ForegroundColor White
+Read-Host
+
+$autoMapped = $false
+$picks = @(Read-SelectionPlanePicks -Session $session)
+
+if ($picks.Count -gt 0) {
+    Write-Host ("  Read {0} selected datum(s):" -f $picks.Count) -ForegroundColor DarkGray
+    foreach ($pk in $picks) {
+        $nm = if ($pk.Name) { $pk.Name } else { "(no name)" }
+        $rl = if ($pk.Role) { $pk.Role.ToUpper() } else { "unmatched" }
+        Write-Host ("      id $($pk.Id)  name '$nm'  -> $rl") -ForegroundColor DarkGray
     }
-    $p.BaseId = [int]$contents[$contents.Count - 1].SelItem.Id
-    Write-Host "      $($p.Hint) base feature ID = $($p.BaseId)" -ForegroundColor DarkGray
+
+    # assign each plane its base id by matched role; flag any conflict/gap
+    $byRole = @{}
+    $conflict = $false
+    foreach ($pk in $picks) {
+        if ($null -eq $pk.Role) { continue }
+        if ($byRole.ContainsKey($pk.Role)) { $conflict = $true; continue }   # two datums claim the same role
+        $byRole[$pk.Role] = $pk.Id
+    }
+    $allRolesPresent = ($byRole.ContainsKey('Top') -and $byRole.ContainsKey('Side') -and $byRole.ContainsKey('Front'))
+
+    if ($allRolesPresent -and -not $conflict) {
+        foreach ($p in $planes) { $p.BaseId = [int]$byRole[$p.Label] }
+        Write-Host ""
+        Write-Host "  Auto-mapped by name:" -ForegroundColor Green
+        foreach ($p in $planes) {
+            $dim = switch ($p.Label) { "Side" {"Width/length"} "Top" {"Height"} "Front" {"Depth"} default {""} }
+            Write-Host ("      {0,-5} ({1,-12}) = datum id {2}" -f $p.Hint, $dim, $p.BaseId) -ForegroundColor White
+        }
+        Write-Host "  SIDE also becomes the sketch plane + extrude-to reference (hands-free box build)." -ForegroundColor DarkGray
+        Write-Host ""
+        $ans = Read-Host "  Accept this mapping? (ENTER/Y to accept, N to pick planes one at a time)"
+        if ($ans -notmatch '^[Nn]$') {
+            $autoMapped = $true
+        } else {
+            foreach ($p in $planes) { $p.BaseId = $null }   # clear so the fallback re-captures cleanly
+            Write-Host "  Mapping rejected - falling back to one-click-per-plane." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host ""
+        if ($conflict) {
+            Write-Host "  Two datums matched the same role - cannot auto-map by name." -ForegroundColor Yellow
+        } else {
+            $missing = @('Top','Side','Front' | Where-Object { -not $byRole.ContainsKey($_) })
+            Write-Host ("  Could not match all three roles by name (missing: {0})." -f ($missing -join ', ')) -ForegroundColor Yellow
+        }
+        Write-Host "  Falling back to one-click-per-plane capture." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "  Nothing was selected - falling back to one-click-per-plane capture." -ForegroundColor Yellow
+}
+
+# FALLBACK: original sequential capture - one quick click per plane, in order.
+if (-not $autoMapped) {
+    Write-Host ""
+    foreach ($p in $planes) {
+        Read-Host "    Click the $($p.Hint) plane in Creo, then press ENTER"
+        $contents = ($session.CurrentSelectionBuffer()).Contents
+        if ($null -eq $contents -or $contents.Count -eq 0) {
+            throw "Nothing was selected for the $($p.Hint) plane. Click the plane, then press ENTER."
+        }
+        $p.BaseId = [int]$contents[$contents.Count - 1].SelItem.Id
+        Write-Host "      $($p.Hint) base feature ID = $($p.BaseId)" -ForegroundColor DarkGray
+    }
 }
 Write-Host ""
 
@@ -984,11 +1218,26 @@ $doBox = Read-Host "    (y to create the box, anything else to skip and go strai
 if ($doBox.Trim().ToUpper() -eq "Y") {
     if ($null -eq $sidePlane) {
         Write-Host "  No SIDE plane was created, so there is nothing to build against. Skipping box." -ForegroundColor Yellow
-    } else {
+    }
+    # HANDS-FREE PATH: the all-three multi-select already identified SIDE by name
+    # AND confirmed once, so the box's two references are known with no further
+    # clicks - sketch ON the SIDE og/default datum ($sidePlane.BaseId), extrude UP
+    # TO the SIDE offset plane ($sidePlane.FeatId). This is exactly the user ask:
+    # "draw on the SIDE plane and the offset to that plane." Requires both ids.
+    elseif ($autoMapped -and $null -ne $sidePlane.BaseId -and $null -ne $sidePlane.FeatId) {
+        $sketchPlaneId = [int]$sidePlane.BaseId
+        $extrudeToId   = [int]$sidePlane.FeatId
+        Write-Host ""
+        Write-Host "  Box references taken from the SIDE mapping (no clicks needed):" -ForegroundColor Green
+        Write-Host "      sketch on   SIDE og/default datum (id $sketchPlaneId)" -ForegroundColor White
+        Write-Host "      extrude to  SIDE offset plane      (id $extrudeToId)" -ForegroundColor White
+    }
+    # FALLBACK PATH: no clean auto-map (or SIDE ids missing) - click each plane.
+    else {
 
         Write-Host ""
         Write-Host "  In Creo: CLICK the og/default datum to sketch the box footprint on," -ForegroundColor White
-        Write-Host "  then press ENTER." -ForegroundColor White
+        Write-Host "  then press ENTER. (Tip: this is normally the SIDE datum.)" -ForegroundColor White
         Read-Host
         $sketchPlaneId = Read-SelectedId
         if ($null -eq $sketchPlaneId) {
@@ -1035,8 +1284,11 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
         Read-Host
 
         # MACRO B: finish the internal sketch, set depth UP TO the extrude-to
-        # plane (re-selected BY ID, -NoClear so the open depth collector stays
-        # active), blur the field, confirm.
+        # plane, blur the field, confirm. The extrude-to plane is fed to the open
+        # depth collector via Get-SelectDatumByIdMacro (type DATUM, surfenator's
+        # proven up-to-plane feed) -- NOT the Feature-typed Get-SelectByIdMacro,
+        # which left the dashboard waiting for a manual plane click. No buffer_clean
+        # (clearing mid-dashboard can deactivate the open collector).
         $mkFinish =
             "~ Command ``ProCmdSketDone``;" +
             "~ Select ``main_dlg_cur`` ``maindashInst0.depth_flyout``;" +
@@ -1044,7 +1296,7 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
             "~ Activate ``main_dlg_cur`` ``maindashInst0.toselected`` 1;" +
             "~ Trigger ``extrev_1_placement.0.0`` ``PH.section_select_list`` ``0``;" +
             "~ Trigger ``extrev_1_placement.0.0`` ``PH.section_select_list`` ````;" +
-            (Get-SelectByIdMacro -FeatId $extrudeToId -NoClear) +
+            (Get-SelectDatumByIdMacro -FeatId $extrudeToId) +
             "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
             "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
             "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
@@ -1300,6 +1552,164 @@ if ($go -notmatch '^[Yy]$') {
         Write-Host "  Verify the holes visually in Creo." -ForegroundColor DarkGray
     } else {
         Write-Host "  Finished with issues -- $madeHoles of $total changed the model. Inspect Creo." -ForegroundColor Yellow
+    }
+}
+
+# ============================================================================
+# STAGE 4 -- CHIP-RELIEF HOLES (separate gated step)
+# ============================================================================
+# A chip-relief hole is a wider, shallow, BLIND hole COAXIAL with each through-
+# hole, giving drill chips somewhere to clear. Same on-point datum points, so it
+# reuses the through-hole point/body path verbatim and only changes:
+#   diameter = 1.5 x through-hole diameter  (hardcoded multiplier)
+#   depth    = 20% of the plate thickness in the drill direction (hardcoded pct)
+#
+# DEPTH IS APPLIED AFTER CREATION (boxinator pattern): Build-ReliefHoleMacro makes
+# a BLIND hole at Creo's default depth, then Set-ReliefHoleDepth finds the new
+# Linear depth dim (before/after Get-LinearDimMap diff) and writes DimValue +
+# force-regen. This replaced typing the depth into the dashboard, which silently
+# failed -- the blind depth-VALUE widget name was never recordable and Creo
+# dropped the '~ Input', so every relief hole drilled THROUGH (live 2026-06-22).
+#
+# THICKNESS SOURCE (decided with the user 2026-06-22): the box was BUILT this run
+# by extruding from an og datum UP TO the SIDE offset plane, and the holes drill
+# ALONG the SIDE direction -- so the SIDE plane's offset dim IS the plate
+# thickness the hole passes through. We read that dim LIVE (Read-DimValue by the
+# Side plane's captured .Sym) rather than measuring the solid with EvalOutline +
+# a guessed surface normal. Why live, not the cached $made[Side].Offset / the
+# STAGE-1 $bushingLen: the resize loop writes new offsets via Set-PlaneOffset
+# (DimValue + regen) but does NOT update those scalars, so they go STALE after a
+# resize -- only a fresh Read-DimValue reflects the current box. If no Side plane
+# with a drivable dim exists this run (creation failed, or the box was never
+# built), fall back to a manual thickness prompt.
+#
+# This replaces an earlier surface-pick + Read-SurfaceNormal + EvalOutline path:
+# the picked surface was used ONLY to measure thickness (it was never the drill-
+# from face -- the relief is placed On-Point by ID), and that normal read was a
+# guess proven for cylinders, not planes, so it could silently mis-measure.
+$RELIEF_DIA_MULT  = 1.5
+$RELIEF_DEPTH_PCT = 0.20
+
+Write-Host ""
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host "   STAGE 4 - chip-relief holes (wider + shallow, on the same points)" -ForegroundColor Cyan
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+$doRelief = Read-Host "  Add chip-relief holes on these points? (y/N)"
+if ($doRelief -notmatch '^[Yy]$') {
+    Write-Host "  Skipped chip-relief holes." -ForegroundColor DarkGray
+} else {
+    # --- STEP 1: relief depth = 20% of the live SIDE-plane offset (drill-axis
+    # plate thickness), with a manual fallback. Re-derive the Side plane from
+    # $made (NOT the STAGE-2-scoped $sidePlane) and re-read its dim LIVE so a
+    # post-build resize is reflected; never trust the cached .Offset/$bushingLen.
+    Write-Host ""
+    $reliefDepth = 0.0
+    $reliefSide  = @($made | Where-Object { $_.Label -eq "Side" })
+    $reliefSide  = if ($reliefSide.Count -gt 0) { $reliefSide[0] } else { $null }
+    $thickness   = $null
+    if ($null -ne $reliefSide -and $null -ne $reliefSide.Sym) {
+        $live = Read-DimValue -Model $model -TypeObj $pfcType -Sym $reliefSide.Sym
+        if ($null -ne $live -and $live -gt 0) { $thickness = [double]$live }
+    }
+    if ($null -ne $thickness -and $thickness -gt 0) {
+        $reliefDepth = [Math]::Round($thickness * $RELIEF_DEPTH_PCT, 4)
+        Write-Host ("  Plate thickness from the live SIDE offset ({0} = {1}`"):  relief depth {2}`" ({3:P0})" -f `
+            $reliefSide.Sym, [Math]::Round($thickness,4), $reliefDepth, $RELIEF_DEPTH_PCT) -ForegroundColor Green
+    } else {
+        Write-Host "  No live SIDE offset dim this run -- enter the plate thickness by hand." -ForegroundColor Yellow
+        $thicknessRaw = $null
+        while ($reliefDepth -le 0) {
+            $thicknessRaw = Read-Host "  Plate thickness in the drill direction (relief depth = 20% of it)"
+            $tv = 0.0
+            if ([double]::TryParse($thicknessRaw.Trim(), [ref]$tv) -and $tv -gt 0) {
+                $reliefDepth = [Math]::Round($tv * $RELIEF_DEPTH_PCT, 4)
+            } else { Write-Host "  Enter a positive number." -ForegroundColor Yellow }
+        }
+        Write-Host ("  Relief depth: {0}`" (20% of {1}`")" -f $reliefDepth, $thicknessRaw.Trim()) -ForegroundColor Green
+    }
+
+    $reliefDia = [Math]::Round($holeDiaFinal * $RELIEF_DIA_MULT, 4)
+
+    # --- CONFIRM ---
+    Write-Host ""
+    Write-Host ("  Ready: {0} relief hole(s), diameter {1}`" (= {2} x {3}), blind depth {4}`", body index {5}." -f `
+        $pointIDs.Count, $reliefDia, $holeDiaFinal, $RELIEF_DIA_MULT, $reliefDepth, $bodyIndex) -ForegroundColor Cyan
+    Write-Host "  Do not touch Creo while this runs." -ForegroundColor DarkGray
+    $goR = Read-Host "  Proceed? (y/N)"
+    if ($goR -notmatch '^[Yy]$') {
+        Write-Host "  Cancelled -- no chip-relief holes drilled." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        # --- FIRE -- canary first, then the rest (same guard as through-holes) ---
+        # Each hole: snapshot Linear dims -> create BLIND hole (default depth) ->
+        # find the new depth dim by diff -> write DimValue=reliefDepth + force regen.
+        $rTotal = $pointIDs.Count
+        $rIdx = 0; $rMade = 0; $rNoop = 0; $rFail = 0; $rAbort = $false
+        $rDepthHeld = 0; $rDepthMiss = 0
+        foreach ($ptId in $pointIDs) {
+            $rIdx++
+            Show-Progress ([Math]::Floor(($rIdx / $rTotal) * 100)) "Relief $rIdx/$rTotal"
+            # snapshot the Linear-dim set BEFORE creating the hole (depth-dim diff)
+            $beforeMap = Get-LinearDimMap -Model $model -TypeObj $pfcType
+            $macro = Build-ReliefHoleMacro -PointId $ptId -Diameter $reliefDia -BodyIndex $bodyIndex
+            $changed = $false
+            try {
+                $stamp = $model.VersionStamp
+                $session.RunMacro($macro)
+                $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp
+            } catch { $rFail++ }
+            if ($changed) {
+                $rMade++
+                # NOW drive the blind depth via the feature-level dim (boxinator way)
+                $dr = Set-ReliefHoleDepth -BeforeMap $beforeMap -Depth $reliefDepth
+                if ($dr.Status -eq 'held') {
+                    $rDepthHeld++
+                } else {
+                    $rDepthMiss++
+                    Write-Host ""
+                    Write-Host ("      depth not confirmed on hole {0}: {1} (sym {2}, read {3}, wanted {4})" -f `
+                        $rIdx, $dr.Status, $dr.Sym, $dr.Value, $reliefDepth) -ForegroundColor Yellow
+                }
+            } else { $rNoop++ }
+            if ($rIdx -eq 1 -and -not $changed) {
+                Show-Progress 100 "Canary failed"
+                Write-Host ""
+                Write-Host "  ABORT: the first RELIEF hole did not modify the model." -ForegroundColor Red
+                Write-Host "  StrHoleDepBlindF was confirmed firing live, so this is more likely a" -ForegroundColor Red
+                Write-Host "  point-select / body-select issue than the depth-type -- inspect Creo." -ForegroundColor Red
+                $rAbort = $true
+                break
+            }
+            # depth-canary: if hole #1 changed the model but NO depth dim was found
+            # to drive, the rest will all drill through too -- stop and report.
+            if ($rIdx -eq 1 -and $changed -and $rDepthMiss -eq 1) {
+                Show-Progress 100 "Depth canary"
+                Write-Host ""
+                Write-Host "  ABORT: the first relief hole was created but its blind DEPTH dim" -ForegroundColor Red
+                Write-Host "  could not be found/driven, so it would drill through like before." -ForegroundColor Red
+                Write-Host "  Set-ReliefHoleDepth status was '$($dr.Status)'. Inspect the new hole's" -ForegroundColor Red
+                Write-Host "  dims in Creo; the Linear-dim diff may need adjusting for this build." -ForegroundColor Red
+                $rAbort = $true
+                break
+            }
+        }
+        if (-not $rAbort) { Show-Progress 100 "Done" }
+        Write-Host ""
+        Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
+        Write-Host ("  Relief points     : {0}" -f $rTotal) -ForegroundColor White
+        Write-Host ("  Model changed     : {0}" -f $rMade) -ForegroundColor White
+        Write-Host ("  Depth confirmed   : {0}" -f $rDepthHeld) -ForegroundColor White
+        if ($rDepthMiss -gt 0) { Write-Host ("  Depth NOT confirmed: {0}" -f $rDepthMiss) -ForegroundColor Yellow }
+        if ($rNoop -gt 0) { Write-Host ("  No-op (no change) : {0}" -f $rNoop) -ForegroundColor Yellow }
+        if ($rFail -gt 0) { Write-Host ("  Macro errors      : {0}" -f $rFail) -ForegroundColor Yellow }
+        Write-Host ""
+        if ($rAbort) {
+            Write-Host "  STOPPED after the canary -- inspect the model in Creo." -ForegroundColor Red
+        } elseif ($rMade -eq $rTotal -and $rFail -eq 0 -and $rDepthMiss -eq 0) {
+            Write-Host "  Done -- $rMade chip-relief hole(s) created and driven to depth $reliefDepth`". Verify visually in Creo." -ForegroundColor Green
+        } else {
+            Write-Host "  Finished with issues -- $rMade of $rTotal changed the model, $rDepthHeld at correct depth. Inspect Creo." -ForegroundColor Yellow
+        }
     }
 }
 

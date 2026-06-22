@@ -40,6 +40,23 @@ function Dot {
 }
 
 # ----------------------------------------------------------------------------
+# Cross - 3D cross product of two @(x,y,z) arrays -> @(x,y,z).
+# Companion to Dot. cornerinator uses it to derive a vertical edge's direction
+# from its two adjacent plane normals (dir = normalize(cross(n1,n2))) WITHOUT
+# reading the edge's endpoints (the coordinate-read path that crashed holeinator
+# live - see CLAUDE.md "History / why ID-only"). Pure math, no COM.
+# NOTE: build each component on its own line, NOT inside a comma-separated
+# @(...) literal - same op_Subtraction-on-array trap Dist-PointToAxis documents.
+# ----------------------------------------------------------------------------
+function Cross {
+    param($A, $B)
+    $cx = $A[1]*$B[2] - $A[2]*$B[1]
+    $cy = $A[2]*$B[0] - $A[0]*$B[2]
+    $cz = $A[0]*$B[1] - $A[1]*$B[0]
+    return @($cx, $cy, $cz)
+}
+
+# ----------------------------------------------------------------------------
 # Dist-PointToAxis - perpendicular distance from point P to the infinite line
 # through A with direction D (D need not be unit - normalized here). Returns
 # +inf if D is degenerate. This is the "does this point lie on that hole axis"
@@ -235,6 +252,36 @@ function Get-CylinderAxes {
         } catch {}
     }
     return $axes
+}
+
+# ----------------------------------------------------------------------------
+# Read-PlaneNormal - best-effort planar-surface normal as @(x,y,z), or $null.
+# Uses the SAME read path proven LIVE for cylinders in Get-CylinderAxes: the
+# surface descriptor's .Origin is an IpfcTransform3D whose Z axis is the surface
+# normal. Two descriptor fallbacks follow. A failure returns $null and the caller
+# drops to its manual fallback (a read miss must never throw to a trap).
+#
+# LIVE-UNVERIFIED ASSUMPTION: $desc.Origin.GetZAxis() being the normal is proven
+# for the CYLINDER sibling above; the docs confirm plane descriptors are
+# "transformed" (origin + unit vectors) but do not print the .Origin member on a
+# plane descriptor. cornerinator's perpendicular-to-up test exposes a bad read
+# immediately (all |n.up| dots ~1 => wrong axis / wrong member).
+# (Was drilljig.cmd's inline Read-SurfaceNormal; promoted here so every tool
+# reads a surface normal the same way.)
+# ----------------------------------------------------------------------------
+function Read-PlaneNormal {
+    param($Surf)
+    if ($null -eq $Surf) { return $null }
+    $desc = $null
+    try { $desc = $Surf.GetSurfaceDescriptor() } catch { return $null }
+    foreach ($attempt in @(
+        { Get-Comp $desc.Origin.GetZAxis() },   # proven for cylinder descriptors
+        { Get-Comp $desc.GetNormal() },          # fallback
+        { Get-Comp $desc.Normal }                # fallback
+    )) {
+        try { $n = & $attempt; if ($null -ne $n) { return $n } } catch {}
+    }
+    return $null
 }
 
 # ----------------------------------------------------------------------------

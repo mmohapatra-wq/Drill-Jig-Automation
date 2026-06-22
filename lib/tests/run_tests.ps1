@@ -81,6 +81,58 @@ Assert-True "non-unit axis direction is normalized" `
     (Approx (Dist-PointToAxis -P @(0,5,0) -A @(0,0,0) -D @(0,0,2)) 5.0 1e-9)
 
 # ----------------------------------------------------------------------------
+# Cross (cornerinator: vertical edge dir = normalize(cross(n1,n2)))
+# ----------------------------------------------------------------------------
+Write-Host "  -- creo_geometry: Cross --" -ForegroundColor White
+
+# right-hand rule: x cross y = z
+$xy = Cross @(1,0,0) @(0,1,0)
+Assert-True "Cross x,y = z (right-hand rule)" `
+    ((Approx $xy[0] 0.0) -and (Approx $xy[1] 0.0) -and (Approx $xy[2] 1.0))
+# anti-commutative: y cross x = -z
+$yx = Cross @(0,1,0) @(1,0,0)
+Assert-True "Cross y,x = -z (anti-commutative)" (Approx $yx[2] -1.0)
+# result is orthogonal to both inputs
+$a = @(1,2,3); $b = @(4,5,6); $axb = Cross $a $b
+Assert-True "Cross result is orthogonal to both inputs" `
+    ((Approx (Dot $axb $a) 0.0) -and (Approx (Dot $axb $b) 0.0))
+# parallel inputs -> zero vector
+$par = Cross @(0,0,2) @(0,0,5)
+Assert-True "Cross of parallel vectors is zero" `
+    ((Approx $par[0] 0.0) -and (Approx $par[1] 0.0) -and (Approx $par[2] 0.0))
+
+# ----------------------------------------------------------------------------
+# Read-PlaneNormal (fake Surf whose descriptor.Origin.GetZAxis() is the normal)
+# ----------------------------------------------------------------------------
+Write-Host "  -- creo_geometry: Read-PlaneNormal --" -ForegroundColor White
+
+# descriptor whose .Origin.GetZAxis() returns a bracket-indexable normal (the
+# proven cylinder-sibling path); mirrors the Measure-Extents stub style.
+# NB: Add-Member ScriptMethod bodies resolve free variables by DYNAMIC scope (the
+# caller's scope at invoke time). Read-PlaneNormal has its own locals named $desc
+# and $surf, so the stub MUST use distinct names ($pnXform/$pnDesc/$pnSurf) or the
+# method body would pick up the function's half-assigned $desc and return null.
+$pnXform = [pscustomobject]@{} |
+    Add-Member -PassThru -MemberType ScriptMethod -Name GetZAxis -Value { @(0.0, 0.0, 1.0) }
+$pnDesc = [pscustomobject]@{ Origin = $pnXform }
+$pnSurf = [pscustomobject]@{} |
+    Add-Member -PassThru -MemberType ScriptMethod -Name GetSurfaceDescriptor -Value { $pnDesc }
+$n = Read-PlaneNormal -Surf $pnSurf
+Assert-True "Read-PlaneNormal reads descriptor.Origin.GetZAxis()" `
+    ($null -ne $n -and (Approx $n[0] 0.0) -and (Approx $n[1] 0.0) -and (Approx $n[2] 1.0))
+
+# GetNormal() fallback when there is no .Origin
+$pnSurfNorm = [pscustomobject]@{} |
+    Add-Member -PassThru -MemberType ScriptMethod -Name GetSurfaceDescriptor -Value {
+        [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name GetNormal -Value { @(1.0, 0.0, 0.0) }
+    }
+$nf = Read-PlaneNormal -Surf $pnSurfNorm
+Assert-True "Read-PlaneNormal falls back to GetNormal()" `
+    ($null -ne $nf -and (Approx $nf[0] 1.0))
+
+Assert-True "Read-PlaneNormal returns null on null surf (no throw)" ($null -eq (Read-PlaneNormal -Surf $null))
+
+# ----------------------------------------------------------------------------
 # Get-OutlineExtents
 # ----------------------------------------------------------------------------
 Write-Host "  -- creo_geometry: Get-OutlineExtents --" -ForegroundColor White
