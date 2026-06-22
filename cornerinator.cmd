@@ -41,6 +41,10 @@ exit /b %errorlevel%
 
 $Host.UI.RawUI.WindowTitle = "CORNERINATOR"
 $Verbose = $ScriptArgs -match '(?i)-v|--verbose'
+# --probe-edges: read-only diagnostic. Dumps what every COM enumeration call
+# returns live, then has the user select ONE edge by hand and walks UP from it
+# (GetFeature) to pinpoint exactly where enumeration breaks. No mutation, no round.
+$ProbeEdges = ($ScriptArgs -match '(?i)(^|\s)-{1,2}probe-edges(\s|$)')
 $ErrorActionPreference = "Stop"
 $startTime = Get-Date
 
@@ -480,7 +484,13 @@ catch {
 
 $connection = $async.Connect($null, $null, $null, $null)
 $session = $connection.Session
-$model = $session.CurrentModel
+# Use GetActiveModel() FIRST - it is what the proven-live holeinator/drilljig use.
+# cornerinator originally used CurrentModel; that may hand back a different/empty
+# model handle than the one the selection buffer resolves against, which would
+# explain enumeration returning 0 while manual pick works. Fall back to CurrentModel.
+$model = $null
+try { $model = $session.GetActiveModel() } catch {}
+if ($null -eq $model) { try { $model = $session.CurrentModel } catch {} }
 
 if ($null -eq $model) {
     Write-Host ""
@@ -521,6 +531,127 @@ try {
 } catch {}
 
 $modelItemType = New-Object -ComObject pfcls.pfcModelItemType
+
+# ============================================================================
+# --probe-edges : READ-ONLY DIAGNOSTIC (no mutation, no round)
+# ============================================================================
+# Four COM enumeration routes have returned 0 edges live while manual pick works.
+# This probe dumps what every call actually returns, then walks UP from a single
+# hand-picked edge (GetFeature) so we see precisely where enumeration breaks.
+if ($ProbeEdges) {
+    Write-Host ""
+    Write-Host "  ====================================================================" -ForegroundColor Cyan
+    Write-Host "   --probe-edges : read-only enumeration diagnostic" -ForegroundColor Cyan
+    Write-Host "  ====================================================================" -ForegroundColor Cyan
+    Write-Host "  Active model: $($model.FileName)" -ForegroundColor White
+    Write-Host ""
+
+    # Helper: report a ListItems(<type>) call by name -> count (or the error).
+    function Probe-Count {
+        param($Owner, [string]$OwnerLabel, [string]$TypeName)
+        $tv = $null
+        try { $tv = $modelItemType.$TypeName } catch {}
+        if ($null -eq $tv) { Write-Host ("    {0}.ListItems({1}) -> (type const unavailable)" -f $OwnerLabel, $TypeName) -ForegroundColor DarkGray; return }
+        try {
+            $items = $Owner.ListItems($tv)
+            $cnt = if ($null -eq $items) { "<null>" } else { $items.Count }
+            Write-Host ("    {0}.ListItems({1}) -> {2}" -f $OwnerLabel, $TypeName, $cnt) -ForegroundColor White
+        } catch {
+            Write-Host ("    {0}.ListItems({1}) -> ERROR: {2}" -f $OwnerLabel, $TypeName, $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "  [1] Model-level ListItems counts:" -ForegroundColor Cyan
+    foreach ($tn in @("ITEM_EDGE","ITEM_SURFACE","ITEM_BODY","ITEM_FEATURE","ITEM_CURVE","ITEM_AXIS","ITEM_POINT","ITEM_SOLID_GEOMETRY")) {
+        Probe-Count -Owner $model -OwnerLabel "model" -TypeName $tn
+    }
+    Write-Host ""
+
+    Write-Host "  [2] Per-body enumeration:" -ForegroundColor Cyan
+    $bodies = @()
+    try { $bodies = @($model.ListItems($modelItemType.ITEM_BODY)) } catch { Write-Host "    ListItems(ITEM_BODY) threw: $($_.Exception.Message)" -ForegroundColor Yellow }
+    Write-Host ("    body count = $($bodies.Count)") -ForegroundColor White
+    for ($b = 0; $b -lt $bodies.Count; $b++) {
+        $body = $bodies[$b]
+        $nm = try { $body.GetName() } catch { "(unnamed)" }
+        Probe-Count -Owner $body -OwnerLabel "  body[$b] '$nm'" -TypeName "ITEM_EDGE"
+        $sc = "?"; try { $bs = $body.ListSurfaces(); $sc = if ($null -eq $bs) { "<null>" } else { $bs.Count } } catch { $sc = "ERR:$($_.Exception.Message)" }
+        Write-Host ("    body[$b].ListSurfaces() -> $sc") -ForegroundColor White
+    }
+    Write-Host ""
+
+    Write-Host "  [3] GetDefaultBody:" -ForegroundColor Cyan
+    try {
+        $db = $model.GetDefaultBody()
+        if ($null -eq $db) { Write-Host "    GetDefaultBody() -> <null>" -ForegroundColor White }
+        else {
+            Probe-Count -Owner $db -OwnerLabel "  defaultBody" -TypeName "ITEM_EDGE"
+            $sc = "?"; try { $bs = $db.ListSurfaces(); $sc = if ($null -eq $bs) { "<null>" } else { $bs.Count } } catch { $sc = "ERR" }
+            Write-Host ("    defaultBody.ListSurfaces() -> $sc") -ForegroundColor White
+        }
+    } catch { Write-Host "    GetDefaultBody() threw: $($_.Exception.Message)" -ForegroundColor Yellow }
+    Write-Host ""
+
+    Write-Host "  [4] Feature route (first 5 features' ListSubItems(ITEM_EDGE)):" -ForegroundColor Cyan
+    $feats = @()
+    try { $feats = @($model.ListItems($modelItemType.ITEM_FEATURE)) } catch {}
+    Write-Host ("    feature count = $($feats.Count)") -ForegroundColor White
+    $shown = 0
+    foreach ($ft in $feats) {
+        if ($shown -ge 5) { break }
+        $fid = try { [int]$ft.Id } catch { "?" }
+        $ec = "?"; try { $se = $ft.ListSubItems($modelItemType.ITEM_EDGE); $ec = if ($null -eq $se) { "<null>" } else { $se.Count } } catch { $ec = "ERR:$($_.Exception.Message)" }
+        Write-Host ("    feature[id $fid].ListSubItems(ITEM_EDGE) -> $ec") -ForegroundColor White
+        $shown++
+    }
+    Write-Host ""
+
+    Write-Host "  [5] WALK-UP FROM A HAND-PICKED EDGE (the decisive test):" -ForegroundColor Cyan
+    Write-Host "      In Creo, select ONE edge (the same way manual pick works), then press ENTER." -ForegroundColor White
+    Read-Host
+    $buf = $null
+    try { $buf = ($session.CurrentSelectionBuffer()).Contents } catch {}
+    if ($null -eq $buf -or $buf.Count -eq 0) {
+        Write-Host "    Selection buffer empty - nothing to walk up from." -ForegroundColor Yellow
+    } else {
+        Write-Host ("    buffer has $($buf.Count) item(s)") -ForegroundColor White
+        $si = $null
+        try { $si = $buf[$buf.Count - 1].SelItem } catch {}
+        if ($null -ne $si) {
+            $eid = try { [int]$si.Id } catch { "?" }
+            $ety = try { [string]$si.Type } catch { "?" }
+            $elen = try { [double]$si.EvalLength() } catch { "n/a" }
+            Write-Host ("    picked item: Id=$eid  Type=$ety  EvalLength=$elen") -ForegroundColor Green
+            # walk UP to the owning feature (the user's GetFeature route)
+            try {
+                $ownFeat = $si.GetFeature()
+                if ($null -ne $ownFeat) {
+                    $ofid = try { [int]$ownFeat.Id } catch { "?" }
+                    $ofnm = try { [string]$ownFeat.GetName() } catch { "(unnamed)" }
+                    Write-Host ("    GetFeature() -> feature id $ofid '$ofnm'") -ForegroundColor Green
+                    $back = "?"; try { $bse = $ownFeat.ListSubItems($modelItemType.ITEM_EDGE); $back = if ($null -eq $bse) { "<null>" } else { $bse.Count } } catch { $back = "ERR:$($_.Exception.Message)" }
+                    Write-Host ("    that feature.ListSubItems(ITEM_EDGE) -> $back  (if >0, the feature route CAN reach edges)") -ForegroundColor Green
+                } else {
+                    Write-Host "    GetFeature() -> <null>" -ForegroundColor Yellow
+                }
+            } catch { Write-Host "    GetFeature() threw: $($_.Exception.Message)" -ForegroundColor Yellow }
+            # also: does the edge expose adjacent surfaces / its own owner model?
+            try { $own = $si.Owner; $on = try { [string]$own.FileName } catch { "?" }; Write-Host ("    edge.Owner.FileName = $on  (vs active model $($model.FileName))") -ForegroundColor White } catch {}
+        } else {
+            Write-Host "    Could not read SelItem from the buffer." -ForegroundColor Yellow
+        }
+    }
+    Write-Host ""
+    Write-Host "  Probe complete. Copy ALL of the above and paste it back." -ForegroundColor Cyan
+
+    try { if ($null -ne $origVisibleMapkeys) { $session.SetConfigOption("visible_mapkeys", $origVisibleMapkeys) | Out-Null } } catch {}
+    try { if ($null -ne $origDynamicPreview)  { $session.SetConfigOption("dynamic_preview",  $origDynamicPreview)  | Out-Null } } catch {}
+    try { $connection.Disconnect($null) } catch {}
+    Write-Host ""
+    Write-Host "  Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit 0
+}
 
 try {
 
