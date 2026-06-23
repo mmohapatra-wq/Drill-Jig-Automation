@@ -975,6 +975,20 @@ if ($script:Picks.Count -gt 0) {
 }
 Write-Host ""
 
+# Material drives STAGE 4's chip-relief gate. A 3D-printed part ALWAYS gets the
+# chip-relief holes made automatically (no y/N) so the run doesn't pause for a
+# confirmation we already know the answer to; metal (or any non-3D-print / un-
+# resolved path) keeps the human y/N gate. The material is the user's answer to
+# the root question, which the walk recorded into $path -- the "3d print" signal
+# only ever enters $path via that material option (the metal sub-answers are
+# "PFD"/"Hand Drill"), so matching $path for it is unambiguous. Safe default:
+# auto-act ONLY on the explicit 3D-print choice; everything else still asks.
+$is3dPrint = @($path | Where-Object { $_ -match '(?i)3d\s*print' }).Count -gt 0
+if ($is3dPrint) {
+    Write-Host "  Material: 3D print -> chip-relief holes will be added automatically (STAGE 4, no prompt)." -ForegroundColor Cyan
+    Write-Host ""
+}
+
 # ============================================================================
 # CONNECT ONCE (single session) -- wraps STAGES 2 + 3
 # ============================================================================
@@ -1594,7 +1608,16 @@ Write-Host ""
 Write-Host "  ====================================================================" -ForegroundColor Cyan
 Write-Host "   STAGE 4 - chip-relief holes (wider + shallow, on the same points)" -ForegroundColor Cyan
 Write-Host "  ====================================================================" -ForegroundColor Cyan
-$doRelief = Read-Host "  Add chip-relief holes on these points? (y/N)"
+# GATE: 3D-printed parts make the relief holes automatically (no prompt) so the
+# run doesn't stall on a question we already know the answer to; metal (and any
+# non-3D-print / unresolved path) still asks the human y/N. $is3dPrint was
+# derived from the STAGE-1 decision path right after the walk.
+if ($is3dPrint) {
+    $doRelief = 'y'
+    Write-Host "  Material is 3D print -- adding chip-relief holes automatically (no confirmation)." -ForegroundColor Cyan
+} else {
+    $doRelief = Read-Host "  Add chip-relief holes on these points? (y/N)"
+}
 if ($doRelief -notmatch '^[Yy]$') {
     Write-Host "  Skipped chip-relief holes." -ForegroundColor DarkGray
 } else {
@@ -1635,7 +1658,15 @@ if ($doRelief -notmatch '^[Yy]$') {
     Write-Host ("  Ready: {0} relief hole(s), diameter {1}`" (= {2} x {3}), blind depth {4}`", body index {5}." -f `
         $pointIDs.Count, $reliefDia, $holeDiaFinal, $RELIEF_DIA_MULT, $reliefDepth, $bodyIndex) -ForegroundColor Cyan
     Write-Host "  Do not touch Creo while this runs." -ForegroundColor DarkGray
-    $goR = Read-Host "  Proceed? (y/N)"
+    # 3D print auto-proceeds (no confirmation) -- same gate as the STAGE-4 entry,
+    # so a 3D-print run drills the relief holes start-to-finish without a prompt.
+    # Metal (and any non-3D-print / unresolved path) still confirms here.
+    if ($is3dPrint) {
+        $goR = 'y'
+        Write-Host "  Material is 3D print -- proceeding automatically." -ForegroundColor Cyan
+    } else {
+        $goR = Read-Host "  Proceed? (y/N)"
+    }
     if ($goR -notmatch '^[Yy]$') {
         Write-Host "  Cancelled -- no chip-relief holes drilled." -ForegroundColor Yellow
     } else {
