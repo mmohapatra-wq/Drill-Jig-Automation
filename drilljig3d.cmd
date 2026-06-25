@@ -10,8 +10,9 @@ exit /b %errorlevel%
 # ============================================================================
 # "I want a drill-jig that follows a curved face." You enter a THICKNESS, click
 # the SURFACE you want jigged, and this tool:
-#   1. Creates an OFFSET-surface feature from that face at offset = 0 (a coincident
-#      quilt copy of the face), then
+#   1. Creates an OFFSET-surface feature from that face at a STANDOFF offset
+#      (default 0 = a coincident quilt copy; >0 floats the jig off the part for
+#      chip clearance), then
 #   2. THICKENS that quilt into a NEW solid body of the given thickness (STAGE 1).
 #   3. STAGE 2 (optional): drills On-Point holes NORMAL to the surface at datum
 #      points you select - holeinator's proven machinery, retargeted at the new
@@ -431,6 +432,65 @@ function Build-NormalHoleMacro {
     return $m
 }
 
+# Blind-evaluator gate for STAGE 2 drilling (top rec #3 of docs\drilljig3d_improvements.md):
+# did we create exactly the INTENDED number of bores at the INTENDED diameter? The CLAIM
+# is from INTENT (the point count + diameter the user asked for), NOT re-read from the
+# build path (re-reading would be outcome-vs-outcome and a self-consistent wrong result
+# would pass). MEASUREMENT is the DELTA of cylindrical surfaces AT the target radius
+# (holeDia/2) before vs after drilling - counting AT the radius checks COUNT and DIAMETER
+# TOGETHER (a wrong-diameter bore is not counted at the target radius; a missing bore drops
+# the delta), and the delta is robust to any pre-existing same-radius cylinders (they
+# cancel). Test-ExtentsMatch (deterministic) owns the arithmetic; the LLM is advisory.
+# Degrades to UNVERIFIED (returns $null) - never a false pass - when the cylinder walk
+# returns 0 surfaces (the foreign-body / dead-ListSurfaces case; canary-must-not-assume).
+# Reuses the same blind_evaluator API + <model>_eval.json artifact plane-probe uses.
+function Invoke-JigEval {
+    param($Model, $TypeObj, [string]$RepoRoot, $JudgeCfg, [int]$IntendedCount, [double]$Diameter, [int]$CylBefore, [int]$CylAfter, [string]$ModelName)
+
+    $delta  = $CylAfter - $CylBefore
+    $radius = [math]::Round($Diameter / 2.0, 5)
+
+    # 0-surface walk => cannot measure. UNVERIFIED, not a failure of the holes.
+    if ($CylAfter -le 0 -and $CylBefore -le 0) {
+        Write-Host "  Blind eval: the cylinder walk returned 0 surfaces - cannot measure bore" -ForegroundColor Yellow
+        Write-Host "  count/diameter on this body (UNVERIFIED, not a failure). Verify visually." -ForegroundColor Yellow
+        return $null
+    }
+
+    # Slice carries MEASURED geometry only (no mapkey / body-index / orientation
+    # provenance - the slice-purity rule the run_tests.ps1 assertions enforce).
+    $truth = @{
+        intended_hole_count        = $IntendedCount
+        target_radius              = $radius
+        cylinders_at_radius_before = $CylBefore
+        cylinders_at_radius_after  = $CylAfter
+        new_cylinders_at_radius    = $delta
+    }
+
+    # Deterministic gate: measured delta must equal the intended count (within 0.5).
+    $numeric = Test-ExtentsMatch -Expected @([double]$IntendedCount) -Measured @([double]$delta) -Tol 0.5
+
+    $claims = @(
+        "the jig has $IntendedCount through-hole(s) of diameter $Diameter",
+        "every through-hole bore is at diameter $Diameter (counted at radius $radius)"
+    )
+
+    $claim = New-EvalClaim -Tool "drilljig3d" -Operation "drill-holes" -Claims $claims
+    $slice = Get-GeometrySlice -Model $ModelName -Truth $truth
+
+    $base = ($ModelName -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
+    $packetPath = Join-Path $RepoRoot ($base + "_eval.json")
+    $when = (Get-Date).ToString("o")
+    Write-EvalPacket -Path $packetPath -Claim $claim -Slice $slice -WhenIso $when | Out-Null
+    Write-Host "  Eval packet -> $packetPath" -ForegroundColor DarkGray
+
+    $packetObj = Get-Content $packetPath -Raw | ConvertFrom-Json
+    $verdict = Invoke-BlindJudge -Packet $packetObj -Config $JudgeCfg
+
+    # Gate on the deterministic delta; the LLM verdict is advisory.
+    return (Show-ConvergenceReport -Verdict $verdict -Title "Blind evaluator: drill-holes" -Numeric $numeric)
+}
+
 # ============================================================================
 # HEADER
 # ============================================================================
@@ -450,13 +510,56 @@ Write-Host ""
 # SHARED LIBRARY (dim reads come from here so every tool reads dims the same way)
 # ============================================================================
 . (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
+. (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')
+
+# Resolve the blind-judge config once (BlueGPT REST). $null is fine - the STAGE-2
+# hole-count gate still runs DETERMINISTICALLY; the packet is written for offline
+# judging and the REST call is simply skipped.
+$judgeCfg = Get-JudgeConfig -RepoRoot $ScriptDir -DefaultModel "sonnet"
+if ($null -eq $judgeCfg) {
+    Write-Host "  (blind judge not configured - hole-count gate runs deterministically; packet written for offline judging)" -ForegroundColor DarkGray
+}
 
 # ============================================================================
-# USER INPUT - THICKNESS (the whole point of the jig; require a positive number)
+# JIGINATOR HANDOFF (optional) - the same last_jig_spec.json holeinator consumes
 # ============================================================================
+# If a jiginator walk wrote it, pre-fill the STAGE-2 hole diameter (HoleDiameter =
+# bushing OD = the jig seat bore) and seed the STAGE-1 thickness guidance from it.
+# Stale/absent file -> everything stays manual (the user always confirms). Pure
+# file read, no Creo. BushingLength is read if jiginator ever emits it (not in the
+# current handoff contract yet) so this is forward-compatible.
+$jigSpec = $null; $jigDia = $null; $jigBushLen = $null
+$handoffPath = Join-Path $ScriptDir 'last_jig_spec.json'
+if (Test-Path $handoffPath) {
+    try {
+        $jigSpec = Get-Content $handoffPath -Raw | ConvertFrom-Json
+        if ($null -ne $jigSpec.HoleDiameter  -and [double]$jigSpec.HoleDiameter  -gt 0) { $jigDia     = [double]$jigSpec.HoleDiameter }
+        if ($null -ne $jigSpec.BushingLength -and [double]$jigSpec.BushingLength -gt 0) { $jigBushLen = [double]$jigSpec.BushingLength }
+    } catch { $jigSpec = $null }
+    if ($null -ne $jigDia) {
+        $bn = ""
+        try { if ($jigSpec.Bushing) { $bn = " ($($jigSpec.Bushing))" } } catch {}
+        Write-Host "  jiginator handoff: hole/seat dia $jigDia$bn" -ForegroundColor DarkGray
+    }
+}
+
+# ============================================================================
+# USER INPUT - THICKNESS (the jig wall = the bushing's guide length)
+# ============================================================================
+# Guidance (general jig practice, EDITABLE - re-verify against data\bushings*.csv):
+# a drill bushing guides the bit over ~1.5x its diameter and a jig plate is
+# typically 1-2x the tool diameter thick. If the hole diameter is known (handoff),
+# show that band; soft-warn a too-thin wall AFTER entry. Advisory only, never blocks.
+if ($null -ne $jigDia) {
+    $loBand = [math]::Round(1.0 * $jigDia, 4); $hiBand = [math]::Round(2.0 * $jigDia, 4); $seat = [math]::Round(1.5 * $jigDia, 4)
+    Write-Host "  Guidance: jig wall ~1-2x hole dia ($loBand - $hiBand); bushing seats over ~1.5x ($seat)." -ForegroundColor DarkGray
+    Write-Host "  (general jig practice - verify; the chosen bushing's length is the real target)" -ForegroundColor DarkGray
+}
 $Thickness = $null
 while ($null -eq $Thickness) {
-    $raw = Read-Host "  Drill-jig thickness"
+    $tprompt = if ($null -ne $jigBushLen) { "  Drill-jig thickness [ENTER = bushing length $jigBushLen]" } else { "  Drill-jig thickness" }
+    $raw = Read-Host $tprompt
+    if ([string]::IsNullOrWhiteSpace($raw) -and $null -ne $jigBushLen) { $Thickness = $jigBushLen; break }
     $tv = 0.0
     if ([double]::TryParse(($raw.Trim()), [ref]$tv) -and $tv -gt 0) {
         $Thickness = $tv
@@ -464,7 +567,28 @@ while ($null -eq $Thickness) {
         Write-Host "  Enter a positive number (e.g. 0.5)." -ForegroundColor Yellow
     }
 }
+if ($null -ne $jigDia -and $Thickness -lt (1.5 * $jigDia)) {
+    Write-Host "  NOTE: $Thickness is below ~1.5x the hole dia ($([math]::Round(1.5*$jigDia,4))) - a thin wall guides the" -ForegroundColor Yellow
+    Write-Host "  drill over a short length and may let it wander. (advisory, not blocking)" -ForegroundColor Yellow
+}
 Write-Host "  Thickness: $Thickness" -ForegroundColor Green
+Write-Host ""
+
+# ============================================================================
+# USER INPUT - STANDOFF / CHIP-CLEARANCE OFFSET (default 0 = flush, current behavior)
+# ============================================================================
+# The offset-surface distance was previously hard-driven to 0 (jig face coincident
+# with the part). Exposing it lets the jig float a deliberate gap off the part for
+# chip clearance / coating. DEFAULT 0 keeps the proven coincident behavior exactly.
+# (Carr Lane: drilling chip clearance ~0.5-1.5x tool dia - editable guidance.)
+$StandOff = 0.0
+$soRaw = Read-Host "  Standoff / chip-clearance offset from the part (blank/0 = flush)"
+if (-not [string]::IsNullOrWhiteSpace($soRaw)) {
+    $sov = 0.0
+    if ([double]::TryParse(($soRaw.Trim()), [ref]$sov) -and $sov -ge 0) { $StandOff = $sov }
+    else { Write-Host "  Not a non-negative number - using 0 (flush)." -ForegroundColor Yellow }
+}
+if ($StandOff -gt 0) { Write-Host "  Standoff: $StandOff (jig floats off the part face)" -ForegroundColor Green }
 Write-Host ""
 
 # ============================================================================
@@ -629,16 +753,16 @@ if ($go -notmatch '^[Yy]$') {
                 Write-Host "  inspect Creo. Not auto-driving a thickness onto an ambiguous feature." -ForegroundColor Yellow
             }
 
-            # --- OFFSET -> 0 -------------------------------------------------
+            # --- OFFSET -> standoff (default 0 = coincident; chip-clearance if >0) ---
             if ($null -ne $offsetSym) {
-                $now = Set-DimAndConfirm -Model $model -TypeObj $modelItemType -Sym $offsetSym -Target 0.0
-                if ($null -ne $now -and [math]::Abs($now) -lt 1e-4) {
-                    Write-Host "    Offset  feat $($offsetFeat.Id)  $offsetSym = $now  (held at 0)" -ForegroundColor Green
+                $now = Set-DimAndConfirm -Model $model -TypeObj $modelItemType -Sym $offsetSym -Target $StandOff
+                if ($null -ne $now -and [math]::Abs($now - $StandOff) -lt 1e-4) {
+                    Write-Host "    Offset  feat $($offsetFeat.Id)  $offsetSym = $now  (held at $StandOff)" -ForegroundColor Green
                 } else {
-                    Write-Host "    Offset  feat $($offsetFeat.Id)  $offsetSym = $now  (wanted 0 - did NOT hold)" -ForegroundColor Yellow
+                    Write-Host "    Offset  feat $($offsetFeat.Id)  $offsetSym = $now  (wanted $StandOff - did NOT hold; surface may have self-intersected if offset is large)" -ForegroundColor Yellow
                 }
             } else {
-                Write-Host "    Offset  feat $($offsetFeat.Id) exposed no linear dim - assuming its default (likely 0)." -ForegroundColor DarkGray
+                Write-Host "    Offset  feat $($offsetFeat.Id) exposed no linear dim - assuming its default ($StandOff)." -ForegroundColor DarkGray
             }
 
             # --- THICKNESS -> entered value ----------------------------------
@@ -716,38 +840,79 @@ if ($script:blankMade) {
             Write-Host "  Drilling into the new blank body '$script:jigBodyName' (index $bodyIndex)." -ForegroundColor Cyan
         }
 
-        # --- STEP 1: select target datum points (ID-only) ---
-        Write-Host ""
-        Write-Host "  In Creo, select the target datum points on the blank, then press ENTER here." -ForegroundColor Cyan
-        Read-Host
-        $pres = Resolve-SelectedPoints -Session $session -TypeObj $modelItemType
-        $pointIds = @($pres.Points)
-        if ($pres.Rejected.Count -gt 0) {
-            Write-Host ("  Ignored $($pres.Rejected.Count) non-point selection(s):") -ForegroundColor Yellow
-            foreach ($r in ($pres.Rejected | Select-Object -First 10)) { Write-Host "      $r" -ForegroundColor DarkGray }
+        # --- STEP 1: orientation mode + build the (point, surface) pair list ---
+        # CONFORMAL FIX: each hole can carry its OWN normal-reference surface, so a
+        # curved/multi-face jig orients every bore to its LOCAL face (not one global
+        # surface). Mode 1 (default) keeps the fast "all holes share the STAGE-1
+        # surface" path - byte-for-byte the previous behavior; mode 2 pairs each point
+        # with the surface it sits on. Both are ID-ONLY (Resolve-SelectedPoints /
+        # Resolve-SelectedSurfaces walk the same buffer; never a coordinate read).
+        # -defaultorient ignores the surface, so the pairing surface is moot there.
+        $perHole = $false
+        if (-not $DefaultOrient -and $surfIds.Count -ge 1) {
+            Write-Host ""
+            Write-Host "  Orientation surface:" -ForegroundColor Cyan
+            Write-Host "    [1] one surface for ALL holes (fast; holes share STAGE-1 surface $($surfIds[0]))" -ForegroundColor White
+            Write-Host "    [2] per-hole surface (curved/multi-face; pick each point WITH its surface)" -ForegroundColor White
+            $omode = Read-Host "  Choose 1 or 2 [1]"
+            if ($omode.Trim() -eq '2') { $perHole = $true }
         }
-        if ($pointIds.Count -eq 0) {
-            Write-Host "  No datum points resolved from the selection - skipping drilling." -ForegroundColor Yellow
-        } else {
-            Write-Host "  Captured $($pointIds.Count) point id(s): $($pointIds -join ', ')" -ForegroundColor Green
 
-            # --- STEP 2: diameter ---
+        $holePairs = @()
+        if ($perHole) {
+            Write-Host ""
+            Write-Host "  Per-hole mode: in Creo Ctrl-click ONE datum point AND the surface it sits on," -ForegroundColor Cyan
+            Write-Host "  then press ENTER. An empty ENTER (nothing selected) finishes." -ForegroundColor Cyan
+            while ($true) {
+                Read-Host "  Point + surface for hole $($holePairs.Count + 1) (empty ENTER to finish)"
+                $pp = @((Resolve-SelectedPoints   -Session $session -TypeObj $modelItemType).Points)
+                $ss = @((Resolve-SelectedSurfaces -Session $session -TypeObj $modelItemType).Surfaces)
+                if ($pp.Count -eq 0 -and $ss.Count -eq 0) { break }
+                if ($pp.Count -ne 1 -or $ss.Count -lt 1) {
+                    Write-Host "    Need exactly ONE datum point AND its surface selected (got $($pp.Count) point / $($ss.Count) surface). Try again." -ForegroundColor Yellow
+                    continue
+                }
+                $holePairs += [pscustomobject]@{ PointId = [int]$pp[0]; SurfaceId = [int]$ss[0] }
+                Write-Host "    + hole $($holePairs.Count): point $($pp[0]) normal to surface $($ss[0])" -ForegroundColor Green
+            }
+        } else {
+            Write-Host ""
+            Write-Host "  In Creo, select the target datum points on the blank, then press ENTER here." -ForegroundColor Cyan
+            Read-Host
+            $pres = Resolve-SelectedPoints -Session $session -TypeObj $modelItemType
+            if ($pres.Rejected.Count -gt 0) {
+                Write-Host ("  Ignored $($pres.Rejected.Count) non-point selection(s):") -ForegroundColor Yellow
+                foreach ($r in ($pres.Rejected | Select-Object -First 10)) { Write-Host "      $r" -ForegroundColor DarkGray }
+            }
+            $os = if ($surfIds.Count -ge 1) { [int]$surfIds[0] } else { 0 }
+            foreach ($p in @($pres.Points)) { $holePairs += [pscustomobject]@{ PointId = [int]$p; SurfaceId = $os } }
+        }
+
+        if ($holePairs.Count -eq 0) {
+            Write-Host "  No holes resolved from the selection - skipping drilling." -ForegroundColor Yellow
+        } else {
+            Write-Host "  Captured $($holePairs.Count) hole(s)." -ForegroundColor Green
+
+            # --- STEP 2: diameter (pre-filled from the jiginator handoff bushing OD) ---
             Write-Host ""
             $holeDia = 0.0
             while ($holeDia -le 0) {
-                $raw = Read-Host "  Hole diameter"
+                $dprompt = if ($null -ne $jigDia) { "  Hole / bushing-seat diameter [ENTER = $jigDia]" } else { "  Hole diameter" }
+                $raw = Read-Host $dprompt
+                if ([string]::IsNullOrWhiteSpace($raw) -and $null -ne $jigDia) { $holeDia = $jigDia; break }
                 $d = 0.0
                 if ([double]::TryParse(($raw.Trim()), [ref]$d) -and $d -gt 0) { $holeDia = $d }
                 else { Write-Host "  Enter a positive number." -ForegroundColor Yellow }
             }
 
-            # Orientation reference = the FIRST surface picked in STAGE 1 (normal varies
-            # across a multi-surface pick; v1 uses the first). -defaultorient skips it.
-            $orientSurf = [int]$surfIds[0]
-            $orientNote = if ($DefaultOrient) { "Creo default On-Point direction (-defaultorient)" } else { "normal to surface $orientSurf (surface pre-select - verify visually)" }
+            # Orientation note (each hole's normal-reference surface now lives in its
+            # $holePairs entry - per-hole in mode 2, the shared STAGE-1 surface in mode 1).
+            $orientNote = if ($DefaultOrient) { "Creo default On-Point direction (-defaultorient)" }
+                          elseif ($perHole)   { "normal to each hole's OWN surface (per-hole) - verify visually" }
+                          else                { "normal to surface $($surfIds[0]) (one surface for all - verify visually)" }
 
             Write-Host ""
-            Write-Host "  Ready: $($pointIds.Count) On-Point hole(s), dia $holeDia, thru all, body index $bodyIndex." -ForegroundColor Cyan
+            Write-Host "  Ready: $($holePairs.Count) On-Point hole(s), dia $holeDia, thru all, body index $bodyIndex." -ForegroundColor Cyan
             Write-Host "  Orientation: $orientNote." -ForegroundColor Cyan
             Write-Host "  Do not touch Creo while this runs." -ForegroundColor DarkGray
             $go2 = Read-Host "  Proceed? (y/N)"
@@ -755,12 +920,19 @@ if ($script:blankMade) {
                 Write-Host "  Cancelled - no holes drilled." -ForegroundColor Yellow
             } else {
                 Write-Host ""
-                $total = $pointIds.Count; $idx = 0; $holesMade = 0; $holesNoop = 0; $holesFail = 0; $holeAbort = $false
+                $total = $holePairs.Count; $idx = 0; $holesMade = 0; $holesNoop = 0; $holesFail = 0; $holeAbort = $false
                 $script:lastPct = -1
-                foreach ($ptId in $pointIds) {
+
+                # Blind-eval baseline: count cylinders at the target radius BEFORE drilling,
+                # so the AFTER-minus-BEFORE delta isolates the new bores (robust to any
+                # pre-existing same-radius geometry on the part).
+                $cylBefore = $null
+                try { $cylBefore = Count-Cylinders -Model $model -TypeObj $modelItemType -TargetRadius ($holeDia / 2.0) -RadTol 1e-3 } catch {}
+
+                foreach ($pair in $holePairs) {
                     $idx++
                     Show-Progress ([Math]::Floor(($idx / $total) * 100)) "Hole $idx/$total"
-                    $hm = Build-NormalHoleMacro -PointId $ptId -SurfaceId $orientSurf -Diameter $holeDia -BodyIndex $bodyIndex -DefaultOrient:$DefaultOrient
+                    $hm = Build-NormalHoleMacro -PointId $pair.PointId -SurfaceId $pair.SurfaceId -Diameter $holeDia -BodyIndex $bodyIndex -DefaultOrient:$DefaultOrient
                     $hchanged = $false
                     try {
                         $hstamp = $model.VersionStamp
@@ -793,15 +965,41 @@ if ($script:blankMade) {
                 Write-Host ""
                 if ($holeAbort) {
                     Write-Host "  STOPPED after the canary - inspect Creo." -ForegroundColor Red
-                } elseif ($holesMade -eq $total -and $holesFail -eq 0) {
-                    $script:holesConfirmed = $true
-                    Write-Host "  Done - $holesMade On-Point hole(s) created (model changed for each)." -ForegroundColor Green
-                    if (-not $DefaultOrient) {
-                        Write-Host "  VERIFY the holes are NORMAL to the surface visually - orientation is" -ForegroundColor DarkGray
-                        Write-Host "  the live-unverified piece (see Build-NormalHoleMacro)." -ForegroundColor DarkGray
-                    }
                 } else {
-                    Write-Host "  Finished with issues - $holesMade of $total changed the model. Inspect Creo." -ForegroundColor Yellow
+                    if ($holesMade -eq $total -and $holesFail -eq 0) {
+                        Write-Host "  All $total fire(s) changed the model. Measuring the result..." -ForegroundColor Cyan
+                    } else {
+                        Write-Host "  Finished with issues - $holesMade of $total changed the model. Measuring anyway..." -ForegroundColor Yellow
+                    }
+
+                    # BLIND-EVAL GATE: count bores at the target radius (delta vs before) and
+                    # compare to the intended hole count. This replaces "macros fired" as the
+                    # confirmation - it measures the model independently of the per-fire stamp.
+                    $cylAfter = $null
+                    try { $cylAfter = Count-Cylinders -Model $model -TypeObj $modelItemType -TargetRadius ($holeDia / 2.0) -RadTol 1e-3 } catch {}
+                    $modelName = try { [string]$model.FileName } catch { "(unknown)" }
+                    $gate = $null
+                    if ($null -ne $cylBefore -and $null -ne $cylAfter) {
+                        $gate = Invoke-JigEval -Model $model -TypeObj $modelItemType -RepoRoot $ScriptDir -JudgeCfg $judgeCfg `
+                            -IntendedCount $total -Diameter $holeDia -CylBefore $cylBefore -CylAfter $cylAfter -ModelName $modelName
+                    }
+
+                    if ($gate -eq $true) {
+                        $script:holesConfirmed = $true
+                        Write-Host "  CONFIRMED: $total bore(s) at diameter $holeDia measured on the model." -ForegroundColor Green
+                    } elseif ($null -eq $gate) {
+                        # couldn't measure (0-surface walk) - fall back to the per-fire signal, honestly labelled
+                        if ($holesMade -eq $total -and $holesFail -eq 0) {
+                            Write-Host "  Holes fired (model changed for each); bore count UNVERIFIED by measurement - verify visually." -ForegroundColor Yellow
+                        } else {
+                            Write-Host "  Finished with issues and could not measure - inspect Creo." -ForegroundColor Yellow
+                        }
+                    } else {
+                        Write-Host "  NOT confirmed: the measured bore count/diameter did not match $total hole(s) - inspect Creo." -ForegroundColor Yellow
+                    }
+                    if (-not $DefaultOrient) {
+                        Write-Host "  Orientation (normal-to-surface) is still a VISUAL check (see Build-NormalHoleMacro / --probe-orient roadmap)." -ForegroundColor DarkGray
+                    }
                 }
             }
         }

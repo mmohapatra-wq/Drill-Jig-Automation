@@ -43,15 +43,25 @@
 #     { "id":"c2", "text":"unit tests pass",
 #       "check": { "kind":"cmd", "run":"powershell -File lib/tests/run_tests.ps1",
 #                  "expectExit":0 } },
-#     { "id":"c3", "text":"the gate cannot be flipped by the LLM",
+#     { "id":"c3", "text":"cornerinator.cmd still parses",
+#       "check": { "kind":"parse", "in":"cornerinator.cmd" } },
+#     { "id":"c4", "text":"the gate cannot be flipped by the LLM",
 #       "check": { "kind":"semantic" } },
-#     { "id":"c4", "text":"holeinator drills clean holes",
+#     { "id":"c5", "text":"holeinator drills clean holes",
 #       "check": { "kind":"creo" } }
 #   ]
 # }
-# check.kind: symbol | cmd  -> deterministic floor (must pass to gate green)
-#             semantic      -> LLM-judged
-#             creo          -> behavioral; always UNVERIFIED IN CREO, never green
+# check.kind: symbol | cmd | parse  -> deterministic floor (must pass to gate green)
+#             semantic              -> LLM-judged
+#             creo                  -> behavioral; always UNVERIFIED IN CREO, never green
+#
+# 'parse' is for the toolkit's hybrid .cmd polyglots (and .ps1 modules): the
+# batch header is a PowerShell <# .. #> block comment by design, so the WHOLE
+# file parses clean as PowerShell - no header to strip, and error line numbers
+# stay true to the file. The check runs the PS language parser IN-PROCESS (no
+# subprocess, unlike 'cmd') and passes iff there are zero parse errors. This is
+# the toolkit's single most-repeated manual verification (the allowlist is full
+# of one-off PSParser/Parser invocations); 'parse' makes it a first-class claim.
 # ----------------------------------------------------------------------------
 
 # Gather the blind SLICE the judge will see: the raw diff + each cmd's result.
@@ -129,7 +139,49 @@ function Test-SymbolClaim {
 }
 
 # ----------------------------------------------------------------------------
-# Test-DeterministicFloor - run every symbol + cmd check and return the floor
+# Test-ParseClaim - DETERMINISTIC: does $In parse clean as PowerShell? This is
+# the "I edited script X and it's still syntactically valid" check, the toolkit's
+# most-repeated manual verification turned into a first-class claim.
+#
+# The hybrid .cmd polyglots parse clean WHOLE: line 1 `<# :` / line 6 `#>` make
+# the batch header a PowerShell block comment, so there is no header to strip and
+# error line numbers stay true to the file. A plain .ps1 parses the same way.
+# Uses the in-process language Parser (PS 3.0+; ParseInput gives Extent line
+# numbers) - no subprocess, so it's fast and can't be blocked by ExecutionPolicy.
+# Returns @{ Ok; ErrorCount; FirstError } where FirstError is "L<line>: <msg>" or "".
+# A missing file is Ok=$false (claiming a non-existent file parses is dishonest).
+# ----------------------------------------------------------------------------
+function Test-ParseClaim {
+    param([string]$RepoRoot, [string]$In)
+    if ([string]::IsNullOrWhiteSpace($In)) {
+        return [pscustomobject]@{ Ok = $false; ErrorCount = -1; FirstError = "parse check requires 'in' (a file path)" }
+    }
+    $target = Join-Path $RepoRoot $In
+    if (-not (Test-Path $target -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; ErrorCount = -1; FirstError = "file not found: $In" }
+    }
+    $raw = $null
+    try { $raw = Get-Content -Path $target -Raw -Encoding UTF8 } catch {
+        return [pscustomobject]@{ Ok = $false; ErrorCount = -1; FirstError = "could not read $In : $($_.Exception.Message)" }
+    }
+    $toks = $null; $errs = $null
+    try {
+        [void][System.Management.Automation.Language.Parser]::ParseInput($raw, [ref]$toks, [ref]$errs)
+    } catch {
+        return [pscustomobject]@{ Ok = $false; ErrorCount = -1; FirstError = "parser threw on $In : $($_.Exception.Message)" }
+    }
+    $n = @($errs).Count
+    $first = ""
+    if ($n -gt 0) {
+        $e0 = @($errs)[0]
+        $line = try { $e0.Extent.StartLineNumber } catch { "?" }
+        $first = "L{0}: {1}" -f $line, $e0.Message
+    }
+    return [pscustomobject]@{ Ok = ($n -eq 0); ErrorCount = $n; FirstError = $first }
+}
+
+# ----------------------------------------------------------------------------
+# Test-DeterministicFloor - run every symbol + cmd + parse check and return the floor
 # result. This is the GATE for mechanically-checkable claims; the LLM cannot
 # override it. Returns @{ AllPassed; Results[] } where each result is
 # @{ id; text; kind; ok; detail }.
@@ -157,6 +209,15 @@ function Test-DeterministicFloor {
             $got = if ($null -ne $cr) { $cr.exit } else { "(not run)" }
             $results += [pscustomobject]@{ id=$c.id; text=$c.text; kind="cmd"; ok=$ok;
                 detail=("`{0}` exit {1} (want {2})" -f $c.check.run, $got, $want) }
+        }
+        elseif ($kind -eq "parse") {
+            $in = if ($null -ne $c.check.in) { [string]$c.check.in } else { "" }
+            $r = Test-ParseClaim -RepoRoot $RepoRoot -In $in
+            if (-not $r.Ok) { $all = $false }
+            $detail = if ($r.Ok) { "$in parses clean" }
+                      elseif ($r.ErrorCount -gt 0) { "$in has $($r.ErrorCount) parse error(s): $($r.FirstError)" }
+                      else { $r.FirstError }
+            $results += [pscustomobject]@{ id=$c.id; text=$c.text; kind="parse"; ok=$r.Ok; detail=$detail }
         }
     }
     return [pscustomobject]@{ AllPassed = $all; Results = $results }

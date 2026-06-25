@@ -120,6 +120,65 @@ $floorExit = Test-DeterministicFloor -RepoRoot $repo -Claims $claimsExit -Slice 
 Assert-True "floor FAILS when a cmd exits non-zero vs expectExit" (-not $floorExit.AllPassed)
 
 # ---------------------------------------------------------------------------
+# Test-ParseClaim - the deterministic "this script still parses" check.
+# mod.ps1 is valid; write a broken .ps1 and a .cmd polyglot fixture to prove
+# (a) a real syntax error fails with a line number, and (b) the hybrid header
+# (a <# .. #> block comment) lets the WHOLE .cmd parse clean - no strip needed.
+# ---------------------------------------------------------------------------
+Write-Host "  -- Test-ParseClaim --" -ForegroundColor White
+
+$r = Test-ParseClaim -RepoRoot $repo -In "mod.ps1"
+Assert-True "a valid .ps1 parses clean" ($r.Ok -and $r.ErrorCount -eq 0)
+
+# broken PowerShell: unterminated hash literal
+Set-Content -Path (Join-Path $repo 'broken.ps1') -Encoding UTF8 -Value @"
+function Ok-Thing { 'fine' }
+`$x = @{ unterminated =
+"@
+$r = Test-ParseClaim -RepoRoot $repo -In "broken.ps1"
+Assert-True "a syntax error fails the parse check" (-not $r.Ok -and $r.ErrorCount -ge 1)
+Assert-True "the parse failure reports a line number" ($r.FirstError -match "^L\d+:")
+
+# a .cmd polyglot: batch header is a PowerShell <# .. #> block comment, so the
+# whole file parses clean as PowerShell with NO header stripping.
+$cmdBody = "<# :`r`n@echo off`r`nsetlocal`r`npowershell -ExecutionPolicy Bypass -NoProfile -Command `"& ([scriptblock]::Create((Get-Content -Raw '%~f0')))`"`r`nexit /b %errorlevel%`r`n#>`r`n`r`n`$ScriptDir = 'x'`r`nWrite-Host `"hello `$ScriptDir`"`r`n"
+Set-Content -Path (Join-Path $repo 'polyglot.cmd') -Encoding UTF8 -Value $cmdBody -NoNewline
+$r = Test-ParseClaim -RepoRoot $repo -In "polyglot.cmd"
+Assert-True "a hybrid .cmd polyglot parses clean WHOLE (header is a block comment)" ($r.Ok -and $r.ErrorCount -eq 0)
+
+# a broken .cmd: valid header + a syntax error in the PS body still fails
+$cmdBad = "<# :`r`n@echo off`r`n#>`r`n`r`nfunction Bad {`r`n  `$h = @{ x =`r`n"
+Set-Content -Path (Join-Path $repo 'polyglot_bad.cmd') -Encoding UTF8 -Value $cmdBad -NoNewline
+$r = Test-ParseClaim -RepoRoot $repo -In "polyglot_bad.cmd"
+Assert-True "a .cmd with a broken PS body fails the parse check" (-not $r.Ok -and $r.ErrorCount -ge 1)
+
+# missing file: a claim that a non-existent file parses is dishonest -> fail
+$r = Test-ParseClaim -RepoRoot $repo -In "does_not_exist.ps1"
+Assert-True "parse check fails (not throws) on a missing file" (-not $r.Ok)
+Assert-True "missing-file detail says so" ($r.FirstError -match "not found")
+
+# empty 'in' -> fail with a helpful message
+$r = Test-ParseClaim -RepoRoot $repo -In ""
+Assert-True "parse check fails when 'in' is empty" (-not $r.Ok -and $r.FirstError -match "requires 'in'")
+
+# integration: the floor runs a parse check and gates on it
+$claimsParse = @(
+    [pscustomobject]@{ id="p1"; text="mod.ps1 parses";    check=[pscustomobject]@{ kind="parse"; in="mod.ps1" } },
+    [pscustomobject]@{ id="p2"; text="polyglot parses";   check=[pscustomobject]@{ kind="parse"; in="polyglot.cmd" } }
+)
+$sliceParse = Get-ResponseSlice -RepoRoot $repo -BaseRef "" -Claims $claimsParse
+$floorParse = Test-DeterministicFloor -RepoRoot $repo -Claims $claimsParse -Slice $sliceParse
+Assert-True "floor passes when all parse claims are clean" ($floorParse.AllPassed)
+Assert-True "floor records the parse kind in its results" (@($floorParse.Results | Where-Object { $_.kind -eq 'parse' }).Count -eq 2)
+
+$claimsParseBad = @(
+    [pscustomobject]@{ id="p1"; text="broken parses"; check=[pscustomobject]@{ kind="parse"; in="broken.ps1" } }
+)
+$sliceParseBad = Get-ResponseSlice -RepoRoot $repo -BaseRef "" -Claims $claimsParseBad
+$floorParseBad = Test-DeterministicFloor -RepoRoot $repo -Claims $claimsParseBad -Slice $sliceParseBad
+Assert-True "floor FAILS a parse claim on a broken file" (-not $floorParseBad.AllPassed)
+
+# ---------------------------------------------------------------------------
 # Blind prompt shaping: judge sees the diff, NOT agent prose
 # ---------------------------------------------------------------------------
 Write-Host "  -- Get-ResponseJudgeMessages (blind) --" -ForegroundColor White

@@ -11,10 +11,24 @@ exit /b %errorlevel%
 # One end-to-end run of the whole drill-jig flow, in a single console session
 # and a SINGLE Creo connection:
 #
-#   STAGE 1  walk the decision tree (no Creo)        -> resolves the hole OD
-#   STAGE 2  build a parametric box from offset planes (plane-probe v2)
-#   STAGE 3  drill an On-Point hole at every target datum point (holeinator),
-#            using the diameter from STAGE 1
+#   STAGE 1   walk the decision tree (no Creo)        -> resolves the hole OD
+#   (GUI)     (optional) right after the tree, lay out an orthogrid hole pattern
+#             in a WinForms editor, pre-filled with the tree's hole Ø + depth as
+#             read-only context. Captures the spec only; no Creo yet.
+#   STAGE 2   build a parametric box from offset planes (plane-probe v2). When a
+#             pattern was captured, TOP offset = plate width and FRONT offset =
+#             plate height come straight from the GUI (SIDE = bushing length).
+#             Auto-mapped planes build the box with no prompts.
+#   STAGE 2.5 (orthogrid mode) you create ONE seed datum point at the grid corner;
+#             the grid is made later by PATTERNING THE HOLE (STAGE 5), not by
+#             patterning points. If no clean seed, STAGE 3 picks points instead.
+#   STAGE 3   drill an On-Point hole on the seed point (or every selected point),
+#             diameter from STAGE 1; capture the new hole feature id.
+#   STAGE 4   (metal: ask / 3DP: auto) add a coaxial chip-relief hole on the same
+#             point(s); capture the new relief feature id.
+#   STAGE 5   (orthogrid mode) Direction-pattern the hole (+ relief) feature(s)
+#             into the Nx x Nz grid (TOP x Nx @ CcX, FRONT x Nz @ CcZ); canary-
+#             gated, with a printed manual Edit > Pattern fallback.
 #
 # This is a MERGE of three working tools (jiginator.cmd / plane-probe.cmd /
 # holeinator.cmd). Those three are LEFT UNTOUCHED and still run standalone. The
@@ -25,10 +39,13 @@ exit /b %errorlevel%
 #   - the tree is walked ONCE (jiginator's "run again?" loop is dropped);
 #   - only one press-any-key at the very end.
 #
-# DATUM POINTS: this prototype assumes the target datum points ALREADY EXIST in
-# the CAD file (placed on another plane). STAGE 3 just selects them - no point
-# generation. Open the jig PART (not the .asm) with its default datum planes
-# (FRONT/RIGHT/TOP) plus the pre-placed datum points before running.
+# DATUM POINTS: STAGE 2.5 can GENERATE the target datum points as an orthogrid
+# (a regular Nx x Nz grid laid out from the box's TOP/FRONT datums on the SIDE
+# face). If you skip STAGE 2.5, the prototype falls back to its original
+# assumption -- the target datum points ALREADY EXIST in the CAD file and STAGE 3
+# just selects them. Open the jig PART (not the .asm) with its default datum
+# planes (FRONT/RIGHT/TOP); pre-placed datum points are only needed when you skip
+# the STAGE 2.5 grid generation.
 #
 # Provenance of the lifted logic (do not "improve" during the merge):
 #   - jiginator helpers + tree walk (jiginator.cmd)
@@ -43,6 +60,7 @@ $ErrorActionPreference = "Stop"
 # --probe-judge : validate the BlueGPT REST judge round-trip (endpoint + auth)
 # with a synthetic packet, then exit. No Creo connection, no model touched.
 $ProbeJudge = ($ScriptArgs -match '(?i)(^|\s)-{1,2}probe-judge(\s|$)')
+
 
 trap {
     Write-Host ""
@@ -477,6 +495,19 @@ function Get-FeatureIdSet {
     return $set
 }
 
+# Diff the current ITEM_FEATURE set against a prior Get-FeatureIdSet snapshot and
+# return the @(new int feature ids), sorted ascending. Used to capture the hole /
+# relief feature ids just created (STAGE 3/4) so STAGE 5 can pattern them.
+function Resolve-NewFeatureIds {
+    param($Model, $TypeObj, $Before)
+    $after = Get-FeatureIdSet -Model $Model -TypeObj $TypeObj
+    $new = @()
+    foreach ($id in $after.Keys) {
+        if (-not $Before.ContainsKey($id)) { $new += [int]$id }
+    }
+    return @($new | Sort-Object)
+}
+
 # Read the (last) selected feature ID from Creo's selection buffer, or $null.
 function Read-SelectedId {
     $contents = ($session.CurrentSelectionBuffer()).Contents
@@ -743,20 +774,49 @@ function Wait-ModelModified {
 # RunMacro -- a dashboard's command context does not survive across RunMacro
 # calls (CLAUDE.md boxinator lesson). `~ Trail`/`~ Timer` recording noise dropped.
 function Build-HoleMacro {
-    param([int]$PointId, [double]$Diameter, [int]$BodyIndex = 0)
-    return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
-        # select the target datum point by ID
-        "~ Command ``ProCmdMdlTreeSearch``;" +
-        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
-        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
-        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
-        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
-        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
-        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
-        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
-        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+    param([int]$PointId, [double]$Diameter, [int]$BodyIndex = 0, [int]$SurfacePlaneId = 0)
+    # For intersection-of-3-planes points (orthogrid mode), Creo can't auto-infer
+    # the placement surface. Fix: pre-select the SIDE base datum (type DATUM) as
+    # the placement surface, THEN the point (type Point, -NoClear to accumulate).
+    # ProCmdHole receives both → On Point with surface pre-filled. For holeinator-
+    # style points (already on a surface), pass SurfacePlaneId=0 → point-only.
+    $sel = ""
+    if ($SurfacePlaneId -gt 0) {
+        # Clean buffer FIRST (stale refs from prior ops cause Linear mode), then
+        # surface (Datum-typed tree search), then Point (accumulated, no buffer_clean).
+        $sel = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+            (Get-SelectDatumByIdMacro -FeatId $SurfacePlaneId) +
+            "~ Command ``ProCmdMdlTreeSearch``;" +
+            "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+            "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
+            "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+            "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+            "~ Activate ``selspecdlg0`` ``CancelButton``;"
+    } else {
+        # Original holeinator: point-only (surface auto-inferred from point's association).
+        $sel = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+            "~ Command ``ProCmdMdlTreeSearch``;" +
+            "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+            "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
+            "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+            "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+            "~ Activate ``selspecdlg0`` ``CancelButton``;"
+    }
+    # Flip the drill direction when a surface plane was pre-selected (orthogrid mode).
+    $flip = ""
+    if ($SurfacePlaneId -gt 0) {
+        $flip = "~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;"
+    }
+    return $sel +
         # hole dashboard (recorded)
         "~ Command ``ProCmdHole``;" +
+        $flip +
         # depth -> through all (open the depth-type flyout, pick Thru All)
         "~ Select ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
         "~ Close  ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
@@ -805,21 +865,43 @@ function Build-HoleMacro {
 # through-holes set their diameter through it correctly.)
 # ----------------------------------------------------------------------------
 function Build-ReliefHoleMacro {
-    param([int]$PointId, [double]$Diameter, [int]$BodyIndex = 0)
+    param([int]$PointId, [double]$Diameter, [int]$BodyIndex = 0, [int]$SurfacePlaneId = 0)
     $blindDepthType = "StrHoleDepBlindF"   # CONFIRMED live (trail.txt.3 2026-06-22)
-    return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
-        # select the target datum point by ID (identical to the through-hole macro)
-        "~ Command ``ProCmdMdlTreeSearch``;" +
-        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
-        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
-        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
-        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
-        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
-        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
-        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
-        "~ Activate ``selspecdlg0`` ``CancelButton``;" +
+    # Same surface+point selection logic as Build-HoleMacro (see its comment).
+    $sel = ""
+    if ($SurfacePlaneId -gt 0) {
+        # Clean buffer FIRST (stale refs cause Linear mode), then surface + point.
+        $sel = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+            (Get-SelectDatumByIdMacro -FeatId $SurfacePlaneId) +
+            "~ Command ``ProCmdMdlTreeSearch``;" +
+            "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+            "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
+            "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+            "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+            "~ Activate ``selspecdlg0`` ``CancelButton``;"
+    } else {
+        $sel = "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
+            "~ Command ``ProCmdMdlTreeSearch``;" +
+            "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+            "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+            "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$PointId``;" +
+            "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+            "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+            "~ Activate ``selspecdlg0`` ``CancelButton``;"
+    }
+    $flip = ""
+    if ($SurfacePlaneId -gt 0) {
+        $flip = "~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;"
+    }
+    return $sel +
         # hole dashboard
         "~ Command ``ProCmdHole``;" +
+        $flip +
         # depth-type -> BLIND (creates a drivable depth dim; value set after regen)
         "~ Select ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
         "~ Close  ``main_dlg_cur`` ``maindashInst0.hole_depth_to_type_flybtn``;" +
@@ -894,6 +976,16 @@ Write-Host ""
 # ============================================================================
 . (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
 . (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')
+# hands-free edge rounding (sweep GetItemById -> filter by EvalLength -> AddSelection
+# -> round; NO find tool). Used right after the STAGE 2 box build to round corners.
+. (Join-Path $ScriptDir 'lib\edge_round.ps1')
+# STAGE 2.5 orthogrid: grid MATH (pure), the WinForms editor, and the datum-point
+# grid creation/resolution. _gui needs _math (Get-OrthogridGeometry) in scope;
+# _points' Build-PointGridMacro calls Get-SelectByIdMacro (defined below in this
+# file) at fire time -- dot-sourcing shares one scope, so the order here is fine.
+. (Join-Path $ScriptDir 'lib\orthogrid.ps1')
+. (Join-Path $ScriptDir 'lib\orthogrid_gui.ps1')
+. (Join-Path $ScriptDir 'lib\orthogrid_points.ps1')
 
 # --probe-judge: validate the REST judge in isolation, then exit (no Creo).
 if ($ProbeJudge) {
@@ -990,6 +1082,38 @@ if ($is3dPrint) {
 }
 
 # ============================================================================
+# ORTHOGRID PATTERN (GUI) -- right after the decision tree, BEFORE Creo.
+# ============================================================================
+# The orthogrid editor is pure WinForms (no Creo), so it runs here while the
+# tree's numbers are fresh and BEFORE we connect/build the box. It only CAPTURES
+# the pattern spec ($orthoGeo); the datum points are CREATED later in STAGE 2.5,
+# once the box + its TOP/SIDE/FRONT datums exist. The decision-tree hole diameter
+# ($holeDia), the chip-relief diameter (= hole x RELIEF_DIA_MULT, the WIDEST
+# feature), and bushing length / drill depth ($bushingLen) are passed in as
+# read-only context. The relief dia ALSO sizes the plate (Show-OrthogridDialog
+# feeds it to Get-OrthogridGeometry as -ClearDia), so the box Width/Height clears
+# the relief circle at the border -- the operator no longer hand-adds the hole dia.
+# RELIEF_DIA_MULT is defined ONCE here and reused by STAGE 4. Answer 'n' (or cancel
+# the dialog) to skip -- STAGE 3 then uses hand-selected points.
+$RELIEF_DIA_MULT = 1.5
+$reliefDiaForGui = 0.0
+if ($null -ne $holeDia -and [double]$holeDia -gt 0) { $reliefDiaForGui = [Math]::Round([double]$holeDia * $RELIEF_DIA_MULT, 4) }
+$orthoGeo = $null
+$useOrtho = Read-Host "  Lay out an orthogrid hole pattern now? (Y/n)"
+if ($useOrtho -match '^[Nn]') {
+    Write-Host "  Skipping the orthogrid - STAGE 3 will use hand-selected pre-existing points." -ForegroundColor DarkGray
+} else {
+    try { $orthoGeo = Show-OrthogridDialog -HoleDiameter $holeDia -ReliefDiameter $reliefDiaForGui -Thickness $bushingLen } catch { $orthoGeo = $null }
+    if ($null -eq $orthoGeo) {
+        Write-Host "  Orthogrid editor cancelled (or unavailable) - STAGE 3 will use hand-selected points." -ForegroundColor Yellow
+    } else {
+        Write-Host ("  Grid captured: {0} holes, part {1:0.00} x {2:0.00} (Nx={3}, Nz={4}, cc {5}x{6}, edge {7}, relief-clear {8}). Points created in STAGE 2.5/5." -f `
+            $orthoGeo.Count, $orthoGeo.Width, $orthoGeo.Height, $orthoGeo.Nx, $orthoGeo.Nz, $orthoGeo.CcX, $orthoGeo.CcZ, $orthoGeo.Edge, $orthoGeo.ClearDia) -ForegroundColor Green
+    }
+}
+Write-Host ""
+
+# ============================================================================
 # CONNECT ONCE (single session) -- wraps STAGES 2 + 3
 # ============================================================================
 # Resolve the judge config once up front. $null is fine - the evaluator then just
@@ -1078,15 +1202,30 @@ $planes = @(
     [pscustomobject]@{ Label = "Front"; Hint = "FRONT"; Offset = 0.0; Sym = $null; BaseId = $null; FeatId = $null }
 )
 
-# The SIDE plane offset is the box LENGTH and is fixed by the decision tree =
-# the selected bushing/sleeve length ($bushingLen). It is NOT prompted for when
-# the tree resolved a length; the user only enters TOP (height) and FRONT (depth).
-# If the tree gave no length, SIDE falls back to a manual prompt like the others.
-Write-Host "  Enter the box offsets (blank/0 -> 1.0 so each has a drivable dim):" -ForegroundColor Cyan
+# Plane-offset sources, in priority order:
+#   * SIDE  = box LENGTH, fixed by the decision tree = the bushing/sleeve length
+#             ($bushingLen). Not prompted when the tree resolved a length.
+#   * TOP   = plate WIDTH  and  FRONT = plate HEIGHT, taken from the orthogrid GUI
+#             ($orthoGeo) when a pattern was laid out -- the plate is sized to hold
+#             the grid, so the box face dims ARE the grid's plate extents. Per the
+#             grid contract X/Width runs along TOP and Z/Height along FRONT, so
+#             TOP<-Width, FRONT<-Height. Not prompted when $orthoGeo is present.
+#   * anything still unset -> manual prompt (blank/0 -> 1.0 so it has a drivable dim).
+Write-Host "  Box offsets:" -ForegroundColor Cyan
 foreach ($p in $planes) {
     if ($p.Label -eq "Side" -and $null -ne $bushingLen) {
         $p.Offset = [double]$bushingLen
-        Write-Host ("    Side plane offset (box length) = {0} (from the bushing length; not asked)" -f $bushingLen) -ForegroundColor Green
+        Write-Host ("    SIDE offset (box length) = {0} (from the bushing length; not asked)" -f $bushingLen) -ForegroundColor Green
+        continue
+    }
+    if ($p.Label -eq "Top" -and $null -ne $orthoGeo) {
+        $p.Offset = [double]$orthoGeo.Width
+        Write-Host ("    TOP offset (plate width)  = {0} (from the orthogrid plate; not asked)" -f $p.Offset) -ForegroundColor Green
+        continue
+    }
+    if ($p.Label -eq "Front" -and $null -ne $orthoGeo) {
+        $p.Offset = [double]$orthoGeo.Height
+        Write-Host ("    FRONT offset (plate height) = {0} (from the orthogrid plate; not asked)" -f $p.Offset) -ForegroundColor Green
         continue
     }
     $raw = Read-Host "    $($p.Label) plane offset (from $($p.Hint))"
@@ -1142,14 +1281,11 @@ if ($picks.Count -gt 0) {
             Write-Host ("      {0,-5} ({1,-12}) = datum id {2}" -f $p.Hint, $dim, $p.BaseId) -ForegroundColor White
         }
         Write-Host "  SIDE also becomes the sketch plane + extrude-to reference (hands-free box build)." -ForegroundColor DarkGray
-        Write-Host ""
-        $ans = Read-Host "  Accept this mapping? (ENTER/Y to accept, N to pick planes one at a time)"
-        if ($ans -notmatch '^[Nn]$') {
-            $autoMapped = $true
-        } else {
-            foreach ($p in $planes) { $p.BaseId = $null }   # clear so the fallback re-captures cleanly
-            Write-Host "  Mapping rejected - falling back to one-click-per-plane." -ForegroundColor Yellow
-        }
+        # Clean, unambiguous all-three mapping by name -> proceed automatically (no
+        # accept prompt). The ambiguous cases below (conflict / missing role / empty
+        # buffer) still fall back to one-click-per-plane.
+        $autoMapped = $true
+        Write-Host "  Proceeding with this mapping automatically." -ForegroundColor DarkGray
     } else {
         Write-Host ""
         if ($conflict) {
@@ -1227,8 +1363,16 @@ $sidePlane = if ($sidePlane.Count -gt 0) { $sidePlane[0] } else { $null }
 
 $sketchPlaneId = $null
 $script:buildConfirmed = $null
-Write-Host "  Build the box now? (Extrude-first, internal sketch; og -> offset direction)" -ForegroundColor Cyan
-$doBox = Read-Host "    (y to create the box, anything else to skip and go straight to resize)"
+# Auto-build when the planes were cleanly auto-mapped by name (no prompt - the box
+# build is hands-free in that case). Only ask when we fell back to manual plane
+# picking, where the user may want to skip straight to resize.
+if ($autoMapped) {
+    $doBox = "y"
+    Write-Host "  Building the box automatically (planes mapped by name; extrude-first, internal sketch)..." -ForegroundColor Cyan
+} else {
+    Write-Host "  Build the box now? (Extrude-first, internal sketch; og -> offset direction)" -ForegroundColor Cyan
+    $doBox = Read-Host "    (y to create the box, anything else to skip and go straight to resize)"
+}
 if ($doBox.Trim().ToUpper() -eq "Y") {
     if ($null -eq $sidePlane) {
         Write-Host "  No SIDE plane was created, so there is nothing to build against. Skipping box." -ForegroundColor Yellow
@@ -1336,9 +1480,15 @@ if ($doBox.Trim().ToUpper() -eq "Y") {
 }
 
 # --- RESIZE LOOP -- A = all three, 1..N = one plane, D/blank = done (-> STAGE 3) ---
+# In orthogrid mode, the box was sized from the GUI's plate dimensions -- skip the
+# resize loop entirely (no manual adjustments needed).
+if ($null -ne $orthoGeo) {
+    Write-Host "  Resize loop skipped (box sized by orthogrid plate dimensions)." -ForegroundColor DarkGray
+} else {
 Write-Host "  Resize loop (optional - adjust the box before drilling):" -ForegroundColor Cyan
 Write-Host "    A = set ALL three (resize the box),  1-$($made.Count) = one plane,  D/blank = done -> drill" -ForegroundColor White
-while ($true) {
+}
+while ($null -eq $orthoGeo) {
     $cmd = Read-Host "  Command (A / 1-$($made.Count) / D)"
     if ([string]::IsNullOrWhiteSpace($cmd) -or $cmd.Trim().ToUpper() -eq "D") {
         Write-Host "  Done resizing - moving to drilling." -ForegroundColor Cyan
@@ -1394,6 +1544,125 @@ while ($true) {
 Write-Host ""
 
 # ============================================================================
+# STAGE 2.5 -- ORTHOGRID DATUM-POINT GRID (plane intersections, all by ID)
+# ============================================================================
+# Programmatic creation of every grid point via the PROVEN 3-plane-intersection
+# recipe (point-probe.cmd, confirmed live 2026-06-24): for each grid position, the
+# point = intersection of (SIDE offset face) + (an X-offset plane from TOP) + (a
+# Z-offset plane from FRONT). Planes are SHARED (1 face + Nx X-planes + Nz Z-planes
+# → Nx·Nz intersection points). ALL widgets confirmed live; NO screen picks; each
+# RunMacro is atomic + independent (no dashboard-survival issue). Each coordinate is
+# a drivable feature-level offset dim → fully parametric. Completely replaces the
+# broken pattern approach and the manual seed-pick step.
+# If the plane/point creation fails, falls back to Invoke-ManualPointGrid (user
+# creates + selects all points by hand). Never drills a zero-point "Done".
+$gridPointIDs = @()
+if ($null -ne $orthoGeo) {
+    Write-Host "  ====================================================================" -ForegroundColor Cyan
+    Write-Host "   STAGE 2.5 - create all $($orthoGeo.Count) datum points (plane intersections)" -ForegroundColor Cyan
+    Write-Host "  ====================================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host ("  Grid: {0} points, plate {1:0.00} x {2:0.00} (Nx={3}, Nz={4}, cc {5}x{6})." -f `
+        $orthoGeo.Count, $orthoGeo.Width, $orthoGeo.Height, $orthoGeo.Nx, $orthoGeo.Nz, $orthoGeo.CcX, $orthoGeo.CcZ) -ForegroundColor Green
+
+    # Base datum ids for the offset planes (already captured in STAGE 2).
+    $topBaseId   = ($planes | Where-Object { $_.Label -eq "Top"   } | Select-Object -First 1).BaseId
+    $frontBaseId = ($planes | Where-Object { $_.Label -eq "Front" } | Select-Object -First 1).BaseId
+    # The SIDE offset plane = the face all points sit on (from STAGE 2 box build).
+    # Use the SIDE BASE datum (og/default) for point intersection. Points sit on the
+    # body's starting face so "On Point" holes work. ClearDia only widens the plate,
+    # does NOT shift the point positions (the inset fix), so dimensions are correct.
+    $facePlaneId = if ($null -ne $sidePlane -and $null -ne $sidePlane.BaseId) { [int]$sidePlane.BaseId } else { $null }
+
+    $canAutoGrid = ($null -ne $topBaseId -and $null -ne $frontBaseId -and $null -ne $facePlaneId)
+    if (-not $canAutoGrid) {
+        Write-Host "  Missing base datum or SIDE offset plane - cannot auto-create the grid." -ForegroundColor Yellow
+        Write-Host "  Falling back to the manual path (you create + select all points by hand)." -ForegroundColor Yellow
+    } else {
+        Write-Host "  Creating Nx=$($orthoGeo.Nx) X-planes + Nz=$($orthoGeo.Nz) Z-planes + $($orthoGeo.Count) intersection points..." -ForegroundColor Cyan
+        Write-Host "  (All by ID, no picks, no pattern - fully automatic.)" -ForegroundColor DarkGray
+        $ok = $true
+
+        # 1. Create Nx X-offset planes (offset from TOP base by each X coord).
+        $xPlaneIds = @()
+        $xCoords = @(0..($orthoGeo.Nx - 1) | ForEach-Object { [double]$orthoGeo.Points[$_ * $orthoGeo.Nz].X })
+        foreach ($xOff in $xCoords) {
+            $res = New-OffsetPlane -Model $model -TypeObj $pfcType -Label "X$($xPlaneIds.Count)" -Offset $xOff -BaseId ([int]$topBaseId)
+            if ($null -eq $res.FeatId) { Write-Host "  X-plane at offset $xOff FAILED." -ForegroundColor Red; $ok = $false; break }
+            $xPlaneIds += [int]$res.FeatId
+        }
+        if ($ok) { Write-Host ("  {0} X-planes created." -f $xPlaneIds.Count) -ForegroundColor DarkGray }
+
+        # 2. Create Nz Z-offset planes (offset from FRONT base by each Z coord).
+        $zPlaneIds = @()
+        if ($ok) {
+            $zCoords = @(0..($orthoGeo.Nz - 1) | ForEach-Object { [double]$orthoGeo.Points[$_].Z })
+            foreach ($zOff in $zCoords) {
+                $res = New-OffsetPlane -Model $model -TypeObj $pfcType -Label "Z$($zPlaneIds.Count)" -Offset $zOff -BaseId ([int]$frontBaseId)
+                if ($null -eq $res.FeatId) { Write-Host "  Z-plane at offset $zOff FAILED." -ForegroundColor Red; $ok = $false; break }
+                $zPlaneIds += [int]$res.FeatId
+            }
+            if ($ok) { Write-Host ("  {0} Z-planes created." -f $zPlaneIds.Count) -ForegroundColor DarkGray }
+        }
+
+        # 3. Create Nx·Nz intersection points: each = face ∩ X-plane[I] ∩ Z-plane[J].
+        if ($ok) {
+            $beforePts = Get-PointIdSet -Model $model -TypeObj $pfcType
+            $ptOk = $true
+            $ptIdx = 0
+            foreach ($pt in $orthoGeo.Points) {
+                $ptIdx++
+                Show-Progress ([Math]::Floor(($ptIdx / $orthoGeo.Count) * 100)) "Point $ptIdx/$($orthoGeo.Count)"
+                $macro = Build-IntersectPointMacro -PlaneIds @([int]$facePlaneId, [int]$xPlaneIds[$pt.I], [int]$zPlaneIds[$pt.J])
+                try { $session.RunMacro($macro) } catch {
+                    Write-Host "  Point $ptIdx macro errored: $($_.Exception.Message)" -ForegroundColor Red
+                    $ptOk = $false; break
+                }
+            }
+            Show-Progress 100 "Done"
+            $newIds = Resolve-NewPointIds -Model $model -TypeObj $pfcType -Before $beforePts
+            if ($newIds.Count -eq $orthoGeo.Count) {
+                $gridPointIDs = @($newIds)
+                Write-Host ("  All {0} datum points created. IDs: {1}" -f $newIds.Count, (($newIds | Select-Object -First 10) -join ", ")) -ForegroundColor Green
+            } else {
+                Write-Host ("  Point-count MISMATCH: expected {0}, got {1}. Some intersections may have failed." -f $orthoGeo.Count, $newIds.Count) -ForegroundColor Yellow
+                if ($newIds.Count -gt 0) { $gridPointIDs = @($newIds) }  # use what we have
+                $ok = $false
+            }
+        }
+
+        if (-not $ok) {
+            Write-Host "  Auto grid creation had issues. Falling back to manual point selection." -ForegroundColor Yellow
+            if ($gridPointIDs.Count -eq 0) {
+                $gridPointIDs = @(Invoke-ManualPointGrid -Geo $orthoGeo -Session $session -TypeObj $pfcType)
+            }
+        }
+    }
+
+    if ($gridPointIDs.Count -gt 0) {
+        Write-Host ("  Orthogrid ready: {0} point(s) for STAGE 3 drilling." -f $gridPointIDs.Count) -ForegroundColor Green
+    } else {
+        if (-not $canAutoGrid) {
+            $gridPointIDs = @(Invoke-ManualPointGrid -Geo $orthoGeo -Session $session -TypeObj $pfcType)
+        }
+        if ($gridPointIDs.Count -eq 0) {
+            Write-Host "  No orthogrid points captured - STAGE 3 will fall back to a manual selection." -ForegroundColor Yellow
+        }
+    }
+    Write-Host ""
+
+    # Regenerate the model after creating the planes + points so Creo recognizes
+    # them as valid hole-placement references. Without this, ProCmdHole may not
+    # "see" the just-created datum points (they exist in the feature tree but the
+    # model geometry isn't committed). This matches holeinator's assumption that
+    # points PRE-EXIST before drilling starts.
+    if ($gridPointIDs.Count -gt 0) {
+        Write-Host "  Regenerating model (commit all new planes + points before drilling)..." -ForegroundColor DarkGray
+        try { $model.Regenerate($null) } catch {}
+    }
+}
+
+# ============================================================================
 # STAGE 3 -- DRILL HOLES (holeinator) at the diameter from STAGE 1
 # ============================================================================
 Write-Host "  ====================================================================" -ForegroundColor Cyan
@@ -1401,57 +1670,64 @@ Write-Host "   STAGE 3 - drill an On-Point hole at every target datum point" -Fo
 Write-Host "  ====================================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# --- STEP 1: user selects the PRE-EXISTING datum points ---
-Write-Host "  STEP 1 -- In Creo, select the target datum points (they already exist" -ForegroundColor Cyan
-Write-Host "           in the part, on another plane), then press ENTER here." -ForegroundColor Cyan
-Read-Host
-$points = ($session.CurrentSelectionBuffer()).Contents
-if ($null -eq $points) { throw "Selection buffer is empty -- no datum points selected in Creo." }
-
-# Resolve selections into POINT IDs only (never reads .Point coordinates).
+# --- STEP 1: target datum points ---
+# Prefer the orthogrid grid created in STAGE 2.5 (all Nx·Nz points, no pattern);
+# otherwise fall back to selecting pre-existing datum points.
 $pointIDs = @()
-$seen = @{}
-$rejected = @()
-foreach ($item in $points) {
-    $si = $null
-    try { $si = $item.SelItem } catch { continue }
-    if ($null -eq $si) { continue }
+if ($gridPointIDs.Count -gt 0) {
+    $pointIDs = @($gridPointIDs)
+    Write-Host ("  STEP 1 -- using the {0} orthogrid point id(s) from STAGE 2.5: {1}" -f $pointIDs.Count, (($pointIDs | Select-Object -First 10) -join ", ")) -ForegroundColor Green
+} else {
+    Write-Host "  STEP 1 -- In Creo, select the target datum points (they already exist" -ForegroundColor Cyan
+    Write-Host "           in the part, on another plane), then press ENTER here." -ForegroundColor Cyan
+    Read-Host
+    $points = ($session.CurrentSelectionBuffer()).Contents
+    if ($null -eq $points) { throw "Selection buffer is empty -- no datum points selected in Creo." }
 
-    $isPointType = $false
-    try { $isPointType = ([int]$si.Type -eq [int]$pfcType.ITEM_POINT) } catch {}
+    # Resolve selections into POINT IDs only (never reads .Point coordinates).
+    $seen = @{}
+    $rejected = @()
+    foreach ($item in $points) {
+        $si = $null
+        try { $si = $item.SelItem } catch { continue }
+        if ($null -eq $si) { continue }
 
-    $subIds = @()
-    try {
-        foreach ($pt in @($si.ListSubItems($pfcType.ITEM_POINT))) {
-            try { $subIds += [int]$pt.Id } catch {}
+        $isPointType = $false
+        try { $isPointType = ([int]$si.Type -eq [int]$pfcType.ITEM_POINT) } catch {}
+
+        $subIds = @()
+        try {
+            foreach ($pt in @($si.ListSubItems($pfcType.ITEM_POINT))) {
+                try { $subIds += [int]$pt.Id } catch {}
+            }
+        } catch {}
+
+        if ($subIds.Count -gt 0) {
+            # a feature that contains points -> use the contained point ids
+            foreach ($sid in $subIds) {
+                if (-not $seen.ContainsKey($sid)) { $seen[$sid] = $true; $pointIDs += $sid }
+            }
+        } elseif ($isPointType) {
+            # the selection IS a datum point -> use its id
+            $id = [int]$si.Id
+            if (-not $seen.ContainsKey($id)) { $seen[$id] = $true; $pointIDs += $id }
+        } else {
+            $tname = "?"; $rid = "?"
+            try { $rid = [int]$si.Id } catch {}
+            try { $tname = [string]$si.Type } catch {}
+            $rejected += "id $rid (type $tname)"
         }
-    } catch {}
-
-    if ($subIds.Count -gt 0) {
-        # a feature that contains points -> use the contained point ids
-        foreach ($sid in $subIds) {
-            if (-not $seen.ContainsKey($sid)) { $seen[$sid] = $true; $pointIDs += $sid }
-        }
-    } elseif ($isPointType) {
-        # the selection IS a datum point -> use its id
-        $id = [int]$si.Id
-        if (-not $seen.ContainsKey($id)) { $seen[$id] = $true; $pointIDs += $id }
-    } else {
-        $tname = "?"; $rid = "?"
-        try { $rid = [int]$si.Id } catch {}
-        try { $tname = [string]$si.Type } catch {}
-        $rejected += "id $rid (type $tname)"
     }
-}
 
-if ($rejected.Count -gt 0) {
-    Write-Host ("  Ignored {0} selected item(s) that are neither datum points nor point-bearing features:" -f $rejected.Count) -ForegroundColor Yellow
-    foreach ($r in ($rejected | Select-Object -First 10)) { Write-Host "      $r" -ForegroundColor DarkGray }
+    if ($rejected.Count -gt 0) {
+        Write-Host ("  Ignored {0} selected item(s) that are neither datum points nor point-bearing features:" -f $rejected.Count) -ForegroundColor Yellow
+        foreach ($r in ($rejected | Select-Object -First 10)) { Write-Host "      $r" -ForegroundColor DarkGray }
+    }
+    if ($pointIDs.Count -eq 0) {
+        throw "No datum point ids resolved from the selection. Select datum points (or a datum-point feature) and try again."
+    }
+    Write-Host ("  Captured {0} target point id(s): {1}" -f $pointIDs.Count, ($pointIDs -join ", ")) -ForegroundColor Green
 }
-if ($pointIDs.Count -eq 0) {
-    throw "No datum point ids resolved from the selection. Select datum points (or a datum-point feature) and try again."
-}
-Write-Host ("  Captured {0} target point id(s): {1}" -f $pointIDs.Count, ($pointIDs -join ", ")) -ForegroundColor Green
 
 # --- STEP 2: user picks the target body ---
 Write-Host ""
@@ -1460,7 +1736,11 @@ $bodyList = @()
 try { $bodyList = @($model.ListItems($pfcType.ITEM_BODY)) } catch {}
 
 $bodyIndex = 0
-if ($bodyList.Count -gt 1) {
+# In orthogrid mode (grid created programmatically) auto-pick body 0 with no prompt.
+# In manual mode, ask only if >1 body.
+if ($gridPointIDs.Count -gt 0) {
+    Write-Host "  Body index: 0 (auto, orthogrid mode)." -ForegroundColor DarkGray
+} elseif ($bodyList.Count -gt 1) {
     Write-Host ("  This part has {0} solid bodies:" -f $bodyList.Count) -ForegroundColor White
     for ($i = 0; $i -lt $bodyList.Count; $i++) {
         $bn = try { $bodyList[$i].GetName() } catch { "(unnamed)" }
@@ -1475,10 +1755,8 @@ if ($bodyList.Count -gt 1) {
     }
 } elseif ($bodyList.Count -eq 1) {
     Write-Host "  Single-body part -- using body index 0." -ForegroundColor DarkGray
-    Read-Host "  Press ENTER to continue"
 } else {
     Write-Host "  (could not enumerate bodies; defaulting to body index 0)" -ForegroundColor Yellow
-    Read-Host "  Press ENTER to continue"
 }
 Write-Host ("  Target body index: {0}" -f $bodyIndex) -ForegroundColor Green
 
@@ -1503,11 +1781,57 @@ if ($null -ne $holeDia -and [double]$holeDia -gt 0) {
     Write-Host ("  Hole diameter: {0}" -f $holeDiaFinal) -ForegroundColor Green
 }
 
+# ============================================================================
+# STAGE 2b -- AUTO-ROUND THE BOX CORNER EDGES (hands-free, just before drilling)
+# ============================================================================
+# Right BEFORE the drill confirmation below, round the box corner edges: the
+# edges of the LOWEST dimension present (the through-thickness verticals of the
+# plate). FULLY AUTOMATIC - no target prompt, no proceed prompt (user, 2026-06-24).
+# Mechanism = lib\edge_round.ps1 (Invoke-AutoCornerRound): sweep GetItemById ->
+# filter by EvalLength to the smallest length -> CreateModelItemSelection +
+# AddSelection -> proven round mapkey. NO find tool (dead on foreign bodies).
+# It self-tests selection on one edge and aborts WITHOUT mutating if that fails;
+# a VersionStamp canary aborts if the first round changes nothing.
+# Override radius with --corner-radius N (default 0.25); --no-corner-round skips.
+$cornerRadius = 0.25
+$mCr = [regex]::Match($ScriptArgs, '(?i)--corner-radius\s+([0-9]*\.?[0-9]+)')
+if ($mCr.Success) { $cornerRadius = [double]$mCr.Groups[1].Value }
+if ($ScriptArgs -match '(?i)--no-corner-round') {
+    Write-Host "  (--no-corner-round) skipping automatic corner rounding." -ForegroundColor DarkGray
+} else {
+    Write-Host "  ============================================================" -ForegroundColor Cyan
+    Write-Host "   STAGE 2b - auto-rounding box corner edges (lowest dimension)" -ForegroundColor Cyan
+    Write-Host "  ============================================================" -ForegroundColor Cyan
+    Write-Host "  Hands-free: finding the smallest-length edges and rounding them" -ForegroundColor White
+    Write-Host "  at radius $cornerRadius." -ForegroundColor White
+    $cr = Invoke-AutoCornerRound -Session $session -Model $model -TypeObj $pfcType -Radius $cornerRadius
+    Write-Host ("  Found $($cr.Found) edge(s); target length $($cr.Target); matched $($cr.Matched).") -ForegroundColor White
+    if ($cr.Matched -gt 0 -and -not $cr.SelfTestOk) {
+        Write-Host "  Corner round SKIPPED (safe) - $($cr.Reason)" -ForegroundColor Yellow
+    } elseif ($cr.Aborted) {
+        Write-Host "  Corner round ABORTED after canary - $($cr.Reason). Inspect Creo." -ForegroundColor Red
+    } elseif ($cr.Matched -eq 0) {
+        Write-Host "  No corner edges matched - $($cr.Reason). Skipped." -ForegroundColor Yellow
+    } elseif ($cr.TotalBatches -gt 0 -and $cr.ModelChanged -eq $cr.TotalBatches) {
+        Write-Host "  Rounded $($cr.Matched) corner edge(s) in $($cr.BatchesFired) batch(es) (model changed each)." -ForegroundColor Green
+        Write-Host "  NOTE: batches FIRED, not rounds Creo geometrically accepted - verify visually." -ForegroundColor DarkGray
+    } else {
+        Write-Host "  Corner round finished with issues - $($cr.ModelChanged)/$($cr.TotalBatches) batch(es) changed the model. Inspect Creo." -ForegroundColor Yellow
+    }
+    Write-Host ""
+}
+
 # --- CONFIRM (last stop before mutating the model) ---
 Write-Host ""
 Write-Host ("  Ready: {0} hole(s), diameter {1}, through all, body index {2}." -f $pointIDs.Count, $holeDiaFinal, $bodyIndex) -ForegroundColor Cyan
 Write-Host "  Do not touch Creo while this runs." -ForegroundColor DarkGray
-$go = Read-Host "  Proceed? (y/N)"
+# Orthogrid mode: auto-proceed (the user committed at the GUI; everything after is automatic).
+if ($gridPointIDs.Count -gt 0) {
+    $go = 'y'
+    Write-Host "  Proceeding automatically (orthogrid mode)." -ForegroundColor Cyan
+} else {
+    $go = Read-Host "  Proceed? (y/N)"
+}
 if ($go -notmatch '^[Yy]$') {
     Write-Host "  Cancelled -- the box was built but no holes were drilled." -ForegroundColor Yellow
 } else {
@@ -1521,11 +1845,20 @@ if ($go -notmatch '^[Yy]$') {
     $failed = 0
     $aborted = $false
 
+
     foreach ($ptId in $pointIDs) {
         $idx++
         Show-Progress ([Math]::Floor(($idx / $total) * 100)) "Hole $idx/$total"
 
-        $macro = Build-HoleMacro -PointId $ptId -Diameter $holeDiaFinal -BodyIndex $bodyIndex
+        # Orthogrid mode: pass the SIDE base datum as the placement surface (the
+        # intersection points aren't on a solid face, so Creo needs it explicitly).
+        # Pre-select the SIDE OFFSET plane (the box face the points sit on) as the
+        # hole placement surface. Point + matching surface -> "On Point" mode.
+        $surfId = 0
+        if ($gridPointIDs.Count -gt 0 -and $null -ne $sidePlane -and $null -ne $sidePlane.FeatId) {
+            $surfId = [int]$sidePlane.FeatId
+        }
+        $macro = Build-HoleMacro -PointId $ptId -Diameter $holeDiaFinal -BodyIndex $bodyIndex -SurfacePlaneId $surfId
         $changed = $false
         try {
             $stamp = $model.VersionStamp
@@ -1549,6 +1882,7 @@ if ($go -notmatch '^[Yy]$') {
         }
     }
     if (-not $aborted) { Show-Progress 100 "Done" }
+
     Write-Host ""
 
     # --- REPORT ---
@@ -1601,7 +1935,7 @@ if ($go -notmatch '^[Yy]$') {
 # the picked surface was used ONLY to measure thickness (it was never the drill-
 # from face -- the relief is placed On-Point by ID), and that normal read was a
 # guess proven for cylinders, not planes, so it could silently mis-measure.
-$RELIEF_DIA_MULT  = 1.5
+# $RELIEF_DIA_MULT was defined once up at the orthogrid-GUI block (reused here).
 $RELIEF_DEPTH_PCT = 0.20
 
 Write-Host ""
@@ -1612,9 +1946,15 @@ Write-Host "  ==================================================================
 # run doesn't stall on a question we already know the answer to; metal (and any
 # non-3D-print / unresolved path) still asks the human y/N. $is3dPrint was
 # derived from the STAGE-1 decision path right after the walk.
-if ($is3dPrint) {
+if ($is3dPrint -or $gridPointIDs.Count -gt 0) {
+    # Orthogrid mode OR 3D print: auto-add relief (no prompt); the user committed
+    # at the GUI / the material gate. Metal non-orthogrid still asks.
     $doRelief = 'y'
-    Write-Host "  Material is 3D print -- adding chip-relief holes automatically (no confirmation)." -ForegroundColor Cyan
+    if ($is3dPrint) {
+        Write-Host "  Material is 3D print -- adding chip-relief holes automatically." -ForegroundColor Cyan
+    } else {
+        Write-Host "  Orthogrid mode -- adding chip-relief holes automatically." -ForegroundColor Cyan
+    }
 } else {
     $doRelief = Read-Host "  Add chip-relief holes on these points? (y/N)"
 }
@@ -1653,24 +1993,12 @@ if ($doRelief -notmatch '^[Yy]$') {
 
     $reliefDia = [Math]::Round($holeDiaFinal * $RELIEF_DIA_MULT, 4)
 
-    # --- CONFIRM ---
+    # --- No second confirm: saying yes to "Add chip-relief holes?" above already
+    # authorized this; proceed straight to drilling (user, 2026-06-24). ---
     Write-Host ""
     Write-Host ("  Ready: {0} relief hole(s), diameter {1}`" (= {2} x {3}), blind depth {4}`", body index {5}." -f `
         $pointIDs.Count, $reliefDia, $holeDiaFinal, $RELIEF_DIA_MULT, $reliefDepth, $bodyIndex) -ForegroundColor Cyan
-    Write-Host "  Do not touch Creo while this runs." -ForegroundColor DarkGray
-    # 3D print auto-proceeds (no confirmation) -- same gate as the STAGE-4 entry,
-    # so a 3D-print run drills the relief holes start-to-finish without a prompt.
-    # Metal (and any non-3D-print / unresolved path) still confirms here.
-    if ($is3dPrint) {
-        $goR = 'y'
-        Write-Host "  Material is 3D print -- proceeding automatically." -ForegroundColor Cyan
-    } else {
-        $goR = Read-Host "  Proceed? (y/N)"
-    }
-    if ($goR -notmatch '^[Yy]$') {
-        Write-Host "  Cancelled -- no chip-relief holes drilled." -ForegroundColor Yellow
-    } else {
-        Write-Host ""
+    Write-Host ""
         # --- FIRE -- canary first, then the rest (same guard as through-holes) ---
         # Each hole: snapshot Linear dims -> create BLIND hole (default depth) ->
         # find the new depth dim by diff -> write DimValue=reliefDepth + force regen.
@@ -1682,7 +2010,11 @@ if ($doRelief -notmatch '^[Yy]$') {
             Show-Progress ([Math]::Floor(($rIdx / $rTotal) * 100)) "Relief $rIdx/$rTotal"
             # snapshot the Linear-dim set BEFORE creating the hole (depth-dim diff)
             $beforeMap = Get-LinearDimMap -Model $model -TypeObj $pfcType
-            $macro = Build-ReliefHoleMacro -PointId $ptId -Diameter $reliefDia -BodyIndex $bodyIndex
+            $rSurfId = 0
+            if ($gridPointIDs.Count -gt 0 -and $null -ne $sidePlane -and $null -ne $sidePlane.FeatId) {
+                $rSurfId = [int]$sidePlane.FeatId
+            }
+            $macro = Build-ReliefHoleMacro -PointId $ptId -Diameter $reliefDia -BodyIndex $bodyIndex -SurfacePlaneId $rSurfId
             $changed = $false
             try {
                 $stamp = $model.VersionStamp
@@ -1741,8 +2073,12 @@ if ($doRelief -notmatch '^[Yy]$') {
         } else {
             Write-Host "  Finished with issues -- $rMade of $rTotal changed the model, $rDepthHeld at correct depth. Inspect Creo." -ForegroundColor Yellow
         }
-    }
 }
+
+# (STAGE 5 REMOVED: the Direction-pattern approach was abandoned after multiple
+# iterations -- screen picks needed, dashboard didn't survive, chaining made an "L".
+# All grid points are now created programmatically in STAGE 2.5 via plane intersections,
+# and STAGE 3/4 drill + relief every point. No pattern needed.)
 
 # ============================================================================
 # FINAL WORD

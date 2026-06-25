@@ -162,6 +162,58 @@ function Resolve-SelectedEdgeIds {
     return @{ Ids = @($ids); Rejected = @($rejected) }
 }
 
+# Select EVERY edge in the model via the FIND TOOL, then read them back from the
+# selection buffer. THE BREAKTHROUGH (2026-06-22): on this jig part all FOUR COM
+# enumeration routes (surface walk, model/per-body ListItems(ITEM_EDGE), feature
+# ListSubItems) return 0 edges, yet MANUAL PICK works - i.e. the geometry is
+# selectable but NOT API-traversable (classic imported/"foreign" body). The find
+# tool is the SAME UI selection layer as manual pick, NOT the dead COM-traversal
+# layer - so a "select all edges" rule reaches what enumeration cannot, and the
+# resulting buffer is read with the proven CurrentSelectionBuffer().Contents path.
+#
+# The rule: open the search, object type = Edge, Rule = ID, but enter NO id and
+# Evaluate -> with an empty/All rule the find tool matches every edge of the type.
+# Each buffered SelItem yields .Id + EvalLength() (the same reads manual pick uses).
+# Returns @{ Edges=@(@{Id;Length}); Source; Detail }.
+function Get-EdgesViaFindTool {
+    param($Session)
+    $edges = @()
+    $seen = @{}
+    # 1) clear, then open the find tool and select ALL edges into the buffer.
+    #    'All' rule + Evaluate + Apply with no ID filter selects every edge.
+    $macro = "~ Command ``ProCmdSelClear``;" +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Edge``;" +
+        "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Edge``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``All``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``FindNowBtn``;" +
+        "~ Activate ``selspecdlg0`` ``SelAllBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;"
+    try { $Session.RunMacro($macro) } catch { Write-Log "find-tool select-all edges macro failed: $($_.Exception.Message)" "Yellow" }
+
+    # 2) read the buffer back - the proven path (same call manual pick uses).
+    $contents = $null
+    try { $contents = ($Session.CurrentSelectionBuffer()).Contents } catch {}
+    if ($null -ne $contents) {
+        foreach ($item in $contents) {
+            $si = $null
+            try { $si = $item.SelItem } catch { continue }
+            if ($null -eq $si) { continue }
+            $id = $null
+            try { $id = [int]$si.Id } catch {}
+            if ($null -eq $id -or $seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+            $len = $null
+            try { $len = [double]$si.EvalLength() } catch {}
+            $edges += @{ Id = $id; Length = $len; Sel = $si }
+        }
+    }
+    return @{ Edges = @($edges); Source = "find-tool select-all -> buffer"; Detail = "$($edges.Count) edges" }
+}
+
 # Gather ALL edges of the part as a flat COM list. The user's directed approach
 # (2026-06-22): "find all edges that are equal to the extrude" - i.e. go through
 # the FEATURE, not the geometry container. The VB docs confirm the route:
@@ -283,28 +335,40 @@ function Get-AllEdges {
     return @{ Edges = @(); Source = "none"; Detail = "no enumeration path returned edges" }
 }
 
-# Detect the VERTICAL edges of the plate. Re-anchored on DIRECT edge enumeration
-# (the surface walk returned 0 surfaces live) + PROVEN per-edge primitives (the
-# plane-normal read came back $null live, so it can only refine, never gate).
+# Detect the VERTICAL edges of the plate. EDGE SOURCE (2026-06-22): the FIND TOOL
+# select-all -> selection buffer (pass -Session), because on this jig ALL COM
+# traversal returns 0 edges while UI selection works (imported/foreign body). Falls
+# back to the Get-AllEdges COM cascade if the find tool yields nothing.
 #
-# PRIMARY gate (proven primitives - no normal, no coord read):
-#   - straight edge        (GetCurveDescriptor().End1 non-null; presence probe only)
-#   - length ~= plate THICKNESS  (EvalLength within $LenTol of $Thickness)
-# On a flat rectangular plate the only straight edges whose length equals the
-# thinnest extent ARE the four verticals (perimeter edges are width/depth long).
+# PRIMARY gate: length ~= plate THICKNESS (EvalLength within $LenTol of $Thickness).
+# On a flat rectangular plate the only edges whose length equals the thinnest extent
+# ARE the four verticals (perimeter edges are width/depth long).
 #
-# OPTIONAL sub-gates (only when reachable; can never zero the result by themselves):
-#   - both adjacent faces planar (Surface1/Surface2 -> GetSurfaceType 0/9) - SKIPPED
-#     if Surface1/2 are not reachable from a ListItems-sourced edge.
+# OPTIONAL sub-gates - SKIP-not-fail, so none can ever zero the result on foreign
+# geometry where the probe is unavailable:
+#   - straight: GetCurveDescriptor().End1 non-null. Only a CONFIRMED curve rejects;
+#     "could not test" does NOT reject.
+#   - both adjacent faces planar (Surface1/Surface2 -> GetSurfaceType 0/9) - skipped
+#     if Surface1/2 are unreachable.
 #   - normals perpendicular to $UpUnit, only if Read-PlaneNormal returns non-null.
 #
 # $Thickness is the up-axis extent (plate thickness); pass 0 to skip the length
 # test. Returns @{ Matches=@(@{Id;Length;Dot1;Dot2;NormalUsed}); Scanned;
 # EdgeSource; Stats }. Stats shows where edges drop, so a live run pinpoints the gate.
 function Get-VerticalEdges {
-    param($Model, $TypeObj, $UpUnit, [double]$Thickness = 0.0, [double]$LenTol = 0.05, [double]$PerpTol = 0.02)
+    param($Model, $TypeObj, $UpUnit, [double]$Thickness = 0.0, [double]$LenTol = 0.05, [double]$PerpTol = 0.02, $Session = $null)
 
-    $eres  = Get-AllEdges -Model $Model -TypeObj $TypeObj
+    # PRIMARY edge source: the FIND TOOL -> selection buffer (the UI selection
+    # layer that works on this part where ALL COM traversal returns 0). Falls back
+    # to COM enumeration (Get-AllEdges cascade) only if the find tool yields nothing.
+    $eres = $null
+    if ($null -ne $Session) {
+        $eres = Get-EdgesViaFindTool -Session $Session
+        Write-Log "find-tool route: $($eres.Detail)"
+    }
+    if ($null -eq $eres -or @($eres.Edges).Count -eq 0) {
+        $eres = Get-AllEdges -Model $Model -TypeObj $TypeObj
+    }
     $edges = @($eres.Edges)
     Write-Log "Edge source: $($eres.Source) -> $($eres.Detail) (thickness=$Thickness, lenTol=$LenTol)"
 
@@ -319,30 +383,41 @@ function Get-VerticalEdges {
         $edge = $edges[$e]
         if ($null -eq $edge) { continue }
 
+        # Edges from the find-tool route are @{Id;Length;Sel}; from COM routes they
+        # are raw IpfcEdge. Resolve a COM edge handle ($eob) for the optional probes,
+        # and read Id/Length from whichever shape we have.
+        $eob = $edge
+        $preLen = $null
+        if ($edge -is [hashtable]) { $eob = $edge.Sel; $preLen = $edge.Length }
+
         $edgeId = $null
-        try { $edgeId = [int]$edge.Id } catch { continue }
+        try { $edgeId = [int]$eob.Id } catch { try { $edgeId = [int]$edge.Id } catch { continue } }
         if ($processedEdgeIds.ContainsKey($edgeId)) { continue }
         $processedEdgeIds[$edgeId] = $true
         $scanned++
 
         # length (used by the length gate AND shown in the report)
-        $length = $null
-        try { $length = [double]$edge.EvalLength() } catch {}
+        $length = $preLen
+        if ($null -eq $length) { try { $length = [double]$eob.EvalLength() } catch {} }
 
-        # straight test: GetCurveDescriptor().End1 non-null. The value is NEVER
-        # read - only its presence (radinator's proven-safe probe).
+        # straight test: GetCurveDescriptor().End1 non-null - SKIP-not-fail. On
+        # foreign/imported geometry GetCurveDescriptor may be unavailable just like
+        # the surfaces are; treat "could not test" as "do not reject" so the length
+        # gate stands alone. Only a POSITIVE not-straight reading rejects.
+        $straightTested = $false
         $isStraight = $false
         $curveDesc = $null
         try {
-            $curveDesc = $edge.GetCurveDescriptor()
+            $curveDesc = $eob.GetCurveDescriptor()
+            $straightTested = $true
             if ($null -ne $curveDesc.End1) { $isStraight = $true }
-        } catch { $isStraight = $false }
+        } catch { $straightTested = $false }
         finally {
             if ($null -ne $curveDesc) {
                 try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($curveDesc) | Out-Null } catch {}
             }
         }
-        if (-not $isStraight) { continue }
+        if ($straightTested -and -not $isStraight) { continue }   # only reject a CONFIRMED curve
         $stats.Straight++
 
         # PRIMARY: length ~= thickness (skipped if no thickness given)
@@ -362,8 +437,8 @@ function Get-VerticalEdges {
         $surf1 = $null; $surf2 = $null
         $desc1 = $null; $desc2 = $null
         try {
-            try { $surf1 = $edge.Surface1 } catch {}
-            try { $surf2 = $edge.Surface2 } catch {}
+            try { $surf1 = $eob.Surface1 } catch {}
+            try { $surf2 = $eob.Surface2 } catch {}
             if ($null -ne $surf1 -and $null -ne $surf2) {
                 $stats.PlanarChecked++
                 $desc1 = $surf1.GetSurfaceDescriptor()
@@ -702,8 +777,8 @@ $lenTol = if ($thickness -gt 0) { [Math]::Max(0.01, $thickness * 0.05) } else { 
 # ============================================================================
 # DETECT VERTICAL EDGES
 # ============================================================================
-Write-Host "  Detecting vertical edges (straight + length ~ thickness; planar/normals refine if readable)..." -ForegroundColor Cyan
-$scan = Get-VerticalEdges -Model $model -TypeObj $modelItemType -UpUnit $upUnit -Thickness $thickness -LenTol $lenTol
+Write-Host "  Detecting vertical edges (find-tool select-all -> buffer; length ~ thickness gate)..." -ForegroundColor Cyan
+$scan = Get-VerticalEdges -Model $model -TypeObj $modelItemType -UpUnit $upUnit -Thickness $thickness -LenTol $lenTol -Session $session
 $detected = @($scan.Matches)
 Write-Host "  Edge source: $($scan.EdgeSource)" -ForegroundColor DarkGray
 Write-Host "  Scanned $($scan.Scanned) unique edge(s)." -ForegroundColor DarkGray

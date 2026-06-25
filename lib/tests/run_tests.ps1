@@ -191,7 +191,8 @@ $typeObj = [pscustomobject]@{ ITEM_DIMENSION = 1; ITEM_BODY = 2 }
 $dims = @(
     [pscustomobject]@{ Symbol = "d0"; DimType = 0; DimValue = 4.0 },
     [pscustomobject]@{ Symbol = "d1"; DimType = 0; DimValue = 3.0 },
-    [pscustomobject]@{ Symbol = "d2"; DimType = 1; DimValue = 0.5 }
+    [pscustomobject]@{ Symbol = "d2"; DimType = 1; DimValue = 0.5 },
+    [pscustomobject]@{ Symbol = "d3"; DimType = 3; DimValue = 45.0 }
 )
 $fakeModel = [pscustomobject]@{ _dims = $dims }
 $fakeModel | Add-Member -MemberType ScriptMethod -Name ListItems -Value { param($t) $this._dims }
@@ -204,6 +205,12 @@ Assert-True "Get-LinearDimMap keeps only linear dims" ($map.Count -eq 2 -and $ma
 Assert-True "Get-LinearDimMap reads values" ((Approx $map["d0"] 4.0) -and (Approx $map["d1"] 3.0))
 Assert-True "Read-DimValue reads by symbol" (Approx (Read-DimValue -Model $fakeModel -TypeObj $typeObj -Sym "d1") 3.0)
 Assert-True "Read-DimValue returns null for unknown symbol" ($null -eq (Read-DimValue -Model $fakeModel -TypeObj $typeObj -Sym "nope"))
+
+# Get-AngularDimMap: the DimType-3 companion (keeps only the angular dim d3; the
+# two linear dims and the radial dim are excluded). Linear count above stays 2.
+$amap = Get-AngularDimMap -Model $fakeModel -TypeObj $typeObj
+Assert-True "Get-AngularDimMap keeps only angular dims" ($amap.Count -eq 1 -and $amap.ContainsKey("d3") -and -not $amap.ContainsKey("d0") -and -not $amap.ContainsKey("d2"))
+Assert-True "Get-AngularDimMap reads values" (Approx $amap["d3"] 45.0)
 
 # ----------------------------------------------------------------------------
 # Test-ExtentsMatch - the deterministic by-value gate (this is the arithmetic the

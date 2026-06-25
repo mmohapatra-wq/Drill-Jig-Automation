@@ -304,6 +304,27 @@ function Get-LinearDimMap {
 }
 
 # ----------------------------------------------------------------------------
+# Get-AngularDimMap - the ANGULAR (DimType 3) companion to Get-LinearDimMap, for
+# datums whose placement value is a rotation rather than a linear offset (a
+# coordinate system's orient-by-angle, an angled datum plane/axis). Get-LinearDimMap
+# keeps only DimType 0 by design, so an angular offset is silently absent from its
+# before/after diff (see csys-probe.cmd); this surfaces those symbols the same way.
+# DimType 3 = Angular is a confirmed code (creo_api_facts dim-dimtype-codes), so this
+# filter is correct regardless of whether a given datum's rotation actually
+# materialises as a DimType-3 dim on a particular build (the probe finds out live).
+# ----------------------------------------------------------------------------
+function Get-AngularDimMap {
+    param($Model, $TypeObj)
+    $map = @{}
+    try {
+        foreach ($d in $Model.ListItems($TypeObj.ITEM_DIMENSION)) {
+            try { if ($d.DimType -eq 3) { $map[[string]$d.Symbol] = [double]$d.DimValue } } catch {}
+        }
+    } catch {}
+    return $map
+}
+
+# ----------------------------------------------------------------------------
 # Read-DimValue - re-read one dim's value by symbol with a FRESH handle (old COM
 # handles can go stale across a regen). Returns the double or $null. The fresh
 # GetItemByName lookup is the truth check: after a write+regen, this is the only
