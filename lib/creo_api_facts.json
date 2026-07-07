@@ -1,0 +1,603 @@
+{
+  "schemaVersion": 1,
+  "description": "Repo-local, machine-checkable registry of Creo Parametric VB API (pfcls COM) facts hard-won live on this build. Tools and the convergence layer query this instead of re-deriving the same gotchas. status: confirmed-live = proven on the real Creo session and recorded here; docs-only = stated by the VB docs but NOT exercised live (or live result was inconclusive); refuted = tried on this build and FAILED (an antipattern to avoid). 'build' = the Creo Parametric install these scripts target. Edit by hand; Test-ApiFactsSchema (lib/creo_api_facts.ps1) validates structure; run_tests.ps1 gates it.",
+  "statusEnum": ["confirmed-live", "docs-only", "refuted"],
+  "categoryEnum": ["progid", "regen", "dimension", "model", "geometry-read", "surface", "feature", "selection", "mapkey"],
+  "facts": [
+    {
+      "id": "regen-instructions-progid",
+      "category": "progid",
+      "status": "confirmed-live",
+      "fact": "The ProgID for forced-regen instructions is 'pfcls.pfcRegenInstructions'. New-Object that, then call its static .Create() to get the instance.",
+      "antipattern": "New-Object -ComObject pfcls.CCpfcRegenInstructions throws 0x80040154 REGDB_E_CLASSNOTREG (all-zeros CLSID) -- the CC* name from the docs is unregistered.",
+      "symbols": ["pfcls.pfcRegenInstructions", "CCpfcRegenInstructions", "Create"],
+      "evidence": "CLAUDE.md VB API Key Facts; boxinator.cmd.",
+      "verifiedOn": "2026-06-09"
+    },
+    {
+      "id": "cc-factory-names-not-progids",
+      "category": "progid",
+      "status": "confirmed-live",
+      "fact": "The docs' 'CCpfc<X>.Create()' factory names are NEVER standalone ProgIDs. The COM projection exposes the static Create as a method on the non-CC class object 'pfcls.pfc<X>'.",
+      "antipattern": "Treating any CCpfc* name as a ProgID for New-Object -- always REGDB_E_CLASSNOTREG.",
+      "symbols": ["CCpfc", "pfcls.pfc", "Create"],
+      "evidence": "CLAUDE.md VB API Key Facts (generalized from the RegenInstructions case)."
+    },
+    {
+      "id": "async-connection-pattern",
+      "category": "progid",
+      "status": "confirmed-live",
+      "fact": "Connect to a live Creo session via: New-Object -ComObject pfcls.pfcAsyncConnection -> .Connect() -> .Session -> .GetActiveModel().",
+      "antipattern": null,
+      "symbols": ["pfcls.pfcAsyncConnection", "Connect", "Session", "GetActiveModel"],
+      "evidence": "CLAUDE.md Repo Overview / Script Conventions; every tool."
+    },
+    {
+      "id": "regen-instructions-create-signature",
+      "category": "regen",
+      "status": "confirmed-live",
+      "fact": "pfcRegenInstructions.Create(AllowFixUI, ForceRegen, FromFeat) returns the instance. Its 8 settable props (AllowFixUI, ForceRegen, FromFeat, RefreshModelTree, ResolveModeRegen, ResumeExcludedComponents, UpdateAssemblyOnly, UpdateInstances) live on the Create() return value, NOT on the class object.",
+      "antipattern": "Setting those props on the class object instead of on the Create() result.",
+      "symbols": ["Create", "AllowFixUI", "ForceRegen", "FromFeat", "RefreshModelTree", "ResolveModeRegen", "ResumeExcludedComponents", "UpdateAssemblyOnly", "UpdateInstances"],
+      "evidence": "CLAUDE.md VB API Key Facts; boxinator.cmd (confirmed by COM member inspection)."
+    },
+    {
+      "id": "forced-regen-badcontext-noresolve",
+      "category": "regen",
+      "status": "confirmed-live",
+      "fact": "$model.Regenerate(<non-null RegenInstructions>) throws IpfcXToolkitBadContext when Creo runs in No-Resolve mode (the default in Creo Elements/Pro). Wrap forced regen in try/catch and fall back to $model.Regenerate($null).",
+      "antipattern": "Calling forced regen without a try/catch fallback in a No-Resolve session.",
+      "symbols": ["Regenerate", "IpfcXToolkitBadContext"],
+      "evidence": "CLAUDE.md VB API Key Facts; boxinator.cmd; plane-probe.cmd Invoke-ForceRegen."
+    },
+    {
+      "id": "regenerate-null-incremental",
+      "category": "regen",
+      "status": "confirmed-live",
+      "fact": "$model.Regenerate($null) is the automatic (incremental) regen. It can leave a freshly-written feature dim unpropagated -- symptom: a box whose new depth only updates after a manual edit/reopen of the feature's sketch.",
+      "antipattern": "Relying on Regenerate($null) alone to propagate a just-written feature DimValue; write the feature-level DimValue directly (it sticks on a closed sketch) rather than depending on regen mode.",
+      "symbols": ["Regenerate"],
+      "evidence": "CLAUDE.md VB API Key Facts; boxinator.cmd."
+    },
+    {
+      "id": "deprecated-regen-failure-handling-cs260154",
+      "category": "regen",
+      "status": "refuted",
+      "fact": "The config option regen_failure_handling = resolve_mode is DEPRECATED on this build. Setting it pops a blocking 'allow deprecated config (CS260154)' authorization dialog that stalls the whole run with no programmatic dismissal.",
+      "antipattern": "SetConfigOption('regen_failure_handling','resolve_mode') to try to enable forced resolve regen.",
+      "symbols": ["regen_failure_handling", "resolve_mode", "CS260154", "SetConfigOption"],
+      "evidence": "CLAUDE.md VB API Key Facts (Forced regen); boxinator.cmd."
+    },
+    {
+      "id": "sketch-regen-while-open",
+      "category": "regen",
+      "status": "confirmed-live",
+      "fact": "$sketchModel.Regenerate($null) must be called while the sketch is STILL OPEN to solve it and mark it dirty so the edit propagates. After the sketch closes, Creo reports 'Part not changed since last regen' and discards the edits.",
+      "antipattern": "Writing a sketch-dim DimValue, closing the sketch, then regenerating the part.",
+      "symbols": ["Regenerate", "GetActiveModel"],
+      "evidence": "CLAUDE.md VB API Key Facts; diminator.cmd Pass 2; DEV_NOTES.md."
+    },
+    {
+      "id": "dimvalue-feature-vs-sketch",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "$dim.DimValue is a read/write double. The write STICKS for feature-level dims (extrude depth, datum-plane offset) when the sketch is closed. For SKETCH dims it accepts the write in-memory but Creo discards it on regen (snap-back).",
+      "antipattern": "Writing a sketch-dim DimValue and expecting it to survive regen.",
+      "symbols": ["DimValue", "ITEM_DIMENSION"],
+      "evidence": "CLAUDE.md VB API Key Facts; DEV_NOTES.md; boxinator.cmd."
+    },
+    {
+      "id": "dim-symbol",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "$dim.Symbol returns the dimension's symbol name (e.g. d0, d1).",
+      "antipattern": null,
+      "symbols": ["Symbol"],
+      "evidence": "CLAUDE.md VB API Key Facts; gauginator.cmd."
+    },
+    {
+      "id": "dim-dimtype-codes",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "$dim.DimType is an int: 0=Linear, 1=Radial, 2=Diameter, 3=Angular. NOTE: it does NOT distinguish a width edge from a height edge -- both are Linear -- so it cannot bind a sketch dim to an axis.",
+      "antipattern": "Using DimType to tell which Linear sketch dim is width vs height.",
+      "symbols": ["DimType"],
+      "evidence": "CLAUDE.md VB API Key Facts; boxinator.cmd (why box verify went geometric)."
+    },
+    {
+      "id": "dim-value-property-throws",
+      "category": "dimension",
+      "status": "refuted",
+      "fact": "$dim.Value = x throws 'Index was outside bounds of array' -- the Value member expects an IpfcParamValue COM object. Use $dim.DimValue = x (a plain double) instead.",
+      "antipattern": "Assigning a double to $dim.Value.",
+      "symbols": ["Value", "DimValue", "IpfcParamValue"],
+      "evidence": "diminator.cmd known-issues; DEV_NOTES.md."
+    },
+    {
+      "id": "getitembyname-dimension",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "$model.GetItemByName(ITEM_DIMENSION, <symbol>) looks up a dimension by its symbol name.",
+      "antipattern": null,
+      "symbols": ["GetItemByName", "ITEM_DIMENSION"],
+      "evidence": "CLAUDE.md VB API Key Facts; diminator.cmd; lib/creo_geometry.ps1 Read-DimValue."
+    },
+    {
+      "id": "getitembyname-throws-missing",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "GetItemByName THROWS when the item is missing (it does not return $null). Wrap in try/catch; also guard the null path because [double]$null silently coerces to 0.0 and would masquerade as a real reading.",
+      "antipattern": "Calling GetItemByName without try/catch, or trusting a 0.0 result without a null check.",
+      "symbols": ["GetItemByName"],
+      "evidence": "lib/creo_geometry.ps1 Read-DimValue; CLAUDE.md."
+    },
+    {
+      "id": "dimvalue-write-not-truth-check",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "Reading $dim.DimValue right after a write always reflects what you just wrote (in-memory) -- it CANNOT confirm the write stuck. Only a fresh re-read AFTER Regenerate tells you whether the value actually held.",
+      "antipattern": "Using a post-write DimValue read as proof the change took effect.",
+      "symbols": ["DimValue", "Regenerate"],
+      "evidence": "diminator.cmd known-issues; CLAUDE.md."
+    },
+    {
+      "id": "read-dimvalue-fresh-handle",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "Re-read a dim through a FRESH GetItemByName handle after a regen -- old COM handles can go stale across a regen and read wrong.",
+      "antipattern": "Reusing a pre-regen dim handle to verify a post-regen value.",
+      "symbols": ["GetItemByName", "DimValue"],
+      "evidence": "lib/creo_geometry.ps1 Read-DimValue (from plane-probe)."
+    },
+    {
+      "id": "linear-dim-map-diff",
+      "category": "dimension",
+      "status": "confirmed-live",
+      "fact": "Find a newly-created feature dim (datum offset, extrude depth) by snapshotting ListItems(ITEM_DIMENSION) symbol->value BEFORE and AFTER the operation and diffing the symbol sets -- no need to guess the dim symbol. Heavy models commit slowly; POLL for the new symbol rather than waiting a fixed interval.",
+      "antipattern": "Assuming a new feature's dim symbol is predictable; or diffing before the dim is enumerable (fixed wait too short).",
+      "symbols": ["ListItems", "ITEM_DIMENSION", "Symbol", "DimValue"],
+      "evidence": "lib/creo_geometry.ps1 Get-LinearDimMap; plane-probe.cmd New-OffsetPlane; boxinator.cmd."
+    },
+    {
+      "id": "sketch-dim-snapback-routes-refuted",
+      "category": "dimension",
+      "status": "refuted",
+      "fact": "Four programmatic routes to drive an in-plane SKETCH dim and have it survive regen ALL FAILED on this build: (1) raw DimValue write, (2) in-sketcher mod_dim_emb edit, (3) tree-Edit mod_partdim_emb, (4) relations 'd# = value' via $model.Relations. A rough rectangle has weak dims the solver re-derives from unchanged geometry on regen. Only untried route: UDF placement. Production fallback: boxinator's gated sketch-open repair.",
+      "antipattern": "Spending more effort forcing a sketch dim from PowerShell; it is abandoned. Feature-level dims are unaffected and hold via a plain DimValue write.",
+      "symbols": ["DimValue", "mod_dim_emb", "mod_partdim_emb", "Relations"],
+      "evidence": "CLAUDE.md boxinator section (ABANDONED 2026-06-10); memory project_sketch_dim_snapback.md.",
+      "verifiedOn": "2026-06-10"
+    },
+    {
+      "id": "modifydimension-unavailable",
+      "category": "dimension",
+      "status": "refuted",
+      "fact": "$model.ModifyDimension() is not available on this API version.",
+      "antipattern": "Calling ModifyDimension to set a dim value.",
+      "symbols": ["ModifyDimension"],
+      "evidence": "diminator.cmd known-issues."
+    },
+    {
+      "id": "item-param-doublevalue-fails-for-dims",
+      "category": "dimension",
+      "status": "refuted",
+      "fact": "ITEM_PARAM + CreateDoubleParamValue does NOT work for setting dimensions.",
+      "antipattern": "Treating a dimension as an ITEM_PARAM and writing a double param value.",
+      "symbols": ["ITEM_PARAM", "CreateDoubleParamValue"],
+      "evidence": "diminator.cmd known-issues."
+    },
+    {
+      "id": "getactivemodel-returns-sketch",
+      "category": "model",
+      "status": "confirmed-live",
+      "fact": "$session.GetActiveModel() returns the SKETCH model when a sketch is open, and the part model otherwise. To edit sketch dims you must fetch them from the sketch model, not the part model.",
+      "antipattern": "Reading dims off the part model while a sketch is open (you get the wrong / empty set).",
+      "symbols": ["GetActiveModel"],
+      "evidence": "CLAUDE.md VB API Key Facts; diminator.cmd; boxinator.cmd."
+    },
+    {
+      "id": "versionstamp-change-detect",
+      "category": "model",
+      "status": "confirmed-live",
+      "fact": "$model.VersionStamp changes after a successful regen / feature creation. Poll it until it changes after each RunMacro to detect that the model actually mutated -- the canary used to abort a batch run when a mapkey silently no-ops.",
+      "antipattern": "Counting 'batches fired' as 'features created' without a VersionStamp canary.",
+      "symbols": ["VersionStamp", "RunMacro"],
+      "evidence": "CLAUDE.md Script Conventions; holeinator.cmd; cornerinator.cmd; drilljig.cmd."
+    },
+    {
+      "id": "listitems-dimension-solid-only",
+      "category": "model",
+      "status": "confirmed-live",
+      "fact": "$model.ListItems(ITEM_DIMENSION) lists all model dims when called on a SOLID (not-in-sketch) model. In an open sketch it does not return the part's dims -- use GetItemByName on the sketch model, or ListSubItems on a feature.",
+      "antipattern": "Calling ListItems(ITEM_DIMENSION) expecting sketch dims while a sketch is open.",
+      "symbols": ["ListItems", "ITEM_DIMENSION"],
+      "evidence": "CLAUDE.md; boxinator.cmd; DEV_NOTES.md."
+    },
+    {
+      "id": "mode-guard-by-filename-ext",
+      "category": "model",
+      "status": "confirmed-live",
+      "fact": "Detect part vs assembly mode by the active model's FILENAME extension (.prt vs .asm), NOT by EpfcModelType enum ints -- the enum integer values are unconfirmed on this build. Assembly mode resolves selection against the .asm, not the part, so geometry tools must STOP on .asm.",
+      "antipattern": "Branching on EpfcModelType enum ints to decide part/assembly mode.",
+      "symbols": ["EpfcModelType", "GetActiveModel"],
+      "evidence": "holeinator.cmd mode guard; drilljig.cmd."
+    },
+    {
+      "id": "evaloutline-shape",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "$solid.EvalOutline($null, $null) returns an IpfcOutline3D: a 2-element sequence of corner Point3Ds (min, max). The three axis extents (|dx|,|dy|,|dz|) ARE the solid's real width/height/depth, independent of any dimension symbol. $solid.GetOutline() is the regeneration-outline fallback.",
+      "antipattern": "Trusting captured dimension symbols over the measured outline to verify a solid's size.",
+      "symbols": ["EvalOutline", "GetOutline", "IpfcOutline3D", "Point3D"],
+      "evidence": "CLAUDE.md VB API Key Facts; boxinator.cmd; lib/creo_geometry.ps1 Measure-Extents."
+    },
+    {
+      "id": "evaloutline-exclude-datums",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "Pass an IpfcModelItemTypes sequence (ITEM_AXIS, ITEM_COORD_SYS, ITEM_POINT, ITEM_CURVE, ITEM_SURFACE) as EvalOutline's ExcludeTypes so default datums (auto-sized larger than the solid, ~0.0856 inflation seen live) do not inflate the measured extents. CAVEAT: a datum plane can register as ITEM_SURFACE -- same type as solid faces -- so excluding it may collapse the outline; guard for a degenerate (near-zero) extent and fall back to a no-exclude EvalOutline.",
+      "antipattern": "Including datums in EvalOutline (inflates every extent); or excluding ITEM_SURFACE without a degenerate-collapse guard.",
+      "symbols": ["EvalOutline", "ExcludeTypes", "ITEM_AXIS", "ITEM_COORD_SYS", "ITEM_POINT", "ITEM_CURVE", "ITEM_SURFACE", "pfcls.pfcModelItemTypes"],
+      "evidence": "lib/creo_geometry.ps1 New-ExcludeTypes + Measure-Extents; boxinator.cmd."
+    },
+    {
+      "id": "point3d-bracket-index",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "Read IpfcPoint3D/IpfcVector3D components via $V[0..2] bracket indexing (confirmed), with $V.Item(i) as fallback. When building a derived vector, assign each component on its OWN line -- inside a comma-separated @(...) literal PowerShell parses the comma as array-building first and throws op_Subtraction/op_Division on an array.",
+      "antipattern": "@($V[0]-$A[0], $V[1]-$A[1], ...) in one literal -- throws op_Subtraction on System.Object[].",
+      "symbols": ["IpfcPoint3D", "IpfcVector3D", "Item"],
+      "evidence": "lib/creo_geometry.ps1 Get-Comp, Cross, Dist-PointToAxis."
+    },
+    {
+      "id": "ipfcpoint-point-coord-read-crash",
+      "category": "geometry-read",
+      "status": "refuted",
+      "fact": "Reading a datum point's coordinates via IpfcPoint.Point crashes on this build with op_Subtraction on System.Object[] -- the point marshals in an array shape Get-Comp did not expect, and multiple shape-coercion attempts all failed on the real object. holeinator was rebuilt ID-ONLY (never reads point coords; the human judges on-plane/which-body visually) to dodge it.",
+      "antipattern": "Reading IpfcPoint.Point to compute off-plane filters or idempotency; do ID-only selection instead.",
+      "symbols": ["IpfcPoint", "Point"],
+      "evidence": "CLAUDE.md holeinator History/why ID-only; memory project_drill_jig_configurator.md.",
+      "verifiedOn": "2026-06-11"
+    },
+    {
+      "id": "massproperty-gravitycenter",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "$item.GetMassProperty($null).GravityCenter returns a body's center of gravity (Point3D, read via bracket index). CG is per-body.",
+      "antipattern": null,
+      "symbols": ["GetMassProperty", "GravityCenter"],
+      "evidence": "CLAUDE.md VB API Key Facts; gauginator.cmd."
+    },
+    {
+      "id": "edge-evallength",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "$edge.EvalLength() returns the edge length. Works on edges from ListItems AND on edges read off the selection buffer, INCLUDING imported/foreign geometry where container enumeration fails.",
+      "antipattern": null,
+      "symbols": ["EvalLength"],
+      "evidence": "radinator.cmd; cornerinator.cmd; cornerinator-probe.cmd."
+    },
+    {
+      "id": "edge-curvedescriptor-end1-straight",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "$edge.GetCurveDescriptor() returns the edge's geometry descriptor. A straight edge has a non-null .End1 (used as a presence probe -- the value itself is never read). Curved edges differ.",
+      "antipattern": "Reading .End1's coordinate value rather than just testing it non-null.",
+      "symbols": ["GetCurveDescriptor", "End1"],
+      "evidence": "radinator.cmd scan phase; cornerinator.cmd Get-VerticalEdges."
+    },
+    {
+      "id": "edge-adjacent-surfaces",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "$edge.Surface1 / $edge.Surface2 reference an edge's two adjacent surfaces (used to fingerprint a node-boss-meets-flat-stiffener edge: one convex cylinder + one plane). On edges sourced from a ListItems/find-tool walk over imported geometry, Surface1/2 may be unreachable -- treat as SKIP-not-fail.",
+      "antipattern": "Assuming Surface1/Surface2 are always reachable; failing an edge when they are merely unreadable on a foreign body.",
+      "symbols": ["Surface1", "Surface2"],
+      "evidence": "CLAUDE.md; radinator.cmd; cornerinator.cmd."
+    },
+    {
+      "id": "getname-on-geometry",
+      "category": "geometry-read",
+      "status": "confirmed-live",
+      "fact": "$item.GetName() (and SelItem.GetName()) returns a body's/datum's/feature's name string. drilljig uses it live to auto-map three picked datums into TOP/SIDE/FRONT box roles by substring, because plane orientation cannot be read (see plane-descriptor-getzaxis-null).",
+      "antipattern": "Assuming GetName() is always a non-empty, well-formed role label; fall back to a sequential capture when the names are ambiguous.",
+      "symbols": ["GetName"],
+      "evidence": "drilljig.cmd Resolve-PlaneRole; memory project_drilljig_plane_naming.md.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "surface-descriptor-type-codes",
+      "category": "surface",
+      "status": "confirmed-live",
+      "fact": "$surface.GetSurfaceDescriptor().GetSurfaceType() returns an int surface-type code: 0 or 9 = plane, 1 = cylinder.",
+      "antipattern": null,
+      "symbols": ["GetSurfaceDescriptor", "GetSurfaceType"],
+      "evidence": "CLAUDE.md VB API Key Facts; radinator.cmd; lib/creo_geometry.ps1 Count-Cylinders."
+    },
+    {
+      "id": "surface-getorientation-convex",
+      "category": "surface",
+      "status": "confirmed-live",
+      "fact": "$surface.GetOrientation() returns 1 for a convex surface (vs concave). Combined with the type code it distinguishes a convex cylindrical node boss.",
+      "antipattern": null,
+      "symbols": ["GetOrientation"],
+      "evidence": "CLAUDE.md VB API Key Facts; radinator.cmd."
+    },
+    {
+      "id": "cylinder-descriptor-radius",
+      "category": "surface",
+      "status": "confirmed-live",
+      "fact": "A cylinder surface descriptor exposes .Radius (double) directly.",
+      "antipattern": null,
+      "symbols": ["Radius", "GetSurfaceDescriptor"],
+      "evidence": "radinator.cmd; lib/creo_geometry.ps1 Count-Cylinders / Get-CylinderAxes."
+    },
+    {
+      "id": "cylinder-origin-transform-axes",
+      "category": "surface",
+      "status": "confirmed-live",
+      "fact": "A CYLINDER descriptor's .Origin is an IpfcTransform3D: .GetOrigin() is the axis base Point3D and .GetZAxis() is the axis direction Vector3D. This read path is proven live for cylinders.",
+      "antipattern": "Assuming the same .Origin path works for PLANE descriptors (it returns null -- see plane-descriptor-getzaxis-null).",
+      "symbols": ["Origin", "GetOrigin", "GetZAxis", "IpfcTransform3D"],
+      "evidence": "lib/creo_geometry.ps1 Get-CylinderAxes."
+    },
+    {
+      "id": "plane-descriptor-getzaxis-null",
+      "category": "surface",
+      "status": "confirmed-live",
+      "fact": "On this build, a PLANE surface descriptor's .Origin.GetZAxis() returns $null (the same path works for CYLINDER descriptors). So a plane normal cannot be read that way; Read-PlaneNormal tries GetNormal()/Normal fallbacks and any logic must degrade gracefully when the normal is null.",
+      "antipattern": "Anchoring detection logic on a plane normal read via descriptor.Origin.GetZAxis(); it silently yields null.",
+      "symbols": ["Origin", "GetZAxis", "GetNormal", "Normal"],
+      "evidence": "memory project_plane_normal_null.md; CLAUDE.md cornerinator section; lib/creo_geometry.ps1 Read-PlaneNormal.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "listsurfaces-on-body",
+      "category": "surface",
+      "status": "confirmed-live",
+      "fact": "$body.ListSurfaces() enumerates a body's surface faces; $surface.ListContours() -> contour.ListElements() walks its boundary edges. On imported/foreign jig bodies this walk can return 0 surfaces even though the geometry is selectable.",
+      "antipattern": "Assuming ListSurfaces always yields faces; on a foreign body fall back to selection-buffer reads.",
+      "symbols": ["ListSurfaces", "ListContours", "ListElements"],
+      "evidence": "radinator.cmd; cornerinator.cmd live findings; memory project_plane_normal_null.md."
+    },
+    {
+      "id": "listitems-body-defaultbody-fallback",
+      "category": "feature",
+      "status": "confirmed-live",
+      "fact": "$model.ListItems(ITEM_BODY) enumerates solid bodies. When it yields nothing, fall back to $model.GetDefaultBody().",
+      "antipattern": "Assuming ListItems(ITEM_BODY) always returns the bodies without a GetDefaultBody fallback.",
+      "symbols": ["ListItems", "ITEM_BODY", "GetDefaultBody"],
+      "evidence": "CLAUDE.md; radinator.cmd; lib/creo_geometry.ps1 Get-AllSurfaces; holeinator.cmd."
+    },
+    {
+      "id": "listsubitems-dimension-on-feature",
+      "category": "feature",
+      "status": "confirmed-live",
+      "fact": "$feature.ListSubItems(ITEM_DIMENSION) lists the dims owned by that feature. Dimension order within a feature is Creo's internal storage order, NOT creation order -- do not rely on it.",
+      "antipattern": "Relying on ListSubItems dimension order to identify which dim is which.",
+      "symbols": ["ListSubItems", "ITEM_DIMENSION"],
+      "evidence": "CLAUDE.md gauginator section; gauginator.cmd."
+    },
+    {
+      "id": "listsubitems-point-on-feature",
+      "category": "feature",
+      "status": "confirmed-live",
+      "fact": "$feature.ListSubItems(ITEM_POINT) lists the point geometry owned by a datum-point feature; read each point's .Id (ID-only, no coordinate read). This is how holeinator resolves a selected datum-point feature into point IDs live.",
+      "antipattern": "Reading the resolved points' coordinates (crashes -- see ipfcpoint-point-coord-read-crash).",
+      "symbols": ["ListSubItems", "ITEM_POINT", "Id"],
+      "evidence": "holeinator.cmd; CLAUDE.md holeinator section.",
+      "verifiedOn": "2026-06-11"
+    },
+    {
+      "id": "listsubitems-edge-on-feature",
+      "category": "feature",
+      "status": "docs-only",
+      "fact": "$feature.ListSubItems(ITEM_EDGE) is documented to list a feature's own edges (ITEM_EDGE is a supported ListSubItems subitem, mirroring ITEM_POINT). On a real imported jig plate this route, like all COM edge-enumeration routes, returned 0 edges live -- so it is NOT yet a confirmed live edge source for foreign bodies.",
+      "antipattern": "Assuming the feature ListSubItems(ITEM_EDGE) route yields edges on imported/foreign geometry; it returned 0 live -- use the find-tool -> selection-buffer route instead.",
+      "symbols": ["ListSubItems", "ITEM_EDGE"],
+      "evidence": "cornerinator.cmd Get-AllEdges cascade; CLAUDE.md cornerinator LIVE STATUS.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "listitems-edge-cascade-foreign-zero",
+      "category": "feature",
+      "status": "confirmed-live",
+      "fact": "On an imported/'foreign' jig body, FOUR COM edge-enumeration routes all returned 0 edges live: surface walk, $model.ListItems(ITEM_EDGE), per-body $body.ListItems(ITEM_EDGE), and feature ListSubItems(ITEM_EDGE) -- while manual selection works every time. Conclusion: the body is selectable but not API-traversable; enumerate edges via the find-tool -> selection buffer instead.",
+      "antipattern": "Relying on any COM container enumeration for edges on foreign geometry.",
+      "symbols": ["ListItems", "ITEM_EDGE", "ListSubItems"],
+      "evidence": "CLAUDE.md cornerinator LIVE STATUS; cornerinator-probe.cmd; memory project_find_edge_by_length.md.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "current-selection-buffer",
+      "category": "selection",
+      "status": "confirmed-live",
+      "fact": "Read the current selection via ($session.CurrentSelectionBuffer()).Contents -- a collection of selection items. This is the proven path that works even on imported geometry where container enumeration fails.",
+      "antipattern": null,
+      "symbols": ["CurrentSelectionBuffer", "Contents"],
+      "evidence": "CLAUDE.md Script Conventions; holeinator.cmd; cornerinator.cmd; flipenator.cmd."
+    },
+    {
+      "id": "selitem-id-capture",
+      "category": "selection",
+      "status": "confirmed-live",
+      "fact": "Capture a selected item's feature/point/edge id via $item.SelItem.Id. Body id and feature id differ -- flip operates on the feature, re-selection uses the body id (flipenator); a selected feature's points come from SelItem.getFeatures()/ListSubItems.",
+      "antipattern": "Conflating body id and feature id.",
+      "symbols": ["SelItem", "Id", "getFeatures"],
+      "evidence": "CLAUDE.md; flipenator.cmd; nodelator.cmd."
+    },
+    {
+      "id": "buffer-evallength-foreign",
+      "category": "selection",
+      "status": "confirmed-live",
+      "fact": "Edges pushed into the selection buffer (manual pick or find tool) expose .Id and .EvalLength() even on foreign bodies where ListItems(ITEM_EDGE) returns 0. This is why cornerinator's vertical-edge detection reads length off buffered SelItems rather than enumerated edges.",
+      "antipattern": "Concluding edges are unreadable because container enumeration returned 0; the buffer still exposes them.",
+      "symbols": ["CurrentSelectionBuffer", "Contents", "EvalLength", "Id"],
+      "evidence": "cornerinator.cmd Get-EdgesViaFindTool; cornerinator-probe.cmd; memory project_find_edge_by_length.md.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "component-path-componentids",
+      "category": "selection",
+      "status": "confirmed-live",
+      "fact": "In an assembly, a selected component's id is $item.Path.ComponentIds[0] and its part number comes from $item.SelectionString (format 'assembly.asm:partnumber<template>.prt(#id)').",
+      "antipattern": null,
+      "symbols": ["Path", "ComponentIds", "SelectionString"],
+      "evidence": "gripenator.cmd."
+    },
+    {
+      "id": "runmacro-atomic-dashboard",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "A dashboard tool's command context does NOT survive across separate RunMacro calls. Fire the ENTIRE dashboard sequence (open -> set value -> confirm dashInst0.Done) as ONE atomic RunMacro string. Split across calls, the confirm fires into a dashboard Creo has already lost track of and is SILENTLY dropped -- dashboard stays open, regen stalls.",
+      "antipattern": "Opening a dashboard in one RunMacro, setting a value in another, confirming in a third.",
+      "symbols": ["RunMacro", "dashInst0.Done", "ProCmdFtExtrude", "ProCmdHole"],
+      "evidence": "CLAUDE.md Mapkey Patterns (CRITICAL); boxinator.cmd; thickenator.cmd; holeinator.cmd."
+    },
+    {
+      "id": "runmacro-fire",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "Fire a recorded mapkey/macro string via $session.RunMacro(<string>).",
+      "antipattern": null,
+      "symbols": ["RunMacro"],
+      "evidence": "CLAUDE.md Script Conventions; all mapkey-driven tools."
+    },
+    {
+      "id": "select-by-id-tree-search",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "Select an item by ID (no screen pick) via the model-tree search dialog: ProCmdMdlTreeSearch -> selspecdlg0 SelOptionRadio set to the type (Feature/Point/Edge/Surface/Component) -> InputIDPanel = <id> -> EvaluateBtn -> ApplyBtn. A Feature-typed select CONSUMES a buffered ref or shows/hides a feature; feeding an OPEN dashboard reference collector needs surfenator's DATUM-typed pattern instead (see select-datum-by-id-for-collector).",
+      "antipattern": "Using the generic Feature-typed select to feed an open depth/reference collector -- it does not satisfy the geometric-reference filter and the dashboard waits for a manual pick.",
+      "symbols": ["ProCmdMdlTreeSearch", "selspecdlg0", "SelOptionRadio", "InputIDPanel", "EvaluateBtn", "ApplyBtn"],
+      "evidence": "CLAUDE.md Mapkey Patterns; nodelator.cmd; flipenator.cmd; plane-probe.cmd Get-SelectByIdMacro."
+    },
+    {
+      "id": "select-datum-by-id-for-collector",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "To feed an OPEN dashboard reference collector (e.g. an extrude depth 'to selected' plane) BY ID, use a DATUM-typed tree search (SelOptionRadio=Datum + LookByOptionMenu=Feature) with NO leading buffer_clean (clearing mid-dashboard deactivates the collector). This mirrors surfenator's proven up-to-plane feed.",
+      "antipattern": "Using a Feature-typed select, or prefixing buffer_clean, when feeding an open collector -- the dashboard sits waiting for a manual plane click.",
+      "symbols": ["SelOptionRadio", "LookByOptionMenu", "buffer_clean", "section_select_list"],
+      "evidence": "drilljig.cmd Get-SelectDatumByIdMacro; surfenator.cmd; CLAUDE.md drilljig STAGE 2.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "find-tool-cannot-filter-edge-length",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "Creo's Find tool CANNOT filter edges by length. Push all edges into the selection buffer (object type = Edge, select-all rule) and filter by EvalLength() in PowerShell. A pure-API AddSelection bypass is dead on foreign bodies.",
+      "antipattern": "Trying to express a length predicate in the Find tool's rules.",
+      "symbols": ["ProCmdMdlTreeSearch", "EvalLength", "AddSelection"],
+      "evidence": "memory project_find_edge_by_length.md; cornerinator.cmd; cornerinator-probe.cmd.",
+      "verifiedOn": "2026-06-22"
+    },
+    {
+      "id": "find-tool-select-all-widgets-unrecorded",
+      "category": "mapkey",
+      "status": "docs-only",
+      "fact": "The find-tool 'select all' widget names (FindNowBtn / SelAllBtn / RuleTypes set to All, layered on the proven selspecdlg0/EvaluateBtn/ApplyBtn skeleton) are BEST-GUESS and not yet recorded live. If a select-all yields an empty buffer, those exact widgets need a 'visible_mapkeys yes' recording of 'search Edges, select all'.",
+      "antipattern": "Trusting the guessed select-all widget names without a live recording; verify before relying on them.",
+      "symbols": ["FindNowBtn", "SelAllBtn", "RuleTypes", "selspecdlg0", "EvaluateBtn", "ApplyBtn"],
+      "evidence": "cornerinator.cmd Get-EdgesViaFindTool CAVEAT; cornerinator-probe.cmd; memory project_find_edge_by_length.md."
+    },
+    {
+      "id": "pause-screen-pick-not-scriptable",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "@PAUSE_FOR_SCREEN_PICK mapkey lines require real mouse coordinates and cannot be driven programmatically -- a RunMacro string cannot pause mid-sequence for a human pick. Split the macro around the human pick (open tool -> user clicks -> resume). ~Trail (dragger/mouse noise) and ~Move (dialog repositioning) lines are skipped in scripts.",
+      "antipattern": "Expecting a single RunMacro to both fire a tool and wait for a screen pick.",
+      "symbols": ["PAUSE_FOR_SCREEN_PICK", "Trail", "Move"],
+      "evidence": "CLAUDE.md Mapkey Patterns; boxinator.cmd; plane-probe.cmd."
+    },
+    {
+      "id": "createfeature-not-implemented",
+      "category": "feature",
+      "status": "refuted",
+      "fact": "IpfcSolid.CreateFeature is 'not implemented' on this build -- you cannot create a feature programmatically from a definition. Feature creation goes through recorded dashboard mapkeys instead (native Hole/Extrude/Round tools).",
+      "antipattern": "Calling Solid.CreateFeature to build a hole/extrude from a feature definition.",
+      "symbols": ["CreateFeature", "IpfcSolid"],
+      "evidence": "CLAUDE.md holeinator section (why On-Point native hole via mapkey)."
+    },
+    {
+      "id": "datumpointgeneral-command",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "The datum-point creation command is ProCmdDatumPointGeneral (NOT ProCmdDatumPoint). It opens the general Datum Point dialog Odui_Dlg_00; OK = stdbtn_1, Cancel = stdbtn_2 (stdbtn_2 pops a 'Do you really want to Cancel?' confirm, answered via ~ Activate `UI Message Dialog` `yes`).",
+      "antipattern": "Using ProCmdDatumPoint (no dialog / silent no-op); assuming stdbtn_2 is OK -- it is Cancel.",
+      "symbols": ["ProCmdDatumPointGeneral", "Odui_Dlg_00", "stdbtn_1", "stdbtn_2"],
+      "evidence": "working_folder/trail.txt.10 (12 point sessions; F6/F10 PNT0); pointref-probe.cmd; point-probe.cmd.",
+      "verifiedOn": "2026-06-24"
+    },
+    {
+      "id": "point-at-3-plane-intersection-by-id",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "A datum POINT is created with ONLY proven widgets by feeding 3 mutually-perpendicular datum planes into the buffer BY ID (repeated tree-search select-by-ID; buffer_clean on the FIRST only, 2nd/3rd omit it to ACCUMULATE) then ProCmdDatumPointGeneral + stdbtn_1. The point lands at the planes' intersection -- NO screen picks and NO offset-value widgets needed. To place the point at an arbitrary X/Y/Z, first create 3 OFFSET planes (ProCmdDatumPlane + t1.constr_dim1) at X/Y/Z and intersect THOSE; each coord is then a drivable feature-level plane-offset dim.",
+      "antipattern": "Typing X/Y/Z into the point dialog (its offset-value widgets need picked references); reaching for the offset-coordinate-system table (widgets unrecorded).",
+      "symbols": ["ProCmdDatumPointGeneral", "stdbtn_1", "ProCmdMdlTreeSearch", "buffer_clean", "ProCmdDatumPlane", "t1.constr_dim1"],
+      "evidence": "working_folder/trail.txt.10 lines 16258-16372 (planes ids 2/4/6 by ID -> ProCmdDatumPointGeneral -> stdbtn_1 -> F6 PNT0); pointref-probe.cmd (user confirmed 3/3 refs loaded by ID); point-probe.cmd.",
+      "verifiedOn": "2026-06-24"
+    },
+    {
+      "id": "selectbyid-accumulates-multiref",
+      "category": "selection",
+      "status": "confirmed-live",
+      "fact": "Repeated tree-search select-by-ID ACCUMULATES multiple references into the selection buffer when buffer_clean is omitted on the 2nd+ calls (EvaluateBtn/ApplyBtn add, not replace). A multi-reference command (e.g. ProCmdDatumPointGeneral) then consumes all of them.",
+      "antipattern": "Assuming the buffer holds only one ref; clearing (buffer_clean) before each select when you mean to accumulate.",
+      "symbols": ["ProCmdMdlTreeSearch", "EvaluateBtn", "ApplyBtn", "buffer_clean"],
+      "evidence": "radinator.cmd edge batching; pointref-probe.cmd + point-probe.cmd (3 planes by ID consumed as references); working_folder/trail.txt.10.",
+      "verifiedOn": "2026-06-24"
+    },
+    {
+      "id": "datum-point-offset-from-refs-needs-picks",
+      "category": "mapkey",
+      "status": "refuted",
+      "fact": "A datum point placed by OFFSET FROM picked geometry (a surface + edges via t1.RefsTable / t1.OffsetRefsTable, offset value OffsetRefsOffsetOptMnu_MRU1, constraint ConstrTypeOptionMenu_OPTMENU1 = DTMPNT_CONSTR_TYPE_OFFSET) requires on-screen reference PICKS that a RunMacro cannot replay -- so this point style is NOT mapkey-automatable. Use the 3-plane-intersection-by-ID recipe instead (point-at-3-plane-intersection-by-id).",
+      "antipattern": "Trying to script the offset-from-surface/edges datum point; its references come from mouse picks (@sel), not the buffer.",
+      "symbols": ["t1.RefsTable", "t1.OffsetRefsTable", "OffsetRefsOffsetOptMnu_MRU1", "ConstrTypeOptionMenu_OPTMENU1", "DTMPNT_CONSTR_TYPE_OFFSET"],
+      "evidence": "working_folder/trail.txt.10 (PNT0 at 8986-9095 used @sel picks for every reference; all 12 point sessions pick-based).",
+      "verifiedOn": "2026-06-24"
+    },
+    {
+      "id": "com-read-deadlocks-while-dialog-open",
+      "category": "selection",
+      "status": "confirmed-live",
+      "fact": "A COM DATA read - ($session.CurrentSelectionBuffer()).Contents, $item.GetCurveDescriptor(), $model.ListItems(...), any property/method that queries Creo for data - DEADLOCKS (freezes PowerShell) if called WHILE an interactive Creo dialog is OPEN and collecting a reference (e.g. between opening ProCmdDatumCsys and clicking OK). Creo's async COM is serviced on Creo's main thread, which is blocked in the dialog's modal pick loop, so the query never returns. By contrast $session.RunMacro(...) fires UI EVENTS that Creo processes mid-dialog (that is how mapkeys drive an open dialog), so RunMacro is SAFE mid-dialog. RULE: do all COM data reads BEFORE opening a dialog or AFTER it closes (OK/Cancel); between, use only RunMacro.",
+      "antipattern": "Reading the selection buffer / a descriptor / ListItems to 'grab what the user just picked' while a feature dialog is still open - it freezes the whole run (observed live: csysinator read the picked origin edge mid-csys-dialog and hung).",
+      "symbols": ["CurrentSelectionBuffer", "Contents", "GetCurveDescriptor", "ListItems", "RunMacro"],
+      "evidence": "csysinator.cmd froze live 2026-07-07 (working_folder/trail.txt.33: ProCmdDatumCsys opened, origin edge picked, then the tool's mid-dialog Read-SelectedRoundEdge buffer read hung - macro B never fired). Fix: removed the mid-dialog read; reads happen post-OK only.",
+      "verifiedOn": "2026-07-07"
+    },
+    {
+      "id": "datumcsys-dialog-sequence",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "ProCmdDatumCsys opens ODUI dialog Odui_Dlg_00 'Coordinate System'. FULL RECIPE from the operator's recorded mapkey (2026-07-06) for 'origin at a hole edge, +Y from that edge aligned to original Y, +X from a picked plane': (A) '~ Command ProCmdDatumCsys' -> prime t1.OriginPlacement (Trigger DuMmY/constr) -> toggle 'pg_vis_tab 1 tab_2' then 'tab_1' -> @PAUSE pick the ORIGIN hole edge (Placement tab). (B) 'pg_vis_tab 1 tab_2' (Orientation) -> the origin edge already supplies DirectionTable1's direction -> '~ Select Odui_Dlg_00 t2.AxisMenu1 1 Axis_Y' assigns it to Y -> '~ Activate Odui_Dlg_00 t2.FlipBtn1' -> prime t2.DirectionTable2 (Trigger/Focus/FocusIn) -> @PAUSE pick the X-direction PLANE. (C) '~ Activate Odui_Dlg_00 t2.FlipBtn2' + refresh both tables -> OK '~ Activate Odui_Dlg_00 stdbtn_1'. TWO mouse picks are mandatory (both @PAUSE_FOR_SCREEN_PICK); a RunMacro cannot replay them, so split into 3 segments around 2 pauses. Only ONE axis is assigned (Axis_Y, to the origin's direction); the second direction (the plane) takes the remaining axis (X) IMPLICITLY - there is NO t2.AxisMenu2 and no Axis_X in the flow (an earlier inference, refuted by the recording). FlipBtn1/FlipBtn2 are geometry-specific. ProCmdDatumCsys does NOT consume by-ID PRE-SELECTED geometry (refuted, trail.txt.15). Cancel = stdbtn_2.",
+      "antipattern": "Feeding csys references by ID and expecting ProCmdDatumCsys to consume them (refuted - it demands mouse picks); assigning the SECOND direction an axis via a t2.AxisMenu2 / Axis_X (they do not exist in the recorded flow - X is implicit once Y is set); firing the 3 segments without pausing for the 2 mandatory picks; using stdbtn_2 as OK (it is Cancel); assuming FlipBtn1/FlipBtn2 are always correct (they are geometry-specific - verify axis directions visually).",
+      "symbols": ["ProCmdDatumCsys", "Odui_Dlg_00", "t1.OriginPlacement", "pg_vis_tab", "tab_1", "tab_2", "t2.DirectionTable1", "t2.DirectionTable2", "t2.AxisMenu1", "Axis_Y", "t2.FlipBtn1", "t2.FlipBtn2", "stdbtn_1", "stdbtn_2"],
+      "evidence": "Operator's recorded mapkey 'datum' (2026-07-06): full ProCmdDatumCsys sequence with 2 @PAUSE_FOR_SCREEN_PICK, t2.AxisMenu1=Axis_Y, t2.FlipBtn1, t2.FlipBtn2 (no AxisMenu2/Axis_X, no stdbtn_1 - operator stopped before OK); corroborated by trail.txt.32 (L2225-2280 CS0 via picks; L13160-13172 AxisMenu1=Axis_Y + FlipBtn1); trail.txt.15 (by-ID pre-select refuted). Implemented in csysinator.cmd Get-CsysOpenMacro/Get-CsysDir1Macro/Get-CsysFinishMacro.",
+      "verifiedOn": "2026-07-06"
+    },
+    {
+      "id": "arc-descriptor-center-radius",
+      "category": "geometry-read",
+      "status": "docs-only",
+      "fact": "A circular solid edge (hole/fastener rim) is an ARC (per the VB docs, solid edges are LINE/ARC/SPLINE/BSPLINE; CIRCLE is 'reserved for future expansion'). $edge.GetCurveDescriptor() returns an IpfcArcDescriptor / IpfcCircleDescriptor whose creation signatures (CCpfcArcDescriptor.Create(Vector1,Vector2,Center,StartAngle,EndAngle,Radius); CCpfcCircleDescriptor.Create(Center,Radius,UnitNormal)) expose .Center (IpfcPoint3D) and .Radius (double). Reading .Center via Get-Comp is the SAME proven descriptor-read family as the live cylinder .Origin.GetOrigin() read - NOT the refuted IpfcPoint.Point coordinate read. NOT yet exercised live on this build (docs-only): treat as best-effort, degrade to IsRound=$false when the read is unavailable.",
+      "antipattern": "Reading a circular edge's center via IpfcPoint.Point (crashes); assuming .Center is guaranteed live-readable on this build (verify, and degrade gracefully when it is not).",
+      "symbols": ["GetCurveDescriptor", "IpfcArcDescriptor", "IpfcCircleDescriptor", "Center", "Radius"],
+      "evidence": "vb-docs (CCpfcArcDescriptor/CCpfcCircleDescriptor Create signatures; 'Curve and Edge Types' manual section); lib/creo_geometry.ps1 Get-EdgeArcCenter; csysinator.cmd. To promote to confirmed-live: run csysinator, confirm STEP 1 prints a sensible center + radius for a hole rim edge.",
+      "verifiedOn": null
+    },
+    {
+      "id": "coordsystem-coordsys-transform-read",
+      "category": "geometry-read",
+      "status": "docs-only",
+      "fact": "IpfcCoordSystem.CoordSys is an IpfcTransform3D giving a datum csys's location + orientation, read via .GetOrigin() (origin Point3D) and .GetXAxis()/.GetYAxis()/.GetZAxis() (axis Vector3Ds) - the SAME IpfcTransform3D read family proven live for cylinder axes (cylinder-origin-transform-axes). Used to verify a freshly-created csys's origin sits at a known point. NOT yet exercised live on this build (docs-only): best-effort, returns $null when unavailable so it never false-fails a real feature.",
+      "antipattern": "Gating csys-creation success on this read-back (it may be unavailable on a given build); use the feature-diff canary as the gate and this read as advisory verification.",
+      "symbols": ["IpfcCoordSystem", "CoordSys", "IpfcTransform3D", "GetOrigin", "GetXAxis", "GetYAxis", "GetZAxis", "ITEM_COORD_SYS"],
+      "evidence": "vb-docs ('Transforming to Coordinate System Datum Coordinates'; IpfcTransform3D GetXAxis/GetYAxis/GetZAxis); lib/creo_geometry.ps1 Read-CoordSysTransform; csysinator.cmd.",
+      "verifiedOn": null
+    }
+  ]
+}

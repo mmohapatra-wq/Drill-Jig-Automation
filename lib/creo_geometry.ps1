@@ -255,6 +255,41 @@ function Get-CylinderAxes {
 }
 
 # ----------------------------------------------------------------------------
+# Get-CylinderAxisFromSurface - read ONE surface COM object as a cylinder axis.
+# The single-surface companion to Get-CylinderAxes: when the human has SELECTED
+# the hole bores (matrixinator's index/target picks), each selected SelItem IS a
+# surface, so we read its descriptor directly instead of enumerating the body
+# (ListSurfaces is dead on the imported/"foreign" jig bodies - see cornerinator).
+#
+# Uses the EXACT proven descriptor path (cylinder-origin-transform-axes,
+# confirmed-live): .GetSurfaceDescriptor() -> type==1 -> .Origin (IpfcTransform3D)
+# -> .GetOrigin() (axis base point) + .GetZAxis() (axis direction) + .Radius.
+# This is an axis read off a CYLINDER, NOT the refuted IpfcPoint.Point read.
+#
+# Returns @{ A=<pt[3]>; D=<dir[3]>; Radius=<double> } or $null (not a readable
+# cylinder). NEVER throws - a read miss degrades to $null so the caller can
+# report the pick as "not a cylindrical hole" rather than crash the run.
+# ----------------------------------------------------------------------------
+function Get-CylinderAxisFromSurface {
+    param($Surf)
+    if ($null -eq $Surf) { return $null }
+    $desc = $null
+    try { $desc = $Surf.GetSurfaceDescriptor() } catch { return $null }
+    if ($null -eq $desc) { return $null }
+    try { if ([int]$desc.GetSurfaceType() -ne 1) { return $null } } catch { return $null }   # cylinders only
+    $r = $null
+    try { $r = [double]$desc.Radius } catch {}
+    $a = $null; $d = $null
+    try {
+        $xf = $desc.Origin            # IpfcTransform3D
+        $a = Get-Comp $xf.GetOrigin()
+        $d = Get-Comp $xf.GetZAxis()
+    } catch { return $null }
+    if ($null -eq $a -or $null -eq $d) { return $null }
+    return @{ A = $a; D = $d; Radius = $r }
+}
+
+# ----------------------------------------------------------------------------
 # Read-PlaneNormal - best-effort planar-surface normal as @(x,y,z), or $null.
 # Uses the SAME read path proven LIVE for cylinders in Get-CylinderAxes: the
 # surface descriptor's .Origin is an IpfcTransform3D whose Z axis is the surface
@@ -397,4 +432,103 @@ function Test-ExtentsMatch {
         }
     }
     return [pscustomobject]@{ AllMatched = $all; Pairs = $pairs; Tol = $Tol }
+}
+
+# ----------------------------------------------------------------------------
+# Get-EdgeArcCenter - read the CENTER + RADIUS of a circular (arc/circle) edge.
+# The curve-descriptor sibling of Get-CylinderAxisFromSurface: when the human has
+# SELECTED a hole/fastener RIM edge, that SelItem IS an edge, so we read its
+# curve descriptor directly (radinator/cornerinator prove GetCurveDescriptor()
+# works on buffered edge SelItems even on imported/"foreign" bodies).
+#
+# A solid circular edge is an ARC (per the VB docs, solid edges are
+# LINE/ARC/SPLINE/BSPLINE; CIRCLE is "reserved for future expansion"). Its
+# descriptor is IpfcArcDescriptor / IpfcCircleDescriptor whose creation signatures
+# (CCpfcArcDescriptor.Create(Vector1,Vector2,Center,StartAngle,EndAngle,Radius),
+# CCpfcCircleDescriptor.Create(Center,Radius,UnitNormal)) expose .Center
+# (IpfcPoint3D) + .Radius (double). Reading .Center via Get-Comp is the SAME
+# proven descriptor-read FAMILY as the cylinder .Origin.GetOrigin() read - it is
+# NOT the refuted IpfcPoint.Point coordinate read (ipfcpoint-point-coord-read-crash).
+#
+# LIVE-UNVERIFIED on this exact build (docs-only): the .Center member name is from
+# the docs, not yet exercised live here. So this NEVER throws and DEGRADES to
+# IsRound=$false / Center=$null - a straight (line) edge, a composite curve, or an
+# unreadable descriptor all return a benign result the caller reports, not a crash.
+#
+# Returns @{ IsRound=<bool>; Center=@(x,y,z)|$null; Radius=<double>|$null;
+#            Kind='arc'|'arc-no-center'|'straight'|'no-descriptor'|'none' }.
+# 'arc-no-center' = a circular edge whose .Center could not be read on this build
+# (has a radius, no straight-edge .End1): IsRound=$true so creation still proceeds,
+# Center=$null so the caller degrades to VISUAL verification (center is an anchor,
+# not a gate). This is the docs-only degrade path made non-blocking.
+# ----------------------------------------------------------------------------
+function Get-EdgeArcCenter {
+    param($Edge)
+    if ($null -eq $Edge) { return @{ IsRound = $false; Center = $null; Radius = $null; Kind = 'none' } }
+    $desc = $null
+    try { $desc = $Edge.GetCurveDescriptor() } catch { return @{ IsRound = $false; Center = $null; Radius = $null; Kind = 'no-descriptor' } }
+    if ($null -eq $desc) { return @{ IsRound = $false; Center = $null; Radius = $null; Kind = 'no-descriptor' } }
+
+    # ARC / CIRCLE descriptor -> .Center (IpfcPoint3D) + .Radius (double).
+    $center = $null
+    try { $center = Get-Comp $desc.Center } catch {}
+    # Read the raw radius and null-guard BEFORE coercing: [double]$null silently
+    # becomes 0.0, which would make a genuinely-null/absent radius masquerade as a
+    # real 0.0 and mis-trip the arc-no-center branch below. Only a non-null raw
+    # value is coerced (getitembyname-throws-missing documents the same trap).
+    $radius = $null
+    try { $rawR = $desc.Radius; if ($null -ne $rawR) { $radius = [double]$rawR } } catch {}
+
+    if ($null -ne $center) {
+        return @{ IsRound = $true; Center = $center; Radius = $radius; Kind = 'arc' }
+    }
+
+    # No center readable. Distinguish a straight LINE edge (has .End1) from a
+    # circular edge whose .Center is merely unreadable on this build (the docs-only
+    # degrade case) - probe .End1 for PRESENCE only, never read its value (the
+    # edge-endpoint read that crashed holeinator).
+    $isLine = $false
+    try { $isLine = ($null -ne $desc.End1) } catch {}
+    if ($isLine) {
+        return @{ IsRound = $false; Center = $null; Radius = $radius; Kind = 'straight' }
+    }
+    if ($null -ne $radius) {
+        # A radius but NO .End1 and NO readable center => a circular edge whose
+        # center could not be read on this build. Report it ROUND (IsRound=$true)
+        # so creation can still proceed - the center is a verification ANCHOR, not
+        # a gate; the caller degrades to visual verification. Do NOT conflate
+        # "is it round" with "could I read the center".
+        return @{ IsRound = $true; Center = $null; Radius = $radius; Kind = 'arc-no-center' }
+    }
+    # Nothing readable (no center, no radius, no End1) - genuinely can't classify.
+    return @{ IsRound = $false; Center = $null; Radius = $radius; Kind = 'no-descriptor' }
+}
+
+# ----------------------------------------------------------------------------
+# Read-CoordSysTransform - read a coordinate system's ORIGIN + axis directions.
+# Verification read-back for a freshly-created datum csys: IpfcCoordSystem.CoordSys
+# is an IpfcTransform3D (docs: "provides the location and orientation ... the
+# directions of the three axes and the position of the origin"), read via
+# .GetOrigin() / .GetXAxis() / .GetYAxis() / .GetZAxis() - the SAME IpfcTransform3D
+# read family proven live for cylinder axes (cylinder-origin-transform-axes).
+#
+# LIVE-UNVERIFIED on this build (docs-only): so this NEVER throws and returns $null
+# when the read is unavailable, letting the caller degrade to "verify visually"
+# rather than false-fail a real feature. Origin is required; axes are best-effort.
+#
+# Returns @{ Origin=@(x,y,z); X=@(..)|$null; Y=..|$null; Z=..|$null } or $null.
+# ----------------------------------------------------------------------------
+function Read-CoordSysTransform {
+    param($Csys)
+    if ($null -eq $Csys) { return $null }
+    $xf = $null
+    try { $xf = $Csys.CoordSys } catch { return $null }
+    if ($null -eq $xf) { return $null }
+    $o = $null; $x = $null; $y = $null; $z = $null
+    try { $o = Get-Comp $xf.GetOrigin() } catch {}
+    try { $x = Get-Comp $xf.GetXAxis() } catch {}
+    try { $y = Get-Comp $xf.GetYAxis() } catch {}
+    try { $z = Get-Comp $xf.GetZAxis() } catch {}
+    if ($null -eq $o) { return $null }
+    return @{ Origin = $o; X = $x; Y = $y; Z = $z }
 }

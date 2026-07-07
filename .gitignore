@@ -9,3 +9,6 @@ CREO_MAPKEY_AUTOMATION_GUIDE.md
 # Blind-evaluator artifacts and judge config (secret)
 *_eval.json
 .bluegpt_judge.json
+
+# slotpat-probe recorder output (throwaway trail transcription)
+slotpat_recipe.txt
