@@ -538,3 +538,189 @@ function Get-BodyList {
     }
     return ,@($out)
 }
+
+# ============================================================================
+# CHIP-RELIEF SLOTS (slotinator engine, shared by slotinator.cmd + drilljig.cmd
+# + drilljig-gui.cmd). Moved here 2026-07-07 so all three fire the SAME
+# confirmed-live macros instead of copy-pasted bodies. A slot is a blind
+# rectangular REMOVE-MATERIAL extrude per hole row (length = part length,
+# width = hole dia, depth = % of thickness); rows are seed-drawn once then
+# patterned along a base datum plane's normal.
+# ============================================================================
+
+# Build-CutFinishMacro - MACRO B: finish the internal sketch (which holds the
+# rectangle the operator drew), optionally flip the cut direction, type the blind
+# depth, toggle REMOVE MATERIAL, pick the body, confirm. ONE atomic RunMacro (a
+# dashboard's command context does not survive across RunMacro calls). PURE builder
+# (no COM). Widget provenance (all confirmed live, slotinator.cmd / trail.txt.32,
+# .27:3973, .8:1758/1799):
+#   ProCmdSketDone -> [maindashInst0.flip_pb] -> [def_depth1_ip blind depth] ->
+#   Enter/Exit dashInst0.Quit (blur) -> remove_material_cb 1 -> body_page.1.0 body
+#   -> dashInst0.Done.
+function Build-CutFinishMacro {
+    param([double]$Depth = 0.0, [int]$BodyIndex = 0, [bool]$Flip = $true)
+    $flipMacro = if ($Flip) { "~ Activate ``main_dlg_cur`` ``maindashInst0.flip_pb``;" } else { "" }
+    $depthMacro = if ($Depth -gt 0) {
+        "~ Input  ``main_dlg_cur`` ``maindashInst0.def_depth1_ip`` ``$Depth``;" +
+        "~ Update ``main_dlg_cur`` ``maindashInst0.def_depth1_ip`` ``$Depth``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.def_depth1_ip``;" +
+        "~ FocusOut ``main_dlg_cur`` ``maindashInst0.def_depth1_ip``;"
+    } else { "" }
+    return "~ Command ``ProCmdSketDone``;" +
+        $flipMacro +
+        $depthMacro +
+        "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
+        "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.remove_material_cb`` 1;" +
+        "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ``$BodyIndex``;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
+        "~ Focus  ``body_page.1.0`` ``PH.bodyselectrepwdg_list``;" +
+        "~ Select ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` 1 ``$BodyIndex``;" +
+        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
+        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+}
+
+# Build-SlotPatternMacro - the hands-free single-direction pattern, fired as ONE
+# atomic macro AFTER the operator has SELECTED the seed slot in the model tree
+# (a search-buffer select does NOT register as the pattern target - the operator
+# must click it; see slotinator FIX 1). Direction is a base DATUM PLANE fed BY ID
+# (FIX 2): open pattern -> activate ui_pat_dir_dir1 -> feed the datum by ID ->
+# count + spacing (+ optional flip) -> confirm. CONFIRMED LIVE 2026-07-07.
+# Uses Build-PatternArm/Values/ConfirmMacro (orthogrid_points.ps1) +
+# Get-SelectDatumByIdMacro (above).
+function Build-SlotPatternMacro {
+    param([int]$DirDatumId, [int]$Count, [double]$Spacing, [switch]$Flip)
+    return (Build-PatternArmMacro) +
+           (Get-SelectDatumByIdMacro -FeatId $DirDatumId) +
+           (Build-PatternValuesMacro -Count1 $Count -Spacing1 $Spacing -Flip1:$Flip) +
+           (Build-PatternConfirmMacro)
+}
+
+# New-SlotGuidePlanes - create + SHOW the slot-edge offset planes that guide the
+# manual rectangle draw (the 2-plus datum planes slotinator makes; essential for
+# drawing the slot to the right size). One plane per distinct X edge (offset from
+# the TOP base) + per distinct Z edge (from FRONT); a ~0 offset reuses the base
+# datum (point-probe trick). -UsePattern => only the FIRST row's edges (the seed;
+# the pattern replicates it), else every row's edges. Shows each via
+# ProCmdViewShow@PopupMenuTree (proven: plane-probe / trail.txt.32). Reads the core
+# scope ($script:DJSession/$script:DJModel); needs Get-SharedPlanePlan (orthogrid_
+# points) + New-OffsetPlane + Get-SelectByIdMacro in scope. Returns
+# @{ Ids=@(); XCount; ZCount }. Never throws on a plane failure (logs to $Log).
+function New-SlotGuidePlanes {
+    param(
+        [array]$Rows,
+        [int]$TopBaseId,
+        [int]$FrontBaseId,
+        [switch]$UsePattern,
+        [scriptblock]$Log = $null
+    )
+    $ids = @()
+    if ($null -eq $Rows -or @($Rows).Count -lt 1 -or $TopBaseId -le 0 -or $FrontBaseId -le 0) {
+        return @{ Ids = @(); XCount = 0; ZCount = 0 }
+    }
+    $corners = if ($UsePattern) { @($Rows[0].Corner0, $Rows[0].Corner1) } else { @($Rows | ForEach-Object { $_.Corner0; $_.Corner1 }) }
+    $plan = Get-SharedPlanePlan -Points $corners
+    $tolP = 1e-6
+    foreach ($xOff in $plan.XCoords) {
+        if ([math]::Abs([double]$xOff) -le $tolP) { continue }   # X~0 -> the TOP base datum (already visible)
+        $res = New-OffsetPlane -Label "SlotX$($ids.Count)" -Offset ([double]$xOff) -BaseId ([int]$TopBaseId)
+        if ($null -ne $res.FeatId) { $ids += [int]$res.FeatId }
+        elseif ($null -ne $Log) { & $Log ("  slot X-edge plane at offset $xOff FAILED (continuing).") }
+    }
+    foreach ($zOff in $plan.ZCoords) {
+        if ([math]::Abs([double]$zOff) -le $tolP) { continue }   # Z~0 -> the FRONT base datum
+        $res = New-OffsetPlane -Label "SlotZ$($ids.Count)" -Offset ([double]$zOff) -BaseId ([int]$FrontBaseId)
+        if ($null -ne $res.FeatId) { $ids += [int]$res.FeatId }
+        elseif ($null -ne $Log) { & $Log ("  slot Z-edge plane at offset $zOff FAILED (continuing).") }
+    }
+    # SHOW each created plane (select by id -> ProCmdViewShow@PopupMenuTree)
+    foreach ($planeId in $ids) {
+        $showMacro = (Get-SelectByIdMacro -FeatId ([int]$planeId)) + "~ Command ``ProCmdViewShow@PopupMenuTree``;"
+        try { $script:DJSession.RunMacro($showMacro) } catch { if ($null -ne $Log) { & $Log ("  could not show plane id $planeId : $($_.Exception.Message)") } }
+    }
+    try { $script:DJModel.Regenerate($null) } catch {}
+    return @{ Ids = @($ids); XCount = $plan.XCoords.Count; ZCount = $plan.ZCoords.Count }
+}
+
+# Invoke-VerifiedSeedCut - fire the FIRST slot cut and VERIFY it with the operator
+# (console: uses Read-Host for the draw/verify pause). The correct cut DIRECTION
+# depends on the sketch plane and cannot be known offline, so: open the sketch, the
+# operator draws the rectangle, fire the cut, then ASK whether it cut INTO the plate
+# at the right depth. If NOT, undo + TOGGLE the flip + redraw once (only two
+# directions). Returns @{ Ok; Flip; FeatId } - the confirmed Flip is reused for the
+# pattern / remaining rows, so direction is verified ONCE. Reads the core session
+# scope ($script:DJSession/$script:DJModel), so slotinator.cmd AND drilljig.cmd share
+# this one copy (both call Initialize-DrilljigCore). The GUI does NOT call this - it
+# uses wizard arm/verify steps around the same Build-CutFinishMacro.
+function Invoke-VerifiedSeedCut {
+    param(
+        [int]$FaceId,
+        [double]$Depth,
+        [int]$BodyIndex,
+        [bool]$Flip,
+        [string]$RowLabel = "row 1",
+        [hashtable]$DrawInfo   # SlotLen, RowAxis, SlotWidth, CrossAxis, CrossCoord, HasPlanes
+    )
+    $curFlip = $Flip
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $dirWord = if ($curFlip) { "flipped" } else { "default" }
+        $mkOpen =
+            (Get-SelectByIdMacro -FeatId $FaceId) +
+            "~ Command ``ProCmdFtExtrude``;" +
+            "~ Command ``ProCmdViewSketchView``;" +
+            "~ Command ``ProCmdSketRectangle`` 1;"
+        Write-Host ""
+        Write-Host ("  SEED SLOT ($RowLabel) - attempt $attempt, direction: $dirWord - opening the sketch...") -ForegroundColor Cyan
+        try { $script:DJSession.RunMacro($mkOpen) }
+        catch {
+            Write-Host "    Could not open the sketch: $($_.Exception.Message)" -ForegroundColor Red
+            return @{ Ok = $false; Flip = $curFlip; FeatId = $null }
+        }
+
+        Write-Host ""
+        Write-Host "  MANUAL STEP - draw the rectangle over $RowLabel's holes:" -ForegroundColor Magenta
+        Write-Host ("    target: {0:0.###} long (along {1}) x {2:0.###} wide (along {3}), centered on {3}~{4:0.###}" -f `
+            $DrawInfo.SlotLen, $DrawInfo.RowAxis, $DrawInfo.SlotWidth, $DrawInfo.CrossAxis, $DrawInfo.CrossCoord) -ForegroundColor White
+        if ($DrawInfo.HasPlanes) { Write-Host "    Snap the rectangle edges to the visible slot-edge planes." -ForegroundColor White }
+        Write-Host "    Click one corner then the opposite corner (ONE closed rectangle). Esc drops the tool." -ForegroundColor White
+        Write-Host "    Leave the rectangle drawn + sketch OPEN, then press ENTER here." -ForegroundColor Yellow
+        Read-Host
+
+        $beforeFeat = Get-FeatureIdSet
+        $stamp = $null; try { $stamp = $script:DJModel.VersionStamp } catch {}
+        $changed = $false
+        try {
+            $script:DJSession.RunMacro((Build-CutFinishMacro -Depth $Depth -BodyIndex $BodyIndex -Flip $curFlip))
+            if ($null -ne $stamp) { $changed = Wait-ModelModified -PreviousStamp $stamp -TimeoutMs 30000 }
+        } catch { Write-Host "    Macro error on the cut: $($_.Exception.Message)" -ForegroundColor Red }
+
+        if (-not $changed) {
+            Write-Host "  The cut did NOT modify the model (rectangle not a closed loop, or widget drift)." -ForegroundColor Red
+            return @{ Ok = $false; Flip = $curFlip; FeatId = $null }
+        }
+        $afterFeat = Get-FeatureIdSet
+        $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) } | Sort-Object)
+        $featId    = if ($newFeats.Count -ge 1) { [int]$newFeats[-1] } else { $null }
+
+        Write-Host ""
+        Write-Host "  VERIFY IN CREO: did this slot cut INTO the plate, at the right depth?" -ForegroundColor Magenta
+        $ok = Read-Host "    y = correct (keep it, reuse this direction for all rows) / n = wrong (undo + flip + redraw)"
+        if ($ok -match '^[Yy]') {
+            Write-Host ("  Direction CONFIRMED ($dirWord). Reusing it for the remaining rows.") -ForegroundColor Green
+            return @{ Ok = $true; Flip = $curFlip; FeatId = $featId }
+        }
+
+        if ($attempt -lt 2) {
+            Write-Host "  Flipping the direction. First remove this wrong cut:" -ForegroundColor Yellow
+            try { $script:DJSession.RunMacro("~ Command ``ProCmdEditUndo``;") } catch {}
+            Write-Host "    (I fired Undo. If the wrong slot is STILL in the model, press Ctrl+Z in Creo now.)" -ForegroundColor Yellow
+            Write-Host "    Press ENTER when the wrong slot is gone - you'll redraw with the flipped direction." -ForegroundColor Yellow
+            Read-Host
+            $curFlip = -not $curFlip
+        } else {
+            Write-Host "  Both directions tried and neither was confirmed. Leaving the last cut - inspect Creo." -ForegroundColor Yellow
+            return @{ Ok = $false; Flip = $curFlip; FeatId = $featId }
+        }
+    }
+}

@@ -30,8 +30,11 @@ exit /b %errorlevel%
 #             points. Falls back to manual point selection on any failure.
 #   STAGE 3   drill an On-Point hole at every target point (created in 2.5, or
 #             hand-selected in PREDEFINED mode), diameter from STAGE 1.
-#   STAGE 4   (metal: ask / 3DP or created-points: auto) add a coaxial chip-relief
-#             hole on the same point(s).
+#   STAGE 4   (3DP: auto / metal: ask) cut chip-relief SLOTS -- one blind
+#             rectangular remove-material slot per hole ROW (slotinator method:
+#             seed-drawn once then patterned). Needs a GUI layout; skipped for
+#             PREDEFINED points. REPLACES the old coaxial relief holes + relief
+#             paths (both removed).
 #
 # This is a MERGE of three working tools (jiginator.cmd / plane-probe.cmd /
 # holeinator.cmd). Those three are LEFT UNTOUCHED and still run standalone. The
@@ -561,17 +564,16 @@ if ($script:Picks.Count -gt 0) {
 }
 Write-Host ""
 
-# Material drives STAGE 4's chip-relief gate. A 3D-printed part ALWAYS gets the
-# chip-relief holes made automatically (no y/N) so the run doesn't pause for a
-# confirmation we already know the answer to; metal (or any non-3D-print / un-
-# resolved path) keeps the human y/N gate. The material is the user's answer to
-# the root question, which the walk recorded into $path -- the "3d print" signal
-# only ever enters $path via that material option (the metal sub-answers are
-# "PFD"/"Hand Drill"), so matching $path for it is unambiguous. Safe default:
-# auto-act ONLY on the explicit 3D-print choice; everything else still asks.
+# Material drives STAGE 4's chip-relief-SLOT gate. A 3D-printed part ALWAYS gets the
+# slots made automatically (no y/N) so the run doesn't pause for a confirmation we
+# already know the answer to; metal (or any non-3D-print / unresolved path) keeps the
+# human y/N gate. The material is the user's answer to the root question, which the
+# walk recorded into $path -- the "3d print" signal only ever enters $path via that
+# material option (the metal sub-answers are "PFD"/"Hand Drill"), so matching $path
+# for it is unambiguous. Safe default: auto-act ONLY on the explicit 3D-print choice.
 $is3dPrint = @($path | Where-Object { $_ -match '(?i)3d\s*print' }).Count -gt 0
 if ($is3dPrint) {
-    Write-Host "  Material: 3D print -> chip-relief holes will be added automatically (STAGE 4, no prompt)." -ForegroundColor Cyan
+    Write-Host "  Material: 3D print -> chip-relief slots will be added automatically (STAGE 4, no prompt)." -ForegroundColor Cyan
     Write-Host ""
 }
 
@@ -588,16 +590,11 @@ if ($is3dPrint) {
 # numbers are fresh and BEFORE we connect. They only CAPTURE the spec into the
 # shared $orthoGeo object (Get-Custom/OrthogridGeometry are shape-compatible, with
 # a .Mode tag); the datum points are CREATED later in STAGE 2.5 once the box + its
-# TOP/SIDE/FRONT datums exist. The decision-tree hole diameter ($holeDia), the
-# chip-relief diameter (= hole x RELIEF_DIA_MULT, the WIDEST feature), and bushing
-# length / drill depth ($bushingLen) are passed in as read-only context. The relief
-# dia ALSO sizes the plate (the dialog feeds it to the math layer as -ClearDia), so
-# the box Width/Height clears the relief circle at the border -- the operator no
-# longer hand-adds the hole dia. RELIEF_DIA_MULT is defined ONCE here, reused by
-# STAGE 4. Cancelling a create dialog falls back to PREDEFINED (hand-selected).
-$RELIEF_DIA_MULT = 1.5
-$reliefDiaForGui = 0.0
-if ($null -ne $holeDia -and [double]$holeDia -gt 0) { $reliefDiaForGui = [Math]::Round([double]$holeDia * $RELIEF_DIA_MULT, 4) }
+# TOP/SIDE/FRONT datums exist. The decision-tree hole diameter ($holeDia) and bushing
+# length / drill depth ($bushingLen) are passed in as read-only context. The hole dia
+# ALSO sizes the plate (the dialog feeds it to the math layer as -ClearDia), so the
+# box Width/Height clears the hole at the border. Cancelling a create dialog falls
+# back to PREDEFINED (hand-selected).
 $orthoGeo  = $null
 $pointMode = 'predefined'
 
@@ -615,7 +612,7 @@ switch ($modeRaw.Trim()) {
 if ($pointMode -eq 'predefined') {
     Write-Host "  Using PRE-EXISTING datum points - STAGE 3 will hand-select them." -ForegroundColor DarkGray
 } elseif ($pointMode -eq 'orthogrid') {
-    try { $orthoGeo = Show-OrthogridDialog -HoleDiameter $holeDia -ReliefDiameter $reliefDiaForGui -Thickness $bushingLen } catch { $orthoGeo = $null }
+    try { $orthoGeo = Show-OrthogridDialog -HoleDiameter $holeDia -Thickness $bushingLen } catch { $orthoGeo = $null }
     if ($null -eq $orthoGeo) {
         Write-Host "  Orthogrid editor cancelled (or unavailable) - STAGE 3 will use hand-selected points." -ForegroundColor Yellow
         $pointMode = 'predefined'
@@ -625,7 +622,7 @@ if ($pointMode -eq 'predefined') {
     }
 } else {
     # custom -- arbitrary per-point layout
-    try { $orthoGeo = Show-CustomPointsDialog -HoleDiameter $holeDia -ReliefDiameter $reliefDiaForGui -Thickness $bushingLen } catch { $orthoGeo = $null }
+    try { $orthoGeo = Show-CustomPointsDialog -HoleDiameter $holeDia -Thickness $bushingLen } catch { $orthoGeo = $null }
     if ($null -eq $orthoGeo) {
         Write-Host "  Custom-points editor cancelled (or unavailable) - STAGE 3 will use hand-selected points." -ForegroundColor Yellow
         $pointMode = 'predefined'
@@ -1104,11 +1101,12 @@ Write-Host ""
 # If the plane/point creation fails, falls back to Invoke-ManualPointGrid (user
 # creates + selects all points by hand). Never drills a zero-point "Done".
 $gridPointIDs = @()
-# STAGE 6 (chip-relief paths) reads $gridPlaneIds unconditionally, and the X/Z
-# loops below do `$gridPlaneIds += ...`. MUST be initialised to @() here at top
-# level: an un-initialised `$null += obj` makes it a SCALAR PSObject (not a
-# 1-element array), and the SECOND += then throws "does not contain a method named
-# 'op_Addition'". @() makes += append correctly from the first element.
+# $gridPlaneIds records the offset planes STAGE 2.5 creates (the X/Z loops below do
+# `$gridPlaneIds += ...`). It no longer feeds a later stage (the chip-relief PATHS
+# stage that consumed it was removed when slots replaced relief) but is kept as a
+# harmless record. MUST be initialised to @() here at top level: an un-initialised
+# `$null += obj` makes it a SCALAR PSObject (not a 1-element array), and the SECOND
+# += then throws "does not contain a method named 'op_Addition'".
 $gridPlaneIds = @()
 if ($null -ne $orthoGeo) {
     $modeLabel = if ($orthoGeo.Mode -eq 'custom') { "custom layout" } else { "orthogrid" }
@@ -1179,12 +1177,9 @@ if ($null -ne $orthoGeo) {
             if ($ok) { Write-Host ("  {0} Z-plane reference(s) ready." -f $zPlaneIds.Count) -ForegroundColor DarkGray }
         }
 
-        # Record the grid offset planes for STAGE 6 (chip-relief paths): crossing a
-        # user-picked edge with each of these planes drops one relief point per
-        # plane, spaced at the hole pitch along the edge. Tag each with its axis +
-        # offset so STAGE 6 can offer "X planes" vs "Z planes" (a relief path runs
-        # PERPENDICULAR to the planes it crosses). Skip the X=0/Z=0 base-datum reuse
-        # (those ids are the default datums, not grid-pitch offset planes).
+        # Record the grid offset planes (tagged with axis + offset). This was
+        # consumed by the old chip-relief PATHS stage (removed); kept as a harmless
+        # record. Skip the X=0/Z=0 base-datum reuse (default datums, not offsets).
         if ($ok) {
             for ($qi = 0; $qi -lt $xPlaneIds.Count; $qi++) {
                 if ([int]$xPlaneIds[$qi] -ne [int]$topBaseId) {
@@ -1497,407 +1492,157 @@ if ($go -notmatch '^[Yy]$') {
 }
 
 # ============================================================================
-# STAGE 4 -- CHIP-RELIEF HOLES (separate gated step)
+# STAGE 4 -- CHIP-RELIEF SLOTS (rectangular remove-material, one per hole row)
 # ============================================================================
-# A chip-relief hole is a wider, shallow, BLIND hole COAXIAL with each through-
-# hole, giving drill chips somewhere to clear. Same on-point datum points, so it
-# reuses the through-hole point/body path verbatim and only changes:
-#   diameter = 1.5 x through-hole diameter  (hardcoded multiplier)
-#   depth    = 20% of the plate thickness in the drill direction (hardcoded pct)
-#
-# DEPTH IS APPLIED AFTER CREATION (boxinator pattern): Build-ReliefHoleMacro makes
-# a BLIND hole at Creo's default depth, then Set-ReliefHoleDepth finds the new
-# Linear depth dim (before/after Get-LinearDimMap diff) and writes DimValue +
-# force-regen. This replaced typing the depth into the dashboard, which silently
-# failed -- the blind depth-VALUE widget name was never recordable and Creo
-# dropped the '~ Input', so every relief hole drilled THROUGH (live 2026-06-22).
-#
-# THICKNESS SOURCE (decided with the user 2026-06-22): the box was BUILT this run
-# by extruding from an og datum UP TO the SIDE offset plane, and the holes drill
-# ALONG the SIDE direction -- so the SIDE plane's offset dim IS the plate
-# thickness the hole passes through. We read that dim LIVE (Read-DimValue by the
-# Side plane's captured .Sym) rather than measuring the solid with EvalOutline +
-# a guessed surface normal. Why live, not the cached $made[Side].Offset / the
-# STAGE-1 $bushingLen: the resize loop writes new offsets via Set-PlaneOffset
-# (DimValue + regen) but does NOT update those scalars, so they go STALE after a
-# resize -- only a fresh Read-DimValue reflects the current box. If no Side plane
-# with a drivable dim exists this run (creation failed, or the box was never
-# built), fall back to a manual thickness prompt.
-#
-# This replaces an earlier surface-pick + Read-SurfaceNormal + EvalOutline path:
-# the picked surface was used ONLY to measure thickness (it was never the drill-
-# from face -- the relief is placed On-Point by ID), and that normal read was a
-# guess proven for cylinders, not planes, so it could silently mis-measure.
-# $RELIEF_DIA_MULT was defined once up at the orthogrid-GUI block (reused here).
-$RELIEF_DEPTH_PCT = 0.20
+# Replaces the old coaxial relief holes + relief paths with the slotinator method:
+# ONE blind rectangular slot per hole ROW (length = the part length along the row,
+# width = the drilled hole diameter, depth = % of plate thickness), seed-drawn once
+# then patterned along a base datum plane's normal. Reuses the shared engine in
+# lib\drilljig_core.ps1 (Get-RowSlots / Get-SlotPatternPlan / Invoke-VerifiedSeedCut /
+# Build-SlotPatternMacro / Build-CutFinishMacro) and ALL the context already gathered
+# this run -- the hole diameter ($holeDiaFinal), plate thickness (the live SIDE
+# offset), and hole layout ($orthoGeo) are NOT re-asked. Requires a GUI layout
+# (orthogrid/custom); PREDEFINED points carry no row info (we never read point
+# coordinates -- the IpfcPoint.Point crash), so slots are skipped there.
+$SLOT_DEPTH_PCT = 0.20
+$mSdp = [regex]::Match($ScriptArgs, '(?i)--slot-depth-pct\s+([0-9]*\.?[0-9]+)')
+if ($mSdp.Success) { $pSdp = [double]$mSdp.Groups[1].Value; if ($pSdp -gt 0 -and $pSdp -lt 100) { $SLOT_DEPTH_PCT = $pSdp / 100.0 } }
+$slotFlip        = ($ScriptArgs -match '(?i)--slot-flip')
+$slotPatternFlip = ($ScriptArgs -match '(?i)--pattern-flip')
+$slotNoPattern   = ($ScriptArgs -match '(?i)--no-pattern')
 
 Write-Host ""
 Write-Host "  ====================================================================" -ForegroundColor Cyan
-Write-Host "   STAGE 4 - chip-relief holes (wider + shallow, on the same points)" -ForegroundColor Cyan
+Write-Host "   STAGE 4 - chip-relief SLOTS (one rectangular slot per hole row)" -ForegroundColor Cyan
 Write-Host "  ====================================================================" -ForegroundColor Cyan
-# GATE: 3D-printed parts make the relief holes automatically (no prompt) so the
-# run doesn't stall on a question we already know the answer to; metal (and any
-# non-3D-print / unresolved path) still asks the human y/N. $is3dPrint was
-# derived from the STAGE-1 decision path right after the walk.
-if ($is3dPrint -or $gridPointIDs.Count -gt 0) {
-    # Programmatic points (orthogrid/custom) OR 3D print: auto-add relief (no
-    # prompt); the user committed at the GUI / the material gate. Metal with
-    # hand-selected points still asks.
-    $doRelief = 'y'
-    if ($is3dPrint) {
-        Write-Host "  Material is 3D print -- adding chip-relief holes automatically." -ForegroundColor Cyan
-    } else {
-        Write-Host "  Points created from the GUI layout -- adding chip-relief holes automatically." -ForegroundColor Cyan
-    }
-} else {
-    $doRelief = Read-Host "  Add chip-relief holes on these points? (y/N)"
-}
-if ($doRelief -notmatch '^[Yy]$') {
-    Write-Host "  Skipped chip-relief holes." -ForegroundColor DarkGray
-} else {
-    # --- STEP 1: relief depth = 20% of the live SIDE-plane offset (drill-axis
-    # plate thickness), with a manual fallback. Re-derive the Side plane from
-    # $made (NOT the STAGE-2-scoped $sidePlane) and re-read its dim LIVE so a
-    # post-build resize is reflected; never trust the cached .Offset/$bushingLen.
-    Write-Host ""
-    $reliefDepth = 0.0
-    $reliefSide  = @($made | Where-Object { $_.Label -eq "Side" })
-    $reliefSide  = if ($reliefSide.Count -gt 0) { $reliefSide[0] } else { $null }
-    $thickness   = $null
-    if ($null -ne $reliefSide -and $null -ne $reliefSide.Sym) {
-        $live = Read-DimValue -Model $model -TypeObj $pfcType -Sym $reliefSide.Sym
-        if ($null -ne $live -and $live -gt 0) { $thickness = [double]$live }
-    }
-    if ($null -ne $thickness -and $thickness -gt 0) {
-        $reliefDepth = [Math]::Round($thickness * $RELIEF_DEPTH_PCT, 4)
-        Write-Host ("  Plate thickness from the live SIDE offset ({0} = {1}`"):  relief depth {2}`" ({3:P0})" -f `
-            $reliefSide.Sym, [Math]::Round($thickness,4), $reliefDepth, $RELIEF_DEPTH_PCT) -ForegroundColor Green
-    } else {
-        Write-Host "  No live SIDE offset dim this run -- enter the plate thickness by hand." -ForegroundColor Yellow
-        $thicknessRaw = $null
-        while ($reliefDepth -le 0) {
-            $thicknessRaw = Read-Host "  Plate thickness in the drill direction (relief depth = 20% of it)"
-            $tv = 0.0
-            if ([double]::TryParse($thicknessRaw.Trim(), [ref]$tv) -and $tv -gt 0) {
-                $reliefDepth = [Math]::Round($tv * $RELIEF_DEPTH_PCT, 4)
-            } else { Write-Host "  Enter a positive number." -ForegroundColor Yellow }
-        }
-        Write-Host ("  Relief depth: {0}`" (20% of {1}`")" -f $reliefDepth, $thicknessRaw.Trim()) -ForegroundColor Green
-    }
 
-    $reliefDia = [Math]::Round($holeDiaFinal * $RELIEF_DIA_MULT, 4)
-
-    # --- No second confirm: saying yes to "Add chip-relief holes?" above already
-    # authorized this; proceed straight to drilling (user, 2026-06-24). ---
-    Write-Host ""
-    Write-Host ("  Ready: {0} relief hole(s), diameter {1}`" (= {2} x {3}), blind depth {4}`", body index {5}." -f `
-        $pointIDs.Count, $reliefDia, $holeDiaFinal, $RELIEF_DIA_MULT, $reliefDepth, $bodyIndex) -ForegroundColor Cyan
-    Write-Host ""
-        # --- FIRE -- canary first, then the rest (same guard as through-holes) ---
-        # Each hole: snapshot Linear dims -> create BLIND hole (default depth) ->
-        # find the new depth dim by diff -> write DimValue=reliefDepth + force regen.
-        $rTotal = $pointIDs.Count
-        $rIdx = 0; $rMade = 0; $rNoop = 0; $rFail = 0; $rAbort = $false
-        $rDepthHeld = 0; $rDepthMiss = 0
-        foreach ($ptId in $pointIDs) {
-            $rIdx++
-            Show-Progress ([Math]::Floor(($rIdx / $rTotal) * 100)) "Relief $rIdx/$rTotal"
-            # snapshot the Linear-dim set BEFORE creating the hole (depth-dim diff)
-            $beforeMap = Get-LinearDimMap -Model $model -TypeObj $pfcType
-            $rSurfId = 0
-            if ($gridPointIDs.Count -gt 0 -and $null -ne $sidePlane -and $null -ne $sidePlane.FeatId) {
-                $rSurfId = [int]$sidePlane.FeatId
-            }
-            $macro = Build-ReliefHoleMacro -PointId $ptId -Diameter $reliefDia -BodyIndex $bodyIndex -SurfacePlaneId $rSurfId
-            $changed = $false
-            try {
-                $stamp = $model.VersionStamp
-                $session.RunMacro($macro)
-                $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp
-            } catch { $rFail++ }
-            if ($changed) {
-                $rMade++
-                # NOW drive the blind depth via the feature-level dim (boxinator way)
-                $dr = Set-ReliefHoleDepth -BeforeMap $beforeMap -Depth $reliefDepth
-                if ($dr.Status -eq 'held') {
-                    $rDepthHeld++
-                } else {
-                    $rDepthMiss++
-                    Write-Host ""
-                    Write-Host ("      depth not confirmed on hole {0}: {1} (sym {2}, read {3}, wanted {4})" -f `
-                        $rIdx, $dr.Status, $dr.Sym, $dr.Value, $reliefDepth) -ForegroundColor Yellow
-                }
-            } else { $rNoop++ }
-            if ($rIdx -eq 1 -and -not $changed) {
-                Show-Progress 100 "Canary failed"
-                Write-Host ""
-                Write-Host "  ABORT: the first RELIEF hole did not modify the model." -ForegroundColor Red
-                Write-Host "  StrHoleDepBlindF was confirmed firing live, so this is more likely a" -ForegroundColor Red
-                Write-Host "  point-select / body-select issue than the depth-type -- inspect Creo." -ForegroundColor Red
-                $rAbort = $true
-                break
-            }
-            # depth-canary: if hole #1 changed the model but NO depth dim was found
-            # to drive, the rest will all drill through too -- stop and report.
-            if ($rIdx -eq 1 -and $changed -and $rDepthMiss -eq 1) {
-                Show-Progress 100 "Depth canary"
-                Write-Host ""
-                Write-Host "  ABORT: the first relief hole was created but its blind DEPTH dim" -ForegroundColor Red
-                Write-Host "  could not be found/driven, so it would drill through like before." -ForegroundColor Red
-                Write-Host "  Set-ReliefHoleDepth status was '$($dr.Status)'. Inspect the new hole's" -ForegroundColor Red
-                Write-Host "  dims in Creo; the Linear-dim diff may need adjusting for this build." -ForegroundColor Red
-                $rAbort = $true
-                break
-            }
-        }
-        if (-not $rAbort) { Show-Progress 100 "Done" }
-        Write-Host ""
-        Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
-        Write-Host ("  Relief points     : {0}" -f $rTotal) -ForegroundColor White
-        Write-Host ("  Model changed     : {0}" -f $rMade) -ForegroundColor White
-        Write-Host ("  Depth confirmed   : {0}" -f $rDepthHeld) -ForegroundColor White
-        if ($rDepthMiss -gt 0) { Write-Host ("  Depth NOT confirmed: {0}" -f $rDepthMiss) -ForegroundColor Yellow }
-        if ($rNoop -gt 0) { Write-Host ("  No-op (no change) : {0}" -f $rNoop) -ForegroundColor Yellow }
-        if ($rFail -gt 0) { Write-Host ("  Macro errors      : {0}" -f $rFail) -ForegroundColor Yellow }
-        Write-Host ""
-        if ($rAbort) {
-            Write-Host "  STOPPED after the canary -- inspect the model in Creo." -ForegroundColor Red
-        } elseif ($rMade -eq $rTotal -and $rFail -eq 0 -and $rDepthMiss -eq 0) {
-            Write-Host "  Done -- $rMade chip-relief hole(s) created and driven to depth $reliefDepth`". Verify visually in Creo." -ForegroundColor Green
-        } else {
-            Write-Host "  Finished with issues -- $rMade of $rTotal changed the model, $rDepthHeld at correct depth. Inspect Creo." -ForegroundColor Yellow
-        }
+# GATE (material, user 2026-07-07): 3D print -> add slots automatically; metal (and
+# any non-3D-print / unresolved path) -> ask the human y/N. $is3dPrint was derived
+# from the STAGE-1 decision path.
+$doSlots = $false
+if ($ScriptArgs -match '(?i)--no-slot-relief') {
+    Write-Host "  (--no-slot-relief) skipping chip-relief slots." -ForegroundColor DarkGray
+} elseif ($is3dPrint) {
+    Write-Host "  Material is 3D print -- adding chip-relief slots automatically." -ForegroundColor Cyan
+    $doSlots = $true
+} else {
+    $ansSlot = Read-Host "  Add chip-relief slots? (y/N)"
+    $doSlots = ($ansSlot -match '^[Yy]$')
+    if (-not $doSlots) { Write-Host "  Skipped chip-relief slots." -ForegroundColor DarkGray }
 }
 
-# (STAGE 5 REMOVED: the Direction-pattern approach was abandoned after multiple
-# iterations -- screen picks needed, dashboard didn't survive, chaining made an "L".
-# All grid points are now created programmatically in STAGE 2.5 via plane intersections,
-# and STAGE 3/4 drill + relief every point. No pattern needed.)
+if ($doSlots -and $null -eq $orthoGeo) {
+    Write-Host "  No grid/custom layout was entered (predefined points) -- holes cannot be grouped" -ForegroundColor Yellow
+    Write-Host "  into rows without a layout, so chip-relief slots are skipped. Use orthogrid/custom" -ForegroundColor Yellow
+    Write-Host "  mode to get slots." -ForegroundColor Yellow
+    $doSlots = $false
+}
 
-# ============================================================================
-# STAGE 6 -- CHIP-RELIEF PATHS (datum points along a user-picked edge)
-# ============================================================================
-# Idea: a chip-relief PATH is a line of through-holes running along an edge of the
-# part, used to clear chips/debris. The user picks ONE start edge; a datum point is
-# created where that edge crosses each of the offset planes already made for the
-# hole grid (STAGE 2.5). A straight edge meets a plane at exactly one point, so the
-# points land at the SAME pitch the grid uses (the planes are at the grid offsets).
-# Then a through-hole of diameter = HALF the part extrude (the drill-direction
-# thickness, read live from the SIDE offset) is drilled at every relief point.
-#
-# Reuses ONLY proven machinery:
-#   - point = edge n plane via Build-EdgePlanePointMacro (same ProCmdDatumPointGeneral
-#     + accumulate-by-ID recipe that built the grid; edge fed by Get-SelectEdgeByIdMacro).
-#   - through-hole via Build-HoleMacro with the confirmed On-Point + SIDE-offset-plane
-#     placement (-SurfacePlaneId $sidePlane.FeatId), Thru All.
-#   - ID-ONLY edge capture (SelItem.Id), VersionStamp canaries, manual fallbacks.
-# Gated on $gridPlaneIds (the STAGE 2.5 offset planes). If none exist (no orthogrid,
-# or auto-grid failed), STAGE 6 is skipped. Zero relief points created -> abort +
-# report, never a silent "Done".
-if ($gridPlaneIds.Count -gt 0) {
-    Write-Host ""
-    Write-Host "  ====================================================================" -ForegroundColor Cyan
-    Write-Host "   STAGE 6 - chip-relief paths (holes along an edge)" -ForegroundColor Cyan
-    Write-Host "  ====================================================================" -ForegroundColor Cyan
-    Write-Host ""
-
-    $doPath = Read-Host "  Add chip-relief paths along an edge? (y/N)"
-    if ($doPath -notmatch '^[Yy]$') {
-        Write-Host "  Skipped chip-relief paths." -ForegroundColor DarkGray
+if ($doSlots) {
+    # --- rows from the SAME layout the holes came from (NO re-entry) ---
+    $slots = Get-RowSlots -Points $orthoGeo.Points -SlotWidth $holeDiaFinal -Width $orthoGeo.Width -Height $orthoGeo.Height -RowAxis 'X'
+    if (-not $slots.Valid -or @($slots.Rows).Count -lt 1) {
+        Write-Host "  The layout produced no valid slot rows -- skipping chip-relief slots." -ForegroundColor Yellow
+        foreach ($er in @($slots.Errors)) { Write-Host "    - $er" -ForegroundColor Yellow }
     } else {
-        # === HOW THIS WORKS (and why) ====================================
-        # The user picks an EDGE; the relief holes run ALONG it, drilled NORMAL to
-        # it (= through the plate thickness, the same On-Point + SIDE-plane hole the
-        # grid uses). But feeding the EDGE to the datum-point dialog FAILS on this
-        # imported body -- the trail proved the dialog opens EMPTY (edginator's
-        # find-tool-dead-for-edges wall). So the edge is used ONLY to auto-detect
-        # which axis it runs along (by LENGTH -- no coordinate read); the points are
-        # built with the PROVEN 3-plane intersection that DID load for the grid:
-        #     point = SIDE face  n  a pitch plane  n  the boundary plane the edge is on
-        # all three Feature-type planes. The SIDE face + pitch planes already exist
-        # (STAGE 2.5 $gridPlaneIds + the SIDE base datum); the boundary plane is the
-        # one the user clicks (a datum plane, which loads reliably).
-        # =================================================================
-
-        # --- STEP 1: pick the FACE the relief holes drill into (NOT an edge) ---
-        # WHY a face, not an edge (user, 2026-06-25): inferring the path from an edge's
-        # LENGTH is ambiguous -- a perpendicular/thickness edge has a length that still
-        # matches Width or Height, so the path would silently build on the WRONG line.
-        # The boundary FACE removes all of that: its plane id IS the boundary of the
-        # 3-plane intersection AND its normal IS the drill direction. We just match the
-        # clicked plane to the box's own TOP/FRONT datums to know which pitch planes to
-        # cross (no length guess, no near/far question -- the clicked plane says both).
-        Write-Host ""
-        Write-Host "  Pick the OFFSET plane the relief holes drill INTO -- only the FRONT" -ForegroundColor Cyan
-        Write-Host "  OFFSET or TOP OFFSET plane (the far box faces created in STAGE 2)." -ForegroundColor Cyan
-        Write-Host "  In Creo: CLICK that offset plane, then press ENTER here." -ForegroundColor White
-        Write-Host "  (A row of holes is drilled into this face, normal to it, at the grid pitch.)" -ForegroundColor DarkGray
-        Read-Host
-        $boundaryId = Read-SelectedId
-        if ($null -eq $boundaryId) {
-            Write-Host "  Nothing selected -- click the FRONT or TOP offset plane, then re-run STAGE 6." -ForegroundColor Yellow
+        # --- plate thickness from the LIVE SIDE offset (same source the old relief used;
+        # never the cached .Offset/$bushingLen, which go stale after a resize) ---
+        $slotDepth = 0.0
+        $sSide = @($made | Where-Object { $_.Label -eq "Side" }); $sSide = if ($sSide.Count -gt 0) { $sSide[0] } else { $null }
+        $thkS  = $null
+        if ($null -ne $sSide -and $null -ne $sSide.Sym) { $liveS = Read-DimValue -Model $model -TypeObj $pfcType -Sym $sSide.Sym; if ($null -ne $liveS -and $liveS -gt 0) { $thkS = [double]$liveS } }
+        if ($null -ne $thkS -and $thkS -gt 0) {
+            $slotDepth = [Math]::Round($thkS * $SLOT_DEPTH_PCT, 4)
+            Write-Host ("  Plate thickness from the live SIDE offset ({0} = {1}"" ): slot depth {2}"" ({3:P0})" -f $sSide.Sym, [Math]::Round($thkS,4), $slotDepth, $SLOT_DEPTH_PCT) -ForegroundColor Green
         } else {
-            Write-Host ("      relief-path face id = {0}" -f $boundaryId) -ForegroundColor DarkGray
+            Write-Host "  No live SIDE offset this run -- slots will use Creo's DEFAULT depth (no value typed)." -ForegroundColor Yellow
+        }
+        # --- sketch face = the SIDE og datum (where the box was sketched); pattern
+        # direction datum from the march axis: CrossAxis Z -> FRONT, X -> TOP ---
+        $slotFaceId = if ($null -ne $sidePlane -and $null -ne $sidePlane.BaseId) { [int]$sidePlane.BaseId } else { $null }
+        $frontBase = @($made | Where-Object { $_.Label -eq "Front" }); $frontBase = if ($frontBase.Count -gt 0) { $frontBase[0] } else { $null }
+        $topBase   = @($made | Where-Object { $_.Label -eq "Top" });   $topBase   = if ($topBase.Count -gt 0) { $topBase[0] } else { $null }
+        $dirDatumId = $null; $dirName = $null
+        if ($slots.CrossAxis -eq 'Z') { if ($null -ne $frontBase -and $null -ne $frontBase.BaseId) { $dirDatumId = [int]$frontBase.BaseId; $dirName = 'FRONT' } }
+        else                          { if ($null -ne $topBase   -and $null -ne $topBase.BaseId)   { $dirDatumId = [int]$topBase.BaseId;   $dirName = 'TOP' } }
 
-            # Match the clicked plane to a box OFFSET plane (FeatId ONLY -- the user may
-            # select only the FRONT/TOP OFFSET plane, not the base datum; user
-            # 2026-06-25). A TOP offset plane -> cross the Z-pitch planes; a FRONT offset
-            # plane -> cross the X-pitch planes (the perpendicular family, see below).
-            $topP   = @($planes | Where-Object { $_.Label -eq "Top"   } | Select-Object -First 1)
-            $topP   = if ($topP.Count   -gt 0) { $topP[0]   } else { $null }
-            $frontP = @($planes | Where-Object { $_.Label -eq "Front" } | Select-Object -First 1)
-            $frontP = if ($frontP.Count -gt 0) { $frontP[0] } else { $null }
-            #
-            # CROSS-AXIS = the pitch planes PERPENDICULAR to the boundary (so the 3
-            # planes meet at a point). The grid axes: 'X' planes are offset from TOP
-            # (normal X, i.e. constant-X / parallel-to-TOP), 'Z' planes offset from
-            # FRONT (normal Z, parallel-to-FRONT). So a boundary parallel to one family
-            # MUST be crossed with the OTHER family -- crossing it with its own family
-            # gives TWO PARALLEL planes and the datum dialog opens EMPTY (the live
-            # 2026-06-25 no-points bug: FRONT boundary crossed with Z-pitch, both
-            # constant-Z -> parallel -> Cancel). Hence the FLIP:
-            #   TOP offset   (parallel to X-planes) -> cross the Z-pitch planes
-            #   FRONT offset (parallel to Z-planes) -> cross the X-pitch planes
-            # Match FeatId ONLY (the offset plane), not BaseId -- only offset planes are
-            # accepted as the relief boundary.
-            $crossAxis = $null; $bAxisLabel = $null
-            if ($null -ne $topP -and $null -ne $topP.FeatId -and $boundaryId -eq [int]$topP.FeatId) {
-                $bAxisLabel = 'Top';   $crossAxis = 'Z'
-            } elseif ($null -ne $frontP -and $null -ne $frontP.FeatId -and $boundaryId -eq [int]$frontP.FeatId) {
-                $bAxisLabel = 'Front'; $crossAxis = 'X'
+        if ($null -eq $slotFaceId) {
+            Write-Host "  The SIDE datum was not captured this run -- cannot sketch the slots. Skipping." -ForegroundColor Yellow
+        } else {
+            $depthNote = if ($slotDepth -gt 0) { "$slotDepth""" } else { "Creo default depth" }
+            Write-Host ("  {0} slot row(s), width {1}"" (= hole dia), {2}, sketched on the SIDE face (id {3})." -f @($slots.Rows).Count, $slots.SlotWidth, $depthNote, $slotFaceId) -ForegroundColor Cyan
+
+            $patPlan = Get-SlotPatternPlan -Rows $slots.Rows
+            $usePattern = ($patPlan.CanPattern -and -not $slotNoPattern -and @($slots.Rows).Count -ge 2 -and $null -ne $dirDatumId)
+
+            # --- GUIDE PLANES: create + show the slot-edge offset planes (the 2+ datum
+            # planes slotinator makes) so the operator draws the seed rectangle to the
+            # right size. Pattern mode -> FIRST row's edges only (the seed). Needs the
+            # TOP + FRONT bases. Best-effort; freehand if the bases weren't captured. ---
+            $slotHasPlanes = $false
+            $topBaseIdN   = if ($null -ne $topBase   -and $null -ne $topBase.BaseId)   { [int]$topBase.BaseId }   else { 0 }
+            $frontBaseIdN = if ($null -ne $frontBase -and $null -ne $frontBase.BaseId) { [int]$frontBase.BaseId } else { 0 }
+            if ($topBaseIdN -gt 0 -and $frontBaseIdN -gt 0) {
+                Write-Host "  Creating the slot-edge guide planes (draw references)..." -ForegroundColor Cyan
+                $gp = New-SlotGuidePlanes -Rows $slots.Rows -TopBaseId $topBaseIdN -FrontBaseId $frontBaseIdN -UsePattern:$usePattern -Log { param($m) Write-Host $m -ForegroundColor Yellow }
+                if (@($gp.Ids).Count -gt 0) { $slotHasPlanes = $true; Write-Host ("  {0} slot-edge guide plane(s) created + shown." -f @($gp.Ids).Count) -ForegroundColor Green }
+                else { Write-Host "  No new guide planes needed (edges lie on base datums) - draw freehand." -ForegroundColor DarkGray }
+            } else {
+                Write-Host "  TOP/FRONT base datums not both captured - skipping guide planes (draw freehand)." -ForegroundColor Yellow
             }
 
-            # SIDE face for the INTERSECTION = the SIDE OFFSET plane ($sidePlane.FeatId,
-            # the actual box face the points sit on; user 2026-06-25). This LOADS fine
-            # as a datum-point reference (proven the run the user confirmed "the side
-            # offset surface is now correct") -- the earlier no-points failures were the
-            # parallel-pitch bug above, NOT the offset ref. Falls back to BaseId only if
-            # the offset feat id is missing.
-            $sideFaceId = if ($null -ne $sidePlane -and $null -ne $sidePlane.FeatId) { [int]$sidePlane.FeatId } elseif ($null -ne $sidePlane -and $null -ne $sidePlane.BaseId) { [int]$sidePlane.BaseId } else { $null }
+            # --- SEED slot (row 1): draw + verify direction/depth; learn the flip ---
+            $seedRow = $slots.Rows[0]
+            $seed = Invoke-VerifiedSeedCut -FaceId $slotFaceId -Depth $slotDepth -BodyIndex $bodyIndex `
+                -Flip $slotFlip -RowLabel "row 1 (seed)" -DrawInfo @{
+                    SlotLen = $seedRow.SlotLen; RowAxis = $slots.RowAxis; SlotWidth = $slots.SlotWidth
+                    CrossAxis = $slots.CrossAxis; CrossCoord = $seedRow.CrossCoord; HasPlanes = $slotHasPlanes }
 
-            if ($null -eq $crossAxis) {
-                Write-Host "  That is not the FRONT OFFSET or TOP OFFSET plane. STAGE 6 only accepts one" -ForegroundColor Yellow
-                Write-Host "  of those two offset planes (not the base datums, the SIDE plane, or a face)." -ForegroundColor Yellow
-                Write-Host "  Click the FRONT or TOP offset plane and re-run STAGE 6." -ForegroundColor Yellow
-                $crossPlanes = @()
-            } else {
-                $crossPlanes = @($gridPlaneIds | Where-Object { $_.Axis -eq $crossAxis } | Sort-Object Offset)
-                Write-Host ("  Face is a {0} plane -> crossing {1} perpendicular {2}-pitch plane(s) (one hole each)." -f $bAxisLabel.ToUpper(), $crossPlanes.Count, $crossAxis) -ForegroundColor Cyan
-            }
-
-            if ($null -eq $sideFaceId -or $null -eq $boundaryId -or $crossPlanes.Count -eq 0) {
-                Write-Host "  Missing the SIDE face, a usable boundary face, or any pitch plane to cross -- cannot build the path." -ForegroundColor Yellow
-            } else {
-                Write-Host ("  Boundary face id = {0} ({1}); SIDE face id = {2}." -f $boundaryId, $bAxisLabel, $sideFaceId) -ForegroundColor DarkGray
-
-                # --- STEP 3: point = SIDE face n pitch-plane n boundary plane ---
-                # The PROVEN 3-plane intersection (Build-IntersectPointMacro), the
-                # exact recipe that built the grid -- all Feature-type planes, no edge
-                # fed to the dialog. One point per pitch plane = the holes spaced
-                # along the edge at the grid pitch.
+            if (-not $seed.Ok) {
+                Write-Host "  The seed slot was not confirmed -- no further slots made. Inspect Creo." -ForegroundColor Yellow
+            } elseif ($usePattern) {
+                # --- PATTERN the seed to the remaining rows (hands-free, datum-by-ID) ---
                 Write-Host ""
-                Write-Host ("  Creating {0} relief point(s) (3-plane intersection, no picks)..." -f $crossPlanes.Count) -ForegroundColor Cyan
-                $beforeRel = Get-PointIdSet -Model $model -TypeObj $pfcType
-                $rpIdx = 0
-                foreach ($pl in $crossPlanes) {
-                    $rpIdx++
-                    Show-Progress ([Math]::Floor(($rpIdx / $crossPlanes.Count) * 100)) "Relief point $rpIdx/$($crossPlanes.Count)"
-                    $macro = Build-IntersectPointMacro -PlaneIds @([int]$sideFaceId, [int]$boundaryId, [int]$pl.FeatId)
-                    try { $session.RunMacro($macro) } catch {
-                        Write-Host ("  Relief point {0} macro errored: {1}" -f $rpIdx, $_.Exception.Message) -ForegroundColor Red
-                    }
-                }
-                Show-Progress 100 "Done"
-                try { $model.Regenerate($null) } catch {}
-                $relPointIDs = @(Resolve-NewPointIds -Model $model -TypeObj $pfcType -Before $beforeRel)
-
-                if ($relPointIDs.Count -eq 0) {
-                    Write-Host ""
-                    Write-Host "  ABORT: no relief datum points were created. The boundary + SIDE face +" -ForegroundColor Red
-                    Write-Host "  pitch planes are all box datums (auto-chosen, guaranteed perpendicular)," -ForegroundColor Red
-                    Write-Host "  so this is unexpected -- inspect Creo; the box datums may not have been" -ForegroundColor Red
-                    Write-Host "  captured cleanly this run. You can also create the points by hand." -ForegroundColor Red
+                Write-Host "  SELECT THE SEED SLOT CUT in Creo's model tree (the remove-material extrude you" -ForegroundColor Magenta
+                Write-Host "  just verified), then press ENTER." -ForegroundColor Magenta
+                Read-Host
+                $selSeed = Read-SelectedId
+                if ($null -eq $selSeed) {
+                    Write-Host "  Nothing selected -- the seed slot IS cut; pattern by hand, or re-run with --no-pattern." -ForegroundColor Yellow
                 } else {
-                    Write-Host ("  {0} relief point(s) created. IDs: {1}" -f $relPointIDs.Count, (($relPointIDs | Select-Object -First 10) -join ", ")) -ForegroundColor Green
-
-                    # --- STEP 4: through-hole diameter = HALF the part extrude ---
-                    # The "part extrude" in the drill direction is the live SIDE offset
-                    # (re-read fresh; never trust the cached .Offset after a resize).
-                    $pathSide = @($made | Where-Object { $_.Label -eq "Side" })
-                    $pathSide = if ($pathSide.Count -gt 0) { $pathSide[0] } else { $null }
-                    $extrudeLen = $null
-                    if ($null -ne $pathSide -and $null -ne $pathSide.Sym) {
-                        $lv = Read-DimValue -Model $model -TypeObj $pfcType -Sym $pathSide.Sym
-                        if ($null -ne $lv -and $lv -gt 0) { $extrudeLen = [double]$lv }
-                    }
-                    $pathDia = $null
-                    if ($null -ne $extrudeLen -and $extrudeLen -gt 0) {
-                        $pathDia = [Math]::Round($extrudeLen / 2.0, 4)
-                        Write-Host ("  Relief-path hole diameter = {0}`" (= half the part extrude {1}`")" -f $pathDia, [Math]::Round($extrudeLen,4)) -ForegroundColor Green
+                    Write-Host ("  Patterning {0} copies at pitch {1:0.####} along {2}, direction = the {3} datum (by ID)..." -f $patPlan.Count, $patPlan.Increment, $slots.CrossAxis, $dirName) -ForegroundColor Cyan
+                    $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
+                    $patChanged = $false
+                    try {
+                        $session.RunMacro((Build-SlotPatternMacro -DirDatumId $dirDatumId -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$slotPatternFlip))
+                        if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -TimeoutMs 30000 }
+                    } catch { Write-Host "    pattern macro error: $($_.Exception.Message)" -ForegroundColor Red }
+                    if ($patChanged) {
+                        Write-Host ("  Done -- seed slot patterned to the remaining rows (model changed). {0} slots total, one per" -f $patPlan.Count) -ForegroundColor Green
+                        Write-Host ("  row, spaced {0:0.####}. If the copies marched the WRONG way (off the plate), re-run with --pattern-flip." -f $patPlan.Increment) -ForegroundColor DarkGray
                     } else {
-                        Write-Host "  Could not read the live SIDE offset (part extrude) -- enter it by hand." -ForegroundColor Yellow
-                        while ($null -eq $pathDia) {
-                            $raw = Read-Host "  Part extrude length in the drill direction (hole dia = half of it)"
-                            $pv = 0.0
-                            if ([double]::TryParse($raw.Trim(), [ref]$pv) -and $pv -gt 0) {
-                                $pathDia = [Math]::Round($pv / 2.0, 4)
-                            } else { Write-Host "  Enter a positive number." -ForegroundColor Yellow }
-                        }
-                        Write-Host ("  Relief-path hole diameter = {0}`"" -f $pathDia) -ForegroundColor Green
-                    }
-
-                    # --- STEP 5: drill a Thru-All On-Point hole at each relief point,
-                    # NORMAL TO THE BOUNDARY FACE (the user's rule: drill INTO the face
-                    # they picked, "the same direction the plane goes"). The On-Point
-                    # placement surface = the BOUNDARY face the user clicked in STEP 1
-                    # (its normal is the drill axis), NOT the SIDE face -- the SIDE face
-                    # is what made the holes drill through the thickness (the wrong
-                    # direction). The boundary face is the SAME for every relief point,
-                    # so all holes share it.
-                    $holeSurfId = [int]$boundaryId
-                    Write-Host ""
-                    Write-Host ("  Drilling {0} through-hole(s) at diameter {1}`", NORMAL to the boundary plane (id {2}), body index {3}..." -f $relPointIDs.Count, $pathDia, $boundaryId, $bodyIndex) -ForegroundColor Cyan
-                    $pTotal = $relPointIDs.Count
-                    $pIdx = 0; $pMade = 0; $pNoop = 0; $pFail = 0; $pAbort = $false
-                    foreach ($ptId in $relPointIDs) {
-                        $pIdx++
-                        Show-Progress ([Math]::Floor(($pIdx / $pTotal) * 100)) "Path hole $pIdx/$pTotal"
-                        # FlipCount=2: relief-path holes drill the OPPOSITE direction
-                        # along the boundary-face normal vs. the grid holes (which use
-                        # the default 1). One extra Flip toggle reverses the bore.
-                        $macro = Build-HoleMacro -PointId ([int]$ptId) -Diameter $pathDia -BodyIndex $bodyIndex -SurfacePlaneId $holeSurfId -FlipCount 2
-                        $changed = $false
-                        try {
-                            $stamp = $model.VersionStamp
-                            $session.RunMacro($macro)
-                            $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp
-                        } catch { $pFail++ }
-                        if ($changed) { $pMade++ } else { $pNoop++ }
-                        if ($pIdx -eq 1 -and -not $changed) {
-                            Show-Progress 100 "Canary failed"
-                            Write-Host ""
-                            Write-Host "  ABORT: the first relief-path hole did not modify the model." -ForegroundColor Red
-                            Write-Host "  The points exist; this is a hole-placement issue (inspect Creo)." -ForegroundColor Red
-                            $pAbort = $true
-                            break
-                        }
-                    }
-                    if (-not $pAbort) { Show-Progress 100 "Done" }
-                    Write-Host ""
-                    Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
-                    Write-Host ("  Relief-path points : {0}" -f $pTotal) -ForegroundColor White
-                    Write-Host ("  Model changed      : {0}" -f $pMade) -ForegroundColor White
-                    if ($pNoop -gt 0) { Write-Host ("  No-op (no change)  : {0}" -f $pNoop) -ForegroundColor Yellow }
-                    if ($pFail -gt 0) { Write-Host ("  Macro errors       : {0}" -f $pFail) -ForegroundColor Yellow }
-                    Write-Host ""
-                    if ($pAbort) {
-                        Write-Host "  STOPPED after the canary -- inspect the model in Creo." -ForegroundColor Red
-                    } elseif ($pMade -eq $pTotal -and $pFail -eq 0) {
-                        Write-Host "  Done -- $pMade chip-relief-path hole(s) drilled through at diameter $pathDia`". Verify visually in Creo." -ForegroundColor Green
-                    } else {
-                        Write-Host "  Finished with issues -- $pMade of $pTotal changed the model. Inspect Creo." -ForegroundColor Yellow
+                        Write-Host "  The pattern did NOT change the model. The seed slot IS cut; finish by hand or re-run with --no-pattern." -ForegroundColor Yellow
                     }
                 }
+            } else {
+                # --- PER-ROW: seed is row 1; draw the rest with the confirmed flip ---
+                $confirmedFlip = $seed.Flip
+                $rowNum = 1; $slMade = 1; $slNoop = 0
+                foreach ($row in @($slots.Rows | Select-Object -Skip 1)) {
+                    $rowNum++
+                    Write-Host ""
+                    Write-Host ("  ROW $rowNum of $(@($slots.Rows).Count) ($($slots.CrossAxis)~{0:0.###})" -f $row.CrossCoord) -ForegroundColor Cyan
+                    $mkOpenR = (Get-SelectByIdMacro -FeatId $slotFaceId) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
+                    try { $session.RunMacro($mkOpenR) } catch { Write-Host "    open error: $($_.Exception.Message)" -ForegroundColor Red; continue }
+                    Write-Host ("    Draw this row's slot rectangle ({0:0.###} long x {1:0.###} wide), then press ENTER." -f $row.SlotLen, $slots.SlotWidth) -ForegroundColor Magenta
+                    Read-Host
+                    $stampR = $null; try { $stampR = $model.VersionStamp } catch {}
+                    $chgR = $false
+                    try { $session.RunMacro((Build-CutFinishMacro -Depth $slotDepth -BodyIndex $bodyIndex -Flip $confirmedFlip)); if ($null -ne $stampR) { $chgR = Wait-ModelModified -Model $model -PreviousStamp $stampR -TimeoutMs 30000 } } catch { Write-Host "    cut error: $($_.Exception.Message)" -ForegroundColor Red }
+                    if ($chgR) { $slMade++; Write-Host "    Slot cut (model changed)." -ForegroundColor Green } else { $slNoop++; Write-Host "    No change." -ForegroundColor Yellow }
+                }
+                Write-Host ""
+                Write-Host ("  Done -- {0} of {1} slot(s) cut (per-row). Verify in Creo." -f $slMade, @($slots.Rows).Count) -ForegroundColor $(if ($slNoop -eq 0) { 'Green' } else { 'Yellow' })
             }
         }
     }

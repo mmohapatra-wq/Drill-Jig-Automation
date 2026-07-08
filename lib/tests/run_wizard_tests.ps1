@@ -212,6 +212,30 @@ Assert-True "relief: BLIND depth type (not thru-all)" (($r0 -match 'StrHoleDepBl
 Assert-True "relief: diameter present"         ($r0 -match 'diameter_mip_OptionMenu.*0\.75')
 
 # ----------------------------------------------------------------------------
+# core: chip-relief SLOT macros (Build-CutFinishMacro + Build-SlotPatternMacro),
+# shared by slotinator.cmd + drilljig.cmd + drilljig-gui.cmd.
+# ----------------------------------------------------------------------------
+Write-Host "  -- core: slot macros --" -ForegroundColor White
+$cut = Build-CutFinishMacro -Depth 0.15 -BodyIndex 0 -Flip $true
+Assert-True "cut: finishes the sketch"          ($cut -match 'ProCmdSketDone')
+Assert-True "cut: flip when -Flip true"         ($cut -match 'maindashInst0\.flip_pb')
+Assert-True "cut: types blind depth"            ($cut -match 'def_depth1_ip.*0\.15')
+Assert-True "cut: remove-material toggle"       ($cut -match 'remove_material_cb')
+Assert-True "cut: confirm Done"                 ($cut -match 'dashInst0\.Done')
+$cutNF = Build-CutFinishMacro -Depth 0.0 -BodyIndex 0 -Flip $false
+Assert-True "cut: -Flip false -> no flip"       (-not ($cutNF -match 'maindashInst0\.flip_pb'))
+Assert-True "cut: depth 0 -> no depth typed"    (-not ($cutNF -match 'def_depth1_ip'))
+$sp = Build-SlotPatternMacro -DirDatumId 55 -Count 5 -Spacing 4
+Assert-True "slotpat: opens the geom pattern"   ($sp -match 'ProCmdGeomPattern')
+Assert-True "slotpat: activates dir-1 collector"($sp -match 'ui_pat_dir_dir1')
+Assert-True "slotpat: feeds the datum by id"    ($sp -match 'SelOptionRadio.*Datum' -and $sp -match 'InputIDPanel.*55')
+Assert-True "slotpat: sets count"               ($sp -match 'ui_pat_dir_1_num_inst.*5')
+Assert-True "slotpat: sets spacing"             ($sp -match 'ui_pat_dir_1_incr.*4')
+Assert-True "slotpat: confirms stdbtn_1"        ($sp -match 'dashInst0\.stdbtn_1')
+$spF = Build-SlotPatternMacro -DirDatumId 55 -Count 5 -Spacing 4 -Flip
+Assert-True "slotpat: -Flip adds ui_pat_dir_1_flip" ($spF -match 'ui_pat_dir_1_flip')
+
+# ----------------------------------------------------------------------------
 # PARSE + FUNCTION-RESOLVE smoke check of drilljig-gui.cmd
 # ----------------------------------------------------------------------------
 Write-Host "  -- smoke: drilljig-gui.cmd parse + resolve --" -ForegroundColor White
@@ -518,9 +542,40 @@ try {
 
     $drifted = @($djFns | Where-Object { $coreFns -contains $_ })
     Assert-True "parity: drilljig.cmd does NOT re-define any drilljig_core function (0 drift)" ($drifted.Count -eq 0) ("drifted: {0}" -f ($drifted -join ', '))
+
+    # slotinator.cmd must no longer DEFINE the slot primitives moved to the lib
+    # (Build-CutFinishMacro / Invoke-VerifiedSeedCut) - it uses the lib copies.
+    $slText = Get-Content -Raw (Join-Path $root 'slotinator.cmd')
+    $slT=$null; $slE=$null
+    $slAst = [System.Management.Automation.Language.Parser]::ParseInput($slText, [ref]$slT, [ref]$slE)
+    $slFns = @($slAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+    Assert-True "parity: slotinator.cmd does NOT re-define Build-CutFinishMacro" (-not ($slFns -contains 'Build-CutFinishMacro'))
+    Assert-True "parity: slotinator.cmd does NOT re-define Invoke-VerifiedSeedCut" (-not ($slFns -contains 'Invoke-VerifiedSeedCut'))
+    Assert-True "parity: slotinator.cmd uses the lib Build-SlotPatternMacro" ($slText -match 'Build-SlotPatternMacro -DirDatumId')
 } catch {
     Assert-True "parity harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
 }
+
+# ----------------------------------------------------------------------------
+# core: New-SlotGuidePlanes -- creates + shows the slot-edge guide planes (the 2+
+# planes slotinator makes). COM-heavy, so stub New-OffsetPlane + the core session
+# scope; assert pattern-mode (first row only) creates FEWER than all-rows. Placed
+# last so the New-OffsetPlane stub doesn't shadow earlier tests.
+# ----------------------------------------------------------------------------
+Write-Host "  -- core: New-SlotGuidePlanes --" -ForegroundColor White
+function New-OffsetPlane { param($Label,$Offset,$BaseId) $script:gpN++; return @{ FeatId = (3000 + $script:gpN); Symbol = "g$($script:gpN)" } }
+$gpStubS = [pscustomobject]@{}; Add-Member -InputObject $gpStubS -MemberType ScriptMethod -Name RunMacro -Value { param($x) }
+$gpStubM = [pscustomobject]@{}; Add-Member -InputObject $gpStubM -MemberType ScriptMethod -Name Regenerate -Value { param($x) }
+Set-Variable -Name DJSession -Scope Script -Value $gpStubS
+Set-Variable -Name DJModel   -Scope Script -Value $gpStubM
+$gpGeo = Get-OrthogridGeometry -CcX 2.0 -CcZ 2.0 -Nx 3 -Nz 3 -Edge 2.0 -ClearDia 0.75
+$gpSl  = Get-RowSlots -Points $gpGeo.Points -SlotWidth 0.75 -Width $gpGeo.Width -Height $gpGeo.Height -RowAxis 'X'
+$script:gpN = 0; $gpPat = New-SlotGuidePlanes -Rows $gpSl.Rows -TopBaseId 10 -FrontBaseId 11 -UsePattern
+$script:gpN = 0; $gpAll = New-SlotGuidePlanes -Rows $gpSl.Rows -TopBaseId 10 -FrontBaseId 11
+Assert-True "guides: pattern mode creates >=1 plane"        (@($gpPat.Ids).Count -ge 1)
+Assert-True "guides: all-rows creates more than first-row"  (@($gpAll.Ids).Count -gt @($gpPat.Ids).Count)
+Assert-True "guides: no TOP/FRONT base -> no planes, no throw" (@((New-SlotGuidePlanes -Rows $gpSl.Rows -TopBaseId 0 -FrontBaseId 0).Ids).Count -eq 0)
+Assert-True "guides: empty rows -> no planes, no throw"     (@((New-SlotGuidePlanes -Rows @() -TopBaseId 10 -FrontBaseId 11).Ids).Count -eq 0)
 
 # ----------------------------------------------------------------------------
 Write-Host ""

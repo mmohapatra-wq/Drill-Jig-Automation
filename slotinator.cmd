@@ -122,162 +122,12 @@ function Write-Log {
 }
 
 # ----------------------------------------------------------------------------
-# Build-CutFinishMacro - MACRO B: finish the internal sketch (which now holds the
-# rectangle the operator just drew around this row's holes), toggle REMOVE
-# MATERIAL, pick the target body, confirm. ONE atomic RunMacro - a dashboard's
-# command context does not survive across RunMacro calls (CLAUDE.md boxinator
-# lesson), so the whole finish-to-Done sequence is a single string.
-#
-# The cut fires as: ProCmdSketDone -> (flip) -> type the BLIND depth into
-# def_depth1_ip -> blur -> remove_material_cb -> body -> Done. Sources:
-#   * the finish/blur/remove-material/body/Done spine is the operator's recording
-#     trail.txt.32:4398-4412 (the drilljig slot cut, 2026-07-06);
-#   * the DEPTH VALUE is typed into maindashInst0.def_depth1_ip (Input/Update/
-#     Activate/FocusOut) - the recorded extrude blind-depth field, trail.txt.27:3973
-#     (used 33x across trails). This REPLACED an earlier attempt with
-#     GrmTextTagEmbedMRU (boxinator's field, wrong on this build) and then with NO
-#     depth at all (took Creo's default = the "wrong depth" the user hit). A plain
-#     extrude defaults to Blind, so def_depth1_ip is directly editable without
-#     touching depth_flyout (confirmed: trail.txt.27 types it with no flyout).
-#
-# DIRECTION FLIP (fixes "extrude going the wrong way", 2026-07-06): the default
-# cut direction was going the WRONG way on the existing plate, so the cut extrudes
-# INTO the plate by flipping the extrude direction. maindashInst0.flip_pb is the
-# recorded extrude direction-flip button (trail.txt.8:1758 + trail.txt.9:3878),
-# fired right after ProCmdSketDone. One Activate = one flip off the default.
-# -Flip:$false skips it if a future part already defaults the correct way.
-#
-# WIDGET PROVENANCE (confirmed live):
-#   ProCmdSketDone .................... exit sketcher (trail.txt.32)
-#   maindashInst0.flip_pb ............. extrude direction flip (trail.txt.8:1758)
-#   maindashInst0.def_depth1_ip ....... blind depth value (trail.txt.27:3973)
-#   Enter/Exit dashInst0.Quit ......... blur the dashboard so Done can land (trail.32)
-#   maindashInst0.remove_material_cb 1  the Remove-Material toggle (this makes
-#                                       the extrude a CUT); trail.txt.32 + .8:1799
-#   chkbn.body_page.0 / body_page.1.0 / PH.bodyselectrepwdg_list   body select
-#   dashInst0.Done .................... confirm
+# Build-CutFinishMacro, Invoke-VerifiedSeedCut, and Build-SlotPatternMacro now live
+# in lib\drilljig_core.ps1 (dot-sourced below) so slotinator.cmd, drilljig.cmd, and
+# drilljig-gui.cmd all fire the SAME confirmed-live macros. Invoke-VerifiedSeedCut
+# reads the core session scope ($script:DJSession/$script:DJModel) set by
+# Initialize-DrilljigCore, which slotinator calls after connecting.
 # ----------------------------------------------------------------------------
-function Build-CutFinishMacro {
-    param([double]$Depth = 0.0, [int]$BodyIndex = 0, [bool]$Flip = $true)
-    $flipMacro = if ($Flip) { "~ Activate ``main_dlg_cur`` ``maindashInst0.flip_pb``;" } else { "" }
-    # type the blind depth into def_depth1_ip (Input/Update/Activate/FocusOut, the
-    # recorded pattern). Only when a positive depth was derived; otherwise fall back
-    # to Creo's default depth (no depth widget touched).
-    $depthMacro = if ($Depth -gt 0) {
-        "~ Input  ``main_dlg_cur`` ``maindashInst0.def_depth1_ip`` ``$Depth``;" +
-        "~ Update ``main_dlg_cur`` ``maindashInst0.def_depth1_ip`` ``$Depth``;" +
-        "~ Activate ``main_dlg_cur`` ``maindashInst0.def_depth1_ip``;" +
-        "~ FocusOut ``main_dlg_cur`` ``maindashInst0.def_depth1_ip``;"
-    } else { "" }
-    return "~ Command ``ProCmdSketDone``;" +
-        # flip the extrude direction so the cut goes INTO the plate (the default
-        # was the wrong way); fired before the depth, per trail.txt.8:1758
-        $flipMacro +
-        # type the blind depth (def_depth1_ip, trail.txt.27:3973)
-        $depthMacro +
-        # blur the dashboard so Done can land
-        "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
-        "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
-        # REMOVE MATERIAL -> this extrude becomes a cut
-        "~ Activate ``main_dlg_cur`` ``maindashInst0.remove_material_cb`` 1;" +
-        # body the cut removes from (the recorded body_page.1.0 collector)
-        "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
-        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ``$BodyIndex``;" +
-        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
-        "~ Focus  ``body_page.1.0`` ``PH.bodyselectrepwdg_list``;" +
-        "~ Select ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` 1 ``$BodyIndex``;" +
-        "~ Trigger ``body_page.1.0`` ``PH.bodyselectrepwdg_list`` ````;" +
-        # confirm
-        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
-}
-
-# ----------------------------------------------------------------------------
-# Invoke-VerifiedSeedCut - fire the FIRST slot cut and VERIFY it with the operator
-# (user 2026-07-06: "keep auto-SIDE, verify seed"). The correct cut DIRECTION
-# depends on which plane the sketch lands on, which I cannot determine offline and
-# have guessed wrong repeatedly. So: open the sketch, the operator draws the
-# rectangle, we fire the cut, then ASK whether it cut INTO the plate at the right
-# depth. If NOT, we undo it, TOGGLE the flip, and let them redraw once (only two
-# possible directions). Returns @{ Ok; Flip; FeatId } - the CONFIRMED-good Flip is
-# reused for every remaining row / the pattern, so direction is verified ONCE.
-#
-# Requires (module scope, set after connect): $session, $model. Uses the shared
-# Get-SelectByIdMacro / Get-FeatureIdSet / Wait-ModelModified.
-function Invoke-VerifiedSeedCut {
-    param(
-        [int]$FaceId,
-        [double]$Depth,
-        [int]$BodyIndex,
-        [bool]$Flip,
-        [string]$RowLabel = "row 1",
-        [hashtable]$DrawInfo   # SlotLen, RowAxis, SlotWidth, CrossAxis, CrossCoord, HasPlanes
-    )
-    $curFlip = $Flip
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $dirWord = if ($curFlip) { "flipped" } else { "default" }
-        # --- open the extrude/sketch on the face + arm the corner-rectangle ---
-        $mkOpen =
-            (Get-SelectByIdMacro -FeatId $FaceId) +
-            "~ Command ``ProCmdFtExtrude``;" +
-            "~ Command ``ProCmdViewSketchView``;" +
-            "~ Command ``ProCmdSketRectangle`` 1;"
-        Write-Host ""
-        Write-Host ("  SEED SLOT ($RowLabel) - attempt $attempt, direction: $dirWord - opening the sketch...") -ForegroundColor Cyan
-        try { $session.RunMacro($mkOpen) }
-        catch {
-            Write-Host "    Could not open the sketch: $($_.Exception.Message)" -ForegroundColor Red
-            return @{ Ok = $false; Flip = $curFlip; FeatId = $null }
-        }
-
-        # --- the operator draws the rectangle ---
-        Write-Host ""
-        Write-Host "  MANUAL STEP - draw the rectangle over $RowLabel's holes:" -ForegroundColor Magenta
-        Write-Host ("    target: {0:0.###} long (along {1}) x {2:0.###} wide (along {3}), centered on {3}~{4:0.###}" -f `
-            $DrawInfo.SlotLen, $DrawInfo.RowAxis, $DrawInfo.SlotWidth, $DrawInfo.CrossAxis, $DrawInfo.CrossCoord) -ForegroundColor White
-        if ($DrawInfo.HasPlanes) { Write-Host "    Snap the rectangle edges to the visible slot-edge planes." -ForegroundColor White }
-        Write-Host "    Click one corner then the opposite corner (ONE closed rectangle). Esc drops the tool." -ForegroundColor White
-        Write-Host "    Leave the rectangle drawn + sketch OPEN, then press ENTER here." -ForegroundColor Yellow
-        Read-Host
-
-        # --- fire the cut; diff feature ids around it to find the seed feature ---
-        $beforeFeat = Get-FeatureIdSet
-        $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
-        $changed = $false
-        try {
-            $session.RunMacro((Build-CutFinishMacro -Depth $Depth -BodyIndex $BodyIndex -Flip $curFlip))
-            if ($null -ne $stamp) { $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -TimeoutMs 30000 }
-        } catch { Write-Host "    Macro error on the cut: $($_.Exception.Message)" -ForegroundColor Red }
-
-        if (-not $changed) {
-            Write-Host "  The cut did NOT modify the model (rectangle not a closed loop, or widget drift)." -ForegroundColor Red
-            return @{ Ok = $false; Flip = $curFlip; FeatId = $null }
-        }
-        $afterFeat = Get-FeatureIdSet
-        $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) } | Sort-Object)
-        $featId    = if ($newFeats.Count -ge 1) { [int]$newFeats[-1] } else { $null }
-
-        # --- VERIFY direction + depth with the operator ---
-        Write-Host ""
-        Write-Host "  VERIFY IN CREO: did this slot cut INTO the plate, at the right depth?" -ForegroundColor Magenta
-        $ok = Read-Host "    y = correct (keep it, reuse this direction for all rows) / n = wrong (undo + flip + redraw)"
-        if ($ok -match '^[Yy]') {
-            Write-Host ("  Direction CONFIRMED ($dirWord). Reusing it for the remaining rows.") -ForegroundColor Green
-            return @{ Ok = $true; Flip = $curFlip; FeatId = $featId }
-        }
-
-        if ($attempt -lt 2) {
-            Write-Host "  Flipping the direction. First remove this wrong cut:" -ForegroundColor Yellow
-            try { $session.RunMacro("~ Command ``ProCmdEditUndo``;") } catch {}
-            Write-Host "    (I fired Undo. If the wrong slot is STILL in the model, press Ctrl+Z in Creo now.)" -ForegroundColor Yellow
-            Write-Host "    Press ENTER when the wrong slot is gone - you'll redraw with the flipped direction." -ForegroundColor Yellow
-            Read-Host
-            $curFlip = -not $curFlip
-        } else {
-            Write-Host "  Both directions tried and neither was confirmed. Leaving the last cut - inspect Creo." -ForegroundColor Yellow
-            return @{ Ok = $false; Flip = $curFlip; FeatId = $featId }
-        }
-    }
-}
 
 # ============================================================================
 # HEADER
@@ -886,10 +736,7 @@ if ($go -notmatch '^[Yy]$') {
             # the datum plane BY ID -> set count + spacing (+ optional flip) -> confirm.
             $stamp2 = $null; try { $stamp2 = $model.VersionStamp } catch {}
             try {
-                $patMacro = (Build-PatternArmMacro) +
-                            (Get-SelectDatumByIdMacro -FeatId ([int]$dirDatumId)) +
-                            (Build-PatternValuesMacro -Count1 ([int]$patPlan.Count) -Spacing1 ([double]$patPlan.Increment) -Flip1:$PatternFlip) +
-                            (Build-PatternConfirmMacro)
+                $patMacro = Build-SlotPatternMacro -DirDatumId ([int]$dirDatumId) -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$PatternFlip
                 $session.RunMacro($patMacro)
                 if ($null -ne $stamp2) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stamp2 -TimeoutMs 30000 }
             } catch { Write-Host "    pattern macro error: $($_.Exception.Message)" -ForegroundColor Red }

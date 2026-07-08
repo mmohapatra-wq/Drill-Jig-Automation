@@ -72,8 +72,13 @@ $mCr = [regex]::Match($ScriptArgs, '(?i)--corner-radius\s+([0-9]*\.?[0-9]+)')
 if ($mCr.Success) { $cornerRadius = [double]$mCr.Groups[1].Value }
 $noCornerRound = ($ScriptArgs -match '(?i)--no-corner-round')
 
-$RELIEF_DIA_MULT  = 1.5
-$RELIEF_DEPTH_PCT = 0.20
+# chip-relief SLOTS (slotinator method): depth = % of plate thickness; direction
+# flags mirror slotinator/drilljig.cmd.
+$SLOT_DEPTH_PCT  = 0.20
+$slotFlipDefault = ($ScriptArgs -match '(?i)--slot-flip')
+$slotPatternFlip = ($ScriptArgs -match '(?i)--pattern-flip')
+$slotNoPattern   = ($ScriptArgs -match '(?i)--no-pattern')
+$noSlotRelief    = ($ScriptArgs -match '(?i)--no-slot-relief')
 
 # ============================================================================
 # The shared CONTEXT hashtable - every wizard step reads/writes it. Holds the
@@ -129,10 +134,12 @@ $ctx = @{
     BodyIndex   = 0
     HoleDiaFinal = 0.0
     Drilled     = $false
-    # STAGE 6 relief paths
-    ReliefBoundaryId = $null
-    ReliefCrossAxis  = $null
-    ReliefBLabel     = $null
+    # STAGE 4 chip-relief SLOTS (slotinator method; replaces relief holes + paths)
+    SlotArmed    = $false     # slot-a armed the seed sketcher; gates slot-b
+    SlotSkip     = $false     # metal declined, or no layout -> skip the slot stage
+    SlotFlip     = $false     # confirmed cut-direction flip (learned on the seed)
+    SlotPlan     = $null      # {Rows; SlotWidth; RowAxis; CrossAxis; Depth; FaceId; DirDatumId; DirName; PatPlan; UsePattern}
+    SlotsDone    = $false
 }
 
 # ----------------------------------------------------------------------------
@@ -1181,8 +1188,7 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
         if ($null -ne $c.OrthoGeo) { $msg += ("- create {0} datum points from the {1} layout (3-plane intersections, no picks)" -f $c.OrthoGeo.Count, $c.OrthoGeo.Mode) + [Environment]::NewLine }
         if (-not $noCornerRound)   { $msg += ("- auto-round the box corner edges at radius {0}" -f $cornerRadius) + [Environment]::NewLine }
         $msg += ("- drill {0} through-hole(s) at diameter {1}`"" -f $n, $dia) + [Environment]::NewLine
-        $relAuto = ($c.Is3dPrint -or $null -ne $c.OrthoGeo)
-        $msg += ("- chip-relief holes: {0}" -f $(if ($relAuto) { 'yes (automatic)' } else { 'asked after drilling' })) + [Environment]::NewLine
+        $msg += "- chip-relief SLOTS follow as the next step (draw one seed, then pattern)." + [Environment]::NewLine
         Add-Para $panel $msg 8 200 'Gray'
     } `
     -OnNext {
@@ -1288,144 +1294,166 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
         elseif ($made -eq $total -and $failed -eq 0) { $wiz.SetChip('drill', ("drill: {0} holes" -f $made), 'built') }
         else { $wiz.SetChip('drill', ("drill: {0}/{1}" -f $made, $total), 'unverified') }
         $wiz.Log(("Through-holes: {0} of {1} changed the model." -f $made, $total))
-
-        # ---- STAGE 4: chip-relief holes ----
-        if (-not $aborted -and $made -gt 0) {
-            $relAuto = ($c.Is3dPrint -or $c.GridPointIDs.Count -gt 0)
-            $doRelief = $relAuto
-            if (-not $relAuto) {
-                $ans = Show-WizardMessage -Text 'Add chip-relief holes on these points?' -Title 'Chip relief' -Buttons 'YesNo' -Icon 'Question'
-                $doRelief = ($ans -eq [System.Windows.Forms.DialogResult]::Yes)
-            }
-            if ($doRelief) {
-                # relief depth from live SIDE offset
-                $reliefSide = @($c.Made | Where-Object { $_.Label -eq 'Side' }); $reliefSide = if ($reliefSide.Count -gt 0) { $reliefSide[0] } else { $null }
-                $thickness = $null
-                if ($null -ne $reliefSide -and $null -ne $reliefSide.Sym) { $live = Read-DimValue -Model $model -TypeObj $pfcType -Sym $reliefSide.Sym; if ($null -ne $live -and $live -gt 0) { $thickness = [double]$live } }
-                if ($null -eq $thickness -or $thickness -le 0) {
-                    $wiz.Log('No live SIDE offset - skipping chip relief (no thickness to size depth from).')
-                    $wiz.SetChip('relief', 'relief: skipped', 'warning')
-                } else {
-                    $reliefDepth = [Math]::Round($thickness * $RELIEF_DEPTH_PCT, 4)
-                    $reliefDia = [Math]::Round($c.HoleDiaFinal * $RELIEF_DIA_MULT, 4)
-                    $wiz.Log(("Chip-relief: {0} hole(s), dia {1}, blind depth {2}..." -f @($c.PointIDs).Count, $reliefDia, $reliefDepth))
-                    $rt=@($c.PointIDs).Count; $ri=0; $rm=0; $rab=$false; $rdh=0; $rdm=0
-                    foreach ($ptId in $c.PointIDs) {
-                        $ri++
-                        $wiz.SetProgress([Math]::Floor(($ri/$rt)*100), ("relief $ri / $rt"))
-                        $beforeMap = Get-LinearDimMap -Model $model -TypeObj $pfcType
-                        $rSurf = 0; if ($c.GridPointIDs.Count -gt 0 -and $null -ne $c.SidePlane -and $null -ne $c.SidePlane.FeatId) { $rSurf = [int]$c.SidePlane.FeatId }
-                        $macro = Build-ReliefHoleMacro -PointId $ptId -Diameter $reliefDia -BodyIndex $c.BodyIndex -SurfacePlaneId $rSurf
-                        $changed = $false
-                        try { $stamp = $model.VersionStamp; $session.RunMacro($macro); $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } } catch {}
-                        if ($changed) { $rm++; $dr = Set-ReliefHoleDepth -BeforeMap $beforeMap -Depth $reliefDepth; if ($dr.Status -eq 'held') { $rdh++ } else { $rdm++ } }
-                        if ($ri -eq 1 -and -not $changed) { $wiz.Log('ABORT: first relief hole did not modify the model.'); $rab=$true; break }
-                    }
-                    if ($rab) { $wiz.SetChip('relief', 'relief: aborted', 'aborted') }
-                    elseif ($rm -eq $rt -and $rdm -eq 0) { $wiz.SetChip('relief', ("relief: {0} @depth" -f $rm), 'built') }
-                    else { $wiz.SetChip('relief', ("relief: {0}/{1}" -f $rm, $rt), 'unverified') }
-                    $wiz.Log(("Chip-relief: {0} of {1} changed; {2} at correct depth." -f $rm, $rt, $rdh))
-                }
-            } else { $wiz.SetChip('relief', 'relief: skipped', 'set') }
-        }
+        # Chip-relief SLOTS are a SEPARATE stage (slot-a / slot-b) after this one,
+        # since the seed slot needs a manual rectangle DRAW (a RunMacro can't draw) -
+        # the same arm/finish split the box build uses. See below.
         return $true
     }
 [void]$steps.Add($drillStep)
 
-# ---- STAGE: Relief Paths -- chip-relief holes along a boundary edge ----------
-# STAGE 6 from drilljig.cmd: the user picks a boundary OFFSET plane (TOP or FRONT
-# offset only), a row of intersection points is created where that plane crosses the
-# pitch planes, and a through-hole is drilled at each. Gated on $c.GridPlaneIds
-# (STAGE 2.5 must have created offset planes). Uses the same shared primitives
-# (Build-IntersectPointMacro, Build-HoleMacro, Resolve-NewPointIds, Get-PointIdSet).
-$reliefPathStep = New-WizardStep -Key 'relief-paths' -Title 'Chip-relief paths (optional)' -Stage 'Relief' -Kind 'pick' -PrimaryText 'Skip' `
+# ---- STAGE: Relief -- chip-relief SLOTS (slotinator method) -----------------
+# Replaces the old relief holes + relief paths with ONE blind rectangular slot per
+# hole ROW (length = part length, width = hole dia, depth = % of thickness), seed-
+# drawn once then patterned along a base datum plane's normal. Split into slot-a
+# (arm the seed sketch) + slot-b (finish the cut, verify direction, pattern) exactly
+# like box-a/box-b, because the seed rectangle is a manual DRAW a RunMacro can't do.
+# Reuses ONLY context already gathered: hole dia ($c.HoleDiaFinal), plate thickness
+# (live SIDE offset), layout ($c.OrthoGeo), datums ($c.Made/$c.SidePlane), body.
+# Needs a GUI layout; PREDEFINED points have no rows -> the stage skips itself.
+$slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the seed' -Stage 'Relief' -Kind 'run' -PrimaryText 'Open the seed sketch' `
     -Validate { param($c) return $true } `
     -Build {
         param($panel, $c, $wiz)
-        if (@($c.GridPlaneIds).Count -eq 0) {
-            Add-Para $panel "No grid offset planes available (STAGE 2.5 was skipped or used predefined points). Chip-relief paths require an orthogrid/custom layout. Press Skip to continue." 8 60 'gray'
-            return
-        }
-        Add-ArmBanner $panel ("In Creo, click the BOUNDARY OFFSET plane the relief holes drill INTO." + [Environment]::NewLine +
-                              "Only the TOP OFFSET or FRONT OFFSET plane (the far box faces created earlier)." + [Environment]::NewLine +
-                              "A row of holes is drilled into this face, normal to it, at the grid pitch.") 8
-        Add-VerifyControls -Panel $panel -Context $c -Wizard $wiz -Top 140 -OnVerify {
-            param($cc, $w)
-            $boundaryId = Read-SelectedId
-            if ($null -eq $boundaryId) { return @{ Ok=$false; Message='Nothing selected. Click the FRONT or TOP offset plane in Creo, then verify.' } }
-            # match to a box OFFSET plane (FeatId only — not BaseId)
-            $topP = @($cc.Planes | Where-Object { $_.Label -eq 'Top' } | Select-Object -First 1); $topP = if ($topP.Count -gt 0) { $topP[0] } else { $null }
-            $frontP = @($cc.Planes | Where-Object { $_.Label -eq 'Front' } | Select-Object -First 1); $frontP = if ($frontP.Count -gt 0) { $frontP[0] } else { $null }
-            $crossAxis = $null; $bLabel = $null
-            if ($null -ne $topP -and $null -ne $topP.FeatId -and $boundaryId -eq [int]$topP.FeatId) { $bLabel='Top'; $crossAxis='Z' }
-            elseif ($null -ne $frontP -and $null -ne $frontP.FeatId -and $boundaryId -eq [int]$frontP.FeatId) { $bLabel='Front'; $crossAxis='X' }
-            if ($null -eq $crossAxis) { return @{ Ok=$false; Message='That is not the FRONT OFFSET or TOP OFFSET plane. Only those two are accepted.' } }
-            $cc.ReliefBoundaryId = [int]$boundaryId
-            $cc.ReliefCrossAxis = $crossAxis
-            $cc.ReliefBLabel = $bLabel
-            $w.SetChip('paths', ("relief path: {0} boundary" -f $bLabel), 'set')
-            $crossPlanes = @($cc.GridPlaneIds | Where-Object { $_.Axis -eq $crossAxis })
-            return @{ Ok=$true; Message=("{0} boundary (id {1}) -> crossing {2} perpendicular {3}-pitch plane(s)." -f $bLabel, $boundaryId, $crossPlanes.Count, $crossAxis) }
-        }
+        if ($noSlotRelief) { Add-Para $panel "Chip-relief slots are disabled (--no-slot-relief). Press Next to finish." 8 60 'gray'; return }
+        if ($null -eq $c.OrthoGeo) { Add-Para $panel ("No grid/custom layout was entered (predefined points). Chip-relief slots group holes into rows from the layout, so they need an orthogrid/custom run. Press Next to skip.") 8 60 'gray'; return }
+        if ($c.SlotArmed) { Add-Para $panel ("The seed sketcher is open in Creo. Draw ONE rectangle over the first hole row, then press Next.") 8 60 'DarkGreen' $true; return }
+        $slotW = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal } elseif ($null -ne $c.HoleDia) { [double]$c.HoleDia } else { 0 }
+        $gate = if ($c.Is3dPrint) { 'added automatically (3D print)' } else { 'you will be asked (metal) when you press the button' }
+        Add-Para $panel ("One blind rectangular slot per hole ROW: length = part length, width = the hole diameter ({0}`"), depth = {1:P0} of the plate thickness. Draw ONE seed slot; the rest are patterned. Chip relief: {2}." -f $slotW, $SLOT_DEPTH_PCT, $gate) 8 90 'Gray'
+        Add-Para $panel "Press the button: Creo opens the sketcher on the SIDE face; then draw the seed rectangle over the first hole row." 110 50 'Gray'
     } `
     -OnNext {
         param($c, $wiz)
-        # if no grid planes → just advance (Skip)
-        if (@($c.GridPlaneIds).Count -eq 0) { return $true }
-        # if no boundary picked → just advance (user pressed Skip)
-        if ($null -eq $c.ReliefBoundaryId) { return $true }
+        if ($c.SlotArmed) { return $true }   # armed already (came back) -> advance to slot-b
         $script:GuiWiz = $wiz
-        $wiz.BeginRun('Creating chip-relief path holes...')
-        $crossPlanes = @($c.GridPlaneIds | Where-Object { $_.Axis -eq $c.ReliefCrossAxis } | Sort-Object Offset)
-        $sideFaceId = if ($null -ne $c.SidePlane -and $null -ne $c.SidePlane.FeatId) { [int]$c.SidePlane.FeatId } elseif ($null -ne $c.SidePlane -and $null -ne $c.SidePlane.BaseId) { [int]$c.SidePlane.BaseId } else { $null }
-        if ($null -eq $sideFaceId -or $crossPlanes.Count -eq 0) {
-            $wiz.Log('Missing SIDE face or pitch planes - cannot build the relief path.')
-            $wiz.SetChip('paths', 'paths: skipped', 'warning')
-            return $true
+        # skip conditions
+        if ($noSlotRelief -or $null -eq $c.OrthoGeo) { $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'set'); return $true }
+        # material gate: 3DP auto; metal asks
+        if (-not $c.Is3dPrint) {
+            $ans = Show-WizardMessage -Text 'Add chip-relief slots (one per hole row)?' -Title 'Chip-relief slots' -Buttons 'YesNo' -Icon 'Question'
+            if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'set'); return $true }
         }
-        # create intersection points: SIDE face n boundary n each pitch plane
-        $wiz.Log(("Creating {0} relief point(s) (3-plane intersection)..." -f $crossPlanes.Count))
-        $beforeRel = Get-PointIdSet -Model $model -TypeObj $pfcType
-        $rpIdx = 0
-        foreach ($pl in $crossPlanes) {
-            $rpIdx++
-            $wiz.SetProgress([Math]::Floor(($rpIdx / $crossPlanes.Count) * 100), ("relief point $rpIdx / $($crossPlanes.Count)"))
-            $macro = Build-IntersectPointMacro -PlaneIds @([int]$sideFaceId, [int]$c.ReliefBoundaryId, [int]$pl.FeatId)
-            try { $session.RunMacro($macro) } catch { $wiz.Log("  point $rpIdx errored: $($_.Exception.Message)") }
+        # compute the slot plan from the SAME layout the holes came from
+        $slotW = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal } else { 0.25 }
+        $slots = Get-RowSlots -Points $c.OrthoGeo.Points -SlotWidth $slotW -Width $c.OrthoGeo.Width -Height $c.OrthoGeo.Height -RowAxis 'X'
+        if (-not $slots.Valid -or @($slots.Rows).Count -lt 1) {
+            $wiz.Log('The layout produced no valid slot rows - skipping chip-relief slots.')
+            $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'warning'); return $true
         }
-        try { $model.Regenerate($null) } catch {}
-        $relPointIDs = @(Resolve-NewPointIds -Model $model -TypeObj $pfcType -Before $beforeRel)
-        if ($relPointIDs.Count -eq 0) {
-            $wiz.Log('ABORT: no relief datum points were created.')
-            $wiz.SetChip('paths', 'paths: no points', 'aborted')
-            return $true
+        # thickness from the LIVE SIDE offset -> depth
+        $sSide = @($c.Made | Where-Object { $_.Label -eq 'Side' }); $sSide = if ($sSide.Count -gt 0) { $sSide[0] } else { $null }
+        $slotDepth = 0.0
+        if ($null -ne $sSide -and $null -ne $sSide.Sym) { $lv = Read-DimValue -Model $model -TypeObj $pfcType -Sym $sSide.Sym; if ($null -ne $lv -and $lv -gt 0) { $slotDepth = [Math]::Round([double]$lv * $SLOT_DEPTH_PCT, 4) } }
+        # sketch face = SIDE og datum; direction datum from the march axis
+        $faceId = if ($null -ne $c.SidePlane -and $null -ne $c.SidePlane.BaseId) { [int]$c.SidePlane.BaseId } else { $null }
+        $frontB = @($c.Made | Where-Object { $_.Label -eq 'Front' }); $frontB = if ($frontB.Count -gt 0) { $frontB[0] } else { $null }
+        $topB   = @($c.Made | Where-Object { $_.Label -eq 'Top' });   $topB   = if ($topB.Count -gt 0) { $topB[0] } else { $null }
+        $dirId = $null; $dirName = $null
+        if ($slots.CrossAxis -eq 'Z') { if ($null -ne $frontB -and $null -ne $frontB.BaseId) { $dirId = [int]$frontB.BaseId; $dirName='FRONT' } }
+        else                          { if ($null -ne $topB   -and $null -ne $topB.BaseId)   { $dirId = [int]$topB.BaseId;   $dirName='TOP' } }
+        if ($null -eq $faceId) {
+            $wiz.Log('The SIDE datum was not captured - cannot sketch the slots. Skipping.')
+            $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'warning'); return $true
         }
-        $wiz.Log(("{0} relief point(s) created." -f $relPointIDs.Count))
-        # hole diameter = half the part extrude (live SIDE offset)
-        $pathSide = @($c.Made | Where-Object { $_.Label -eq 'Side' }); $pathSide = if ($pathSide.Count -gt 0) { $pathSide[0] } else { $null }
-        $extrudeLen = $null
-        if ($null -ne $pathSide -and $null -ne $pathSide.Sym) { $lv = Read-DimValue -Model $model -TypeObj $pfcType -Sym $pathSide.Sym; if ($null -ne $lv -and $lv -gt 0) { $extrudeLen = [double]$lv } }
-        $pathDia = if ($null -ne $extrudeLen -and $extrudeLen -gt 0) { [Math]::Round($extrudeLen / 2.0, 4) } else { 0.25 }
-        $wiz.Log(("Drilling {0} relief-path hole(s) at diameter {1}, normal to the {2} boundary..." -f $relPointIDs.Count, $pathDia, $c.ReliefBLabel))
-        # drill: On-Point, surface = boundary face, FlipCount=2
-        $holeSurfId = [int]$c.ReliefBoundaryId
-        $pTotal = $relPointIDs.Count; $pIdx=0; $pMade=0; $pAbort=$false
-        foreach ($ptId in $relPointIDs) {
-            $pIdx++
-            $wiz.SetProgress([Math]::Floor(($pIdx / $pTotal) * 100), ("path hole $pIdx / $pTotal"))
-            $macro = Build-HoleMacro -PointId ([int]$ptId) -Diameter $pathDia -BodyIndex $c.BodyIndex -SurfacePlaneId $holeSurfId -FlipCount 2
-            $changed = $false
-            try { $stamp = $model.VersionStamp; $session.RunMacro($macro); $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } } catch {}
-            if ($changed) { $pMade++ }
-            if ($pIdx -eq 1 -and -not $changed) { $wiz.Log('ABORT: first relief-path hole did not modify the model.'); $pAbort=$true; break }
+        $patPlan = Get-SlotPatternPlan -Rows $slots.Rows
+        $usePattern = ($patPlan.CanPattern -and -not $slotNoPattern -and @($slots.Rows).Count -ge 2 -and $null -ne $dirId)
+        $c.SlotPlan = @{ Rows=$slots.Rows; SlotWidth=$slots.SlotWidth; RowAxis=$slots.RowAxis; CrossAxis=$slots.CrossAxis
+                         Depth=$slotDepth; FaceId=$faceId; DirDatumId=$dirId; DirName=$dirName; PatPlan=$patPlan; UsePattern=$usePattern }
+        $c.SlotFlip = $slotFlipDefault
+        $wiz.BeginRun('Creating slot-edge guide planes + opening the seed sketcher...')
+        # GUIDE PLANES: the 2+ slot-edge datum planes slotinator makes, so the operator
+        # draws the seed rectangle to the right size. Pattern mode -> first row's edges
+        # only. Needs the TOP + FRONT bases; best-effort (freehand if not captured).
+        $topBaseIdN   = if ($null -ne $topB   -and $null -ne $topB.BaseId)   { [int]$topB.BaseId }   else { 0 }
+        $frontBaseIdN = if ($null -ne $frontB -and $null -ne $frontB.BaseId) { [int]$frontB.BaseId } else { 0 }
+        if ($topBaseIdN -gt 0 -and $frontBaseIdN -gt 0) {
+            $wiz.Log('Creating the slot-edge guide planes (draw references)...')
+            $gp = New-SlotGuidePlanes -Rows $slots.Rows -TopBaseId $topBaseIdN -FrontBaseId $frontBaseIdN -UsePattern:$usePattern -Log { param($m) $wiz.Log($m) }
+            if (@($gp.Ids).Count -gt 0) { $wiz.Log(("{0} slot-edge guide plane(s) created + shown." -f @($gp.Ids).Count)) }
+            else { $wiz.Log('No new guide planes needed (edges lie on base datums).') }
+        } else {
+            $wiz.Log('TOP/FRONT base datums not both captured - skipping guide planes (draw freehand).')
         }
-        if ($pAbort) { $wiz.SetChip('paths', 'paths: aborted', 'aborted') }
-        elseif ($pMade -eq $pTotal) { $wiz.SetChip('paths', ("paths: {0} holes" -f $pMade), 'built') }
-        else { $wiz.SetChip('paths', ("paths: {0}/{1}" -f $pMade, $pTotal), 'unverified') }
-        $wiz.Log(("Relief paths: {0} of {1} changed the model." -f $pMade, $pTotal))
+        # ARM the seed sketch (open extrude on the SIDE face + rectangle tool)
+        $mkArm = (Get-SelectByIdMacro -FeatId ([int]$faceId)) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
+        Invoke-Macro "arm seed slot sketch" $mkArm
+        $c.SlotArmed = $true
+        $wiz.SetChip('slots', 'slots: sketcher open', 'set')
+        $wiz.Log(("Seed slot sketcher open ({0} row(s), width {1}, depth {2}). Draw the seed rectangle, then press Next." -f @($slots.Rows).Count, $slots.SlotWidth, $(if ($slotDepth -gt 0) { $slotDepth } else { 'Creo default' })))
         return $true
     }
-[void]$steps.Add($reliefPathStep)
+[void]$steps.Add($slotArmStep)
+
+# slot-b: the user drew the seed rectangle; finish the cut, verify direction, then
+# pattern the seed to the remaining rows (hands-free, datum-by-ID). Wrong direction
+# -> undo + flip + re-arm the sketcher + stay so the operator redraws (mirrors the
+# console Invoke-VerifiedSeedCut loop, adapted to the wizard).
+$slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + pattern' -Stage 'Relief' -Kind 'run' -PrimaryText 'Finish the seed slot' `
+    -Validate { param($c) return [bool]($c.SlotArmed -or $c.SlotSkip) } `
+    -Build {
+        param($panel, $c, $wiz)
+        if ($c.SlotSkip) { Add-Para $panel "Chip-relief slots were skipped. Press Next to finish." 8 60 'gray'; return }
+        Add-ArmBanner $panel ("In Creo's sketcher: draw the seed rectangle over the FIRST hole row (one corner, opposite corner), Esc to finish." + [Environment]::NewLine +
+                              "Then press 'Finish the seed slot' - Creo cuts it, you confirm the direction, and the rest are patterned.") 8
+    } `
+    -OnNext {
+        param($c, $wiz)
+        if ($c.SlotSkip) { return $true }
+        $script:GuiWiz = $wiz
+        $plan = $c.SlotPlan
+        $wiz.BeginRun('Cutting the seed slot...')
+        $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
+        $changed = $false
+        try {
+            $session.RunMacro((Build-CutFinishMacro -Depth ([double]$plan.Depth) -BodyIndex ([int]$c.BodyIndex) -Flip $c.SlotFlip))
+            if ($null -ne $stamp) { $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
+        } catch { $wiz.Log("  seed cut error: $($_.Exception.Message)") }
+        if (-not $changed) {
+            $wiz.Log('The seed slot cut did not modify the model (rectangle not a closed loop?).')
+            $wiz.SetChip('slots', 'slots: no change', 'unverified')
+            return $true
+        }
+        # VERIFY direction with the operator
+        $ans = Show-WizardMessage -Text 'Did the seed slot cut INTO the plate at the right depth?' -Title 'Verify slot' -Buttons 'YesNo' -Icon 'Question'
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) {
+            # undo, flip, re-arm the sketcher, and STAY so the operator redraws
+            $wiz.Log('Wrong direction - undoing, flipping, and reopening the sketcher to redraw.')
+            try { $session.RunMacro("~ Command ``ProCmdEditUndo``;") } catch {}
+            $c.SlotFlip = -not $c.SlotFlip
+            $mkArm = (Get-SelectByIdMacro -FeatId ([int]$plan.FaceId)) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
+            Invoke-Macro "re-arm seed slot sketch (flipped)" $mkArm
+            $wiz.SetChip('slots', 'slots: redraw', 'unverified')
+            Show-WizardMessage -Text ("Flipped the direction and reopened the sketcher. If the wrong slot is still in Creo, press Ctrl+Z. Redraw the seed rectangle, then press 'Finish the seed slot' again.") -Title 'Chip-relief slots' -Buttons 'OK' -Icon 'Information' | Out-Null
+            return $false   # stay on slot-b; operator redraws
+        }
+        $wiz.SetChip('slots', 'slots: seed built', 'set')
+        $wiz.Log('Seed slot confirmed.')
+        # PATTERN the seed to the remaining rows (if applicable)
+        if ($plan.UsePattern) {
+            Show-WizardMessage -Text ("Select the SEED SLOT CUT in Creo's model tree (the remove-material extrude you just cut), then press OK.") -Title 'Chip-relief slots' -Buttons 'OK' -Icon 'Information' | Out-Null
+            $selSeed = Read-SelectedId
+            if ($null -eq $selSeed) {
+                $wiz.Log('Nothing selected - the seed slot IS cut; pattern by hand or re-run with --no-pattern.')
+                $wiz.SetChip('slots', 'slots: seed only', 'unverified')
+            } else {
+                $wiz.Log(("Patterning {0} copies at pitch {1}, direction = the {2} datum (by ID)..." -f $plan.PatPlan.Count, $plan.PatPlan.Increment, $plan.DirName))
+                $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
+                $patChanged = $false
+                try {
+                    $session.RunMacro((Build-SlotPatternMacro -DirDatumId ([int]$plan.DirDatumId) -Count ([int]$plan.PatPlan.Count) -Spacing ([double]$plan.PatPlan.Increment) -Flip:$slotPatternFlip))
+                    if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
+                } catch { $wiz.Log("  pattern error: $($_.Exception.Message)") }
+                if ($patChanged) { $wiz.SetChip('slots', ("slots: {0} (patterned)" -f $plan.PatPlan.Count), 'built'); $wiz.Log('Seed slot patterned to the remaining rows.') }
+                else { $wiz.SetChip('slots', 'slots: seed only', 'unverified'); $wiz.Log('Pattern did not change the model - seed IS cut; finish by hand or re-run with --no-pattern.') }
+            }
+        } else {
+            $wiz.SetChip('slots', 'slots: 1 cut', 'built')
+        }
+        $c.SlotsDone = $true
+        $wiz.MarkCommitted()
+        return $true
+    }
+[void]$steps.Add($slotFinishStep)
 
 # ---- STAGE: Done -- summary -------------------------------------------------
 $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' -PrimaryText 'Finish' `
@@ -1439,6 +1467,8 @@ $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' 
         }
         if (@($c.PointIDs).Count -gt 0) { $msg += ("  Points: {0}" -f @($c.PointIDs).Count) + [Environment]::NewLine }
         if ($c.Drilled) { $msg += "  Holes: drilled (verify visually in Creo)." + [Environment]::NewLine }
+        if ($c.SlotsDone) { $msg += "  Chip-relief slots: cut (verify each spans its row, correct depth + face)." + [Environment]::NewLine }
+        elseif ($c.SlotSkip) { $msg += "  Chip-relief slots: skipped." + [Environment]::NewLine }
         if ($script:macroFailures -gt 0) { $msg += [Environment]::NewLine + ("  NOTE: {0} mapkey failure(s) during the run - inspect Creo." -f $script:macroFailures) }
         $msg += [Environment]::NewLine + [Environment]::NewLine + "Verify all geometry in Creo. Press Finish to close (the Creo session stays open)."
         Add-Para $panel $msg 8 260 $null $false
