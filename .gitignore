@@ -10,5 +10,8 @@ CREO_MAPKEY_AUTOMATION_GUIDE.md
 *_eval.json
 .bluegpt_judge.json
 
+# Drill-jig index-csys export sidecar (the CSV is covered by *.csv above)
+*_index_report.txt
+
 # slotpat-probe recorder output (throwaway trail transcription)
 slotpat_recipe.txt

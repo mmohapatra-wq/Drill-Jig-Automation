@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FSAE Thermal Academy — Rocket Thermal Modeling → EV Cooling &amp; Aero</title>
+<style>
+  :root{
+    --bg:#0a0e17; --bg2:#0f1626; --panel:#131c2e; --panel2:#1a2438;
+    --ink:#e8edf6; --ink-dim:#9bb0cc; --line:#243250;
+    --rocket:#ff7a45; --rocket-dim:#7a3d24;
+    --fsae:#22d3a8; --fsae-dim:#15543f;
+    --accent:#5b9dff; --accent2:#a78bfa;
+    --warn:#ffcc4d; --bad:#ff6b6b; --ok:#33d17a;
+    --mono:'SFMono-Regular',ui-monospace,Consolas,'Liberation Mono',monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:linear-gradient(180deg,var(--bg),var(--bg2));color:var(--ink);
+    font-family:var(--sans);line-height:1.6;font-size:15px;-webkit-font-smoothing:antialiased}
+  a{color:var(--accent)}
+  .app{display:grid;grid-template-columns:300px 1fr;min-height:100vh}
+
+  /* ---------- sidebar ---------- */
+  .side{position:sticky;top:0;height:100vh;overflow-y:auto;background:rgba(10,14,23,.85);
+    border-right:1px solid var(--line);padding:20px 16px;backdrop-filter:blur(6px)}
+  .brand{font-weight:800;font-size:18px;letter-spacing:.3px;line-height:1.25;margin-bottom:2px}
+  .brand .spark{background:linear-gradient(90deg,var(--rocket),var(--fsae));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .brand-sub{color:var(--ink-dim);font-size:11.5px;margin-bottom:16px;text-transform:uppercase;letter-spacing:1.2px}
+  .progwrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:16px}
+  .progbar{height:7px;border-radius:4px;background:#0c1424;overflow:hidden;margin-top:7px}
+  .progfill{height:100%;width:0;background:linear-gradient(90deg,var(--fsae),var(--accent));transition:width .4s}
+  .progtxt{font-size:11.5px;color:var(--ink-dim);display:flex;justify-content:space-between}
+  nav{display:flex;flex-direction:column;gap:3px}
+  .navitem{display:flex;align-items:center;gap:9px;padding:9px 11px;border-radius:9px;cursor:pointer;
+    border:1px solid transparent;color:var(--ink-dim);font-size:13.5px;transition:.15s}
+  .navitem:hover{background:var(--panel);color:var(--ink)}
+  .navitem.active{background:var(--panel2);border-color:var(--line);color:var(--ink);font-weight:600}
+  .navitem .ix{width:22px;height:22px;flex:0 0 22px;border-radius:6px;display:grid;place-items:center;
+    font-size:11px;font-weight:700;background:#0c1424;border:1px solid var(--line)}
+  .navitem.active .ix{background:linear-gradient(135deg,var(--rocket),var(--fsae));color:#06121f;border:none}
+  .navitem .done{margin-left:auto;color:var(--ok);font-size:13px;opacity:0}
+  .navitem.complete .done{opacity:1}
+  .navsec{font-size:10.5px;text-transform:uppercase;letter-spacing:1.3px;color:#5e7299;margin:14px 4px 4px}
+  .side-foot{margin-top:18px;font-size:11px;color:#5e7299;border-top:1px solid var(--line);padding-top:12px}
+
+  /* ---------- main ---------- */
+  main{padding:34px 44px 90px;max-width:1100px}
+  .hero{margin-bottom:8px}
+  .kicker{display:inline-flex;align-items:center;gap:8px;font-size:11.5px;text-transform:uppercase;
+    letter-spacing:1.6px;color:var(--ink-dim);margin-bottom:10px}
+  .chip{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.4px}
+  .chip.rocket{background:var(--rocket-dim);color:var(--rocket)}
+  .chip.fsae{background:var(--fsae-dim);color:var(--fsae)}
+  h1{font-size:30px;line-height:1.15;margin:.1em 0 .35em}
+  h2{font-size:21px;margin:1.7em 0 .5em;display:flex;align-items:center;gap:10px}
+  h2 .bar{width:4px;height:22px;border-radius:3px;background:linear-gradient(var(--rocket),var(--fsae))}
+  h3{font-size:15.5px;margin:1.3em 0 .4em;color:var(--ink)}
+  p{margin:.5em 0}
+  .lead{font-size:16.5px;color:var(--ink-dim);max-width:74ch}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0}
+  .card.rocket{border-left:3px solid var(--rocket)}
+  .card.fsae{border-left:3px solid var(--fsae)}
+  .card-h{display:flex;align-items:center;gap:9px;font-weight:700;margin-bottom:8px;font-size:14px}
+  .card-h .dot{width:9px;height:9px;border-radius:50%}
+  .rocket .dot{background:var(--rocket)} .fsae .dot{background:var(--fsae)}
+  .tag-rocket{color:var(--rocket)} .tag-fsae{color:var(--fsae)}
+
+  .eqs{display:grid;gap:10px;margin:12px 0}
+  .eq{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .eq .nm{font-size:12px;font-weight:700;color:var(--accent2);text-transform:uppercase;letter-spacing:.6px}
+  .eq .fm{font-family:var(--mono);font-size:15px;color:var(--ink);margin:6px 0;overflow-x:auto;white-space:nowrap;padding-bottom:2px}
+  .eq .vr{font-size:12.5px;color:var(--ink-dim)}
+  .eq .vd{font-size:11.5px;color:#7f93b5;margin-top:3px;font-style:italic}
+  sup{font-size:.72em} sub{font-size:.72em}
+
+  .worked{background:linear-gradient(180deg,#10182a,#0d1422);border:1px dashed var(--accent);border-radius:12px;padding:16px 18px;margin:14px 0;font-size:14px}
+  .worked .wh{font-weight:700;color:var(--accent);margin-bottom:6px;font-size:13px;text-transform:uppercase;letter-spacing:.7px}
+
+  /* calculator */
+  .calc{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:18px 0}
+  .calc-grid{display:grid;grid-template-columns:1fr 1fr;gap:22px}
+  @media(max-width:820px){.calc-grid{grid-template-columns:1fr}.app{grid-template-columns:1fr}.side{position:static;height:auto}}
+  .field{margin-bottom:11px}
+  .field label{display:flex;justify-content:space-between;font-size:12.5px;color:var(--ink-dim);margin-bottom:3px}
+  .field label .u{color:#62789c}
+  .field input[type=range]{width:100%;accent-color:var(--accent)}
+  .field .row{display:flex;gap:8px;align-items:center}
+  .field input[type=number]{width:96px;background:var(--bg);border:1px solid var(--line);color:var(--ink);
+    border-radius:7px;padding:5px 8px;font-family:var(--mono);font-size:13px}
+  .field input[type=range]{flex:1}
+  .outs{display:flex;flex-direction:column;gap:8px}
+  .out{display:flex;justify-content:space-between;align-items:baseline;gap:10px;background:var(--bg);
+    border:1px solid var(--line);border-radius:9px;padding:9px 12px}
+  .out .ol{font-size:12.5px;color:var(--ink-dim)}
+  .out .ov{font-family:var(--mono);font-size:15px;font-weight:600}
+  .out .ou{font-size:11px;color:#62789c;margin-left:4px}
+  .out.hl{border-color:var(--fsae);background:linear-gradient(90deg,rgba(34,211,168,.08),var(--bg))}
+  .out.hl .ov{color:var(--fsae)}
+  .note{margin-top:12px;font-size:13px;padding:11px 13px;border-radius:9px;background:var(--bg);border:1px solid var(--line);color:var(--ink-dim)}
+
+  /* quiz */
+  .quiz{margin:16px 0}
+  .qcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:12px}
+  .qq{font-weight:600;margin-bottom:10px}
+  .opt{display:block;width:100%;text-align:left;background:var(--bg);border:1px solid var(--line);color:var(--ink);
+    border-radius:9px;padding:10px 13px;margin-bottom:7px;cursor:pointer;font-size:13.5px;transition:.12s}
+  .opt:hover{border-color:var(--accent)}
+  .opt.correct{border-color:var(--ok);background:rgba(51,209,122,.12)}
+  .opt.wrong{border-color:var(--bad);background:rgba(255,107,107,.12)}
+  .opt.dim{opacity:.55}
+  .expl{font-size:12.5px;color:var(--ink-dim);margin-top:8px;padding:9px 12px;border-radius:8px;background:var(--bg);
+    border-left:3px solid var(--accent);display:none}
+  .expl.show{display:block}
+
+  table.bridge{width:100%;border-collapse:collapse;margin:14px 0;font-size:13px}
+  table.bridge th,table.bridge td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top}
+  table.bridge th{background:var(--panel2);color:var(--ink);font-size:11.5px;text-transform:uppercase;letter-spacing:.6px}
+  table.bridge td:first-child{color:var(--rocket)} table.bridge td:nth-child(2){color:var(--fsae)}
+  table.bridge td:last-child{color:var(--ink-dim);font-size:12px}
+
+  .gloss{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  @media(max-width:820px){.gloss{grid-template-columns:1fr}}
+  .gl{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+  .gl .t{font-weight:700;color:var(--accent2);font-size:13px}
+  .gl .d{font-size:12.5px;color:var(--ink-dim)}
+
+  .pager{display:flex;justify-content:space-between;margin-top:34px;gap:12px}
+  .btn{background:var(--panel2);border:1px solid var(--line);color:var(--ink);padding:11px 18px;border-radius:10px;
+    cursor:pointer;font-size:13.5px;font-weight:600;transition:.15s}
+  .btn:hover{border-color:var(--accent);background:var(--panel)}
+  .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#fff}
+  .btn:disabled{opacity:.35;cursor:not-allowed}
+  .srcs{font-size:12.5px;color:var(--ink-dim)}
+  .srcs li{margin:5px 0}
+  .pill{display:inline-block;font-size:10.5px;padding:2px 8px;border-radius:6px;background:var(--panel2);border:1px solid var(--line);color:var(--ink-dim);margin-left:6px}
+  .disclaimer{font-size:11.5px;color:#5e7299;border:1px solid var(--line);border-radius:9px;padding:10px 13px;margin-top:18px;background:rgba(0,0,0,.15)}
+  .kpis{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:12px 15px;min-width:120px}
+  .kpi .v{font-size:22px;font-weight:800}
+  .kpi .l{font-size:11px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:.6px}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="brand"><span class="spark">FSAE Thermal Academy</span></div>
+    <div class="brand-sub">Rocket thermal modeling → EV cooling &amp; aero</div>
+    <div class="progwrap">
+      <div class="progtxt"><span>Course progress</span><span id="progpct">0%</span></div>
+      <div class="progbar"><div class="progfill" id="progfill"></div></div>
+      <div class="progtxt" style="margin-top:6px"><span id="progdone">0 modules</span><span id="progquiz">0 quizzes</span></div>
+    </div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      Progress saves in your browser.<br>Built from Blue Origin BE-3U &amp; Sinda-Fluint thermal models, adversarially fact-checked.
+    </div>
+  </aside>
+  <main id="main"></main>
+</div>
+
+<script src="curriculum.js"></script>
+<script src="calculators.js"></script>
+<script>
+/* ============ tiny math notation renderer ============
+   ^{..} → superscript, _{..} → subscript, lone ^x / _x single char,
+   * → ·, -> → →. Safe-escapes HTML first. */
+function mathHTML(s){
+  s = String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  s = s.replace(/-&gt;/g,'→').replace(/=&gt;/g,'⇒');
+  s = s.replace(/\^\{([^}]*)\}/g,'<sup>$1</sup>').replace(/_\{([^}]*)\}/g,'<sub>$1</sub>');
+  s = s.replace(/\^(-?\d+(?:\.\d+)?|[a-zA-Z])/g,'<sup>$1</sup>');
+  s = s.replace(/_(\w)/g,'<sub>$1</sub>');
+  s = s.replace(/\*/g,'·');
+  return s;
+}
+function para(s){ // bold **..**, inline math via backticks-free: keep simple
+  s = String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  s = s.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  return s;
+}
+
+const LS='fsae_thermal_progress_v1';
+let STATE = JSON.parse(localStorage.getItem(LS)||'{}');
+STATE.visited = STATE.visited||{}; STATE.quiz = STATE.quiz||{};
+function save(){localStorage.setItem(LS,JSON.stringify(STATE));}
+
+const MODS = window.MODULES;
+const PAGES = [{id:'home',title:'Welcome',tag:'Start'}]
+  .concat(MODS)
+  .concat([{id:'bridge',title:'The Bridge Map',tag:'Reference'},
+           {id:'glossary',title:'Glossary & Sources',tag:'Reference'}]);
+let cur = location.hash ? location.hash.slice(1) : 'home';
+if(!PAGES.find(p=>p.id===cur)) cur='home';
+
+function moduleNum(id){const i=MODS.findIndex(m=>m.id===id);return i<0?'':(i+1);}
+function quizComplete(id){const q=STATE.quiz[id];const m=MODS.find(x=>x.id===id);return m&&q&&q.length===m.quiz.length&&q.every(x=>x===true);}
+function moduleComplete(id){return STATE.visited[id] && quizComplete(id);}
+
+function renderNav(){
+  const nav=document.getElementById('nav');
+  let h='';
+  h+=`<div class="navitem ${cur==='home'?'active':''}" data-id="home"><span class="ix">★</span>Welcome</div>`;
+  h+=`<div class="navsec">Modules</div>`;
+  MODS.forEach((m,i)=>{
+    h+=`<div class="navitem ${cur===m.id?'active':''} ${moduleComplete(m.id)?'complete':''}" data-id="${m.id}">
+        <span class="ix">${i+1}</span><span>${m.title}</span><span class="done">✓</span></div>`;
+  });
+  h+=`<div class="navsec">Reference</div>`;
+  h+=`<div class="navitem ${cur==='bridge'?'active':''}" data-id="bridge"><span class="ix">⇄</span>The Bridge Map</div>`;
+  h+=`<div class="navitem ${cur==='glossary'?'active':''}" data-id="glossary"><span class="ix">§</span>Glossary &amp; Sources</div>`;
+  nav.innerHTML=h;
+  nav.querySelectorAll('.navitem').forEach(n=>n.onclick=()=>go(n.dataset.id));
+  // progress
+  const total=MODS.length;
+  const doneMods=MODS.filter(m=>moduleComplete(m.id)).length;
+  const doneQuiz=MODS.filter(m=>quizComplete(m.id)).length;
+  const pct=Math.round(100*doneMods/total);
+  document.getElementById('progfill').style.width=pct+'%';
+  document.getElementById('progpct').textContent=pct+'%';
+  document.getElementById('progdone').textContent=doneMods+' / '+total+' modules';
+  document.getElementById('progquiz').textContent=doneQuiz+' quizzes';
+}
+
+function go(id){cur=id;location.hash=id;STATE.visited[id]=true;save();renderNav();render();window.scrollTo(0,0);}
+
+function eqHTML(e){
+  return `<div class="eq"><div class="nm">${para(e.name)}</div>
+    <div class="fm">${mathHTML(e.formula)}</div>
+    <div class="vr">${mathHTML(e.variables)}</div>
+    <div class="vd">Valid: ${mathHTML(e.validity)}</div></div>`;
+}
+
+function calcHTML(key){
+  const c=window.CALCULATORS[key]; if(!c) return '';
+  let inputs='';
+  c.inputs.forEach(inp=>{
+    inputs+=`<div class="field">
+      <label><span>${para(inp.label)}</span><span class="u">${inp.unit||''}</span></label>
+      <div class="row">
+        <input type="range" data-k="${inp.key}" data-calc="${key}" min="${inp.min}" max="${inp.max}" step="${inp.step||((inp.max-inp.min)/100)}" value="${inp.def}">
+        <input type="number" data-k="${inp.key}" data-calc="${key}" data-num="1" min="${inp.min}" max="${inp.max}" step="${inp.step||'any'}" value="${inp.def}">
+      </div></div>`;
+  });
+  return `<div class="calc">
+    <div class="card-h"><span class="dot" style="background:var(--accent)"></span>Interactive: ${c.title}</div>
+    <p style="color:var(--ink-dim);font-size:13px;margin-top:0">${para(c.blurb)}</p>
+    <div class="calc-grid">
+      <div class="calc-in">${inputs}</div>
+      <div><div class="outs" id="outs-${key}"></div><div class="note" id="note-${key}"></div></div>
+    </div></div>`;
+}
+
+function runCalc(key){
+  const c=window.CALCULATORS[key];
+  const v={};
+  document.querySelectorAll(`[data-calc="${key}"][data-num="1"]`).forEach(el=>v[el.dataset.k]=parseFloat(el.value));
+  let res; try{res=c.compute(v);}catch(e){res={outputs:[{label:'error',value:String(e),unit:''}],note:''};}
+  document.getElementById('outs-'+key).innerHTML = res.outputs.map(o=>
+    `<div class="out ${o.hl?'hl':''}"><span class="ol">${para(o.label)}</span>
+      <span><span class="ov">${o.value}</span><span class="ou">${mathHTML(o.unit||'')}</span></span></div>`).join('');
+  document.getElementById('note-'+key).innerHTML = para(res.note||'');
+}
+
+function wireCalc(key){
+  const sync=(src)=>{
+    const k=src.dataset.k, val=src.value;
+    document.querySelectorAll(`[data-calc="${key}"][data-k="${k}"]`).forEach(el=>{if(el!==src)el.value=val;});
+    runCalc(key);
+  };
+  document.querySelectorAll(`[data-calc="${key}"]`).forEach(el=>{
+    el.addEventListener('input',()=>sync(el));
+  });
+  runCalc(key);
+}
+
+function quizHTML(m){
+  let h=`<h2><span class="bar"></span>Check yourself</h2><div class="quiz">`;
+  m.quiz.forEach((q,qi)=>{
+    h+=`<div class="qcard"><div class="qq">${qi+1}. ${para(q.q)}</div>`;
+    q.options.forEach((o,oi)=>{
+      h+=`<button class="opt" data-m="${m.id}" data-q="${qi}" data-o="${oi}">${para(o)}</button>`;
+    });
+    h+=`<div class="expl" id="expl-${m.id}-${qi}">${para(q.explanation)}</div></div>`;
+  });
+  h+=`</div>`;
+  return h;
+}
+
+function wireQuiz(m){
+  document.querySelectorAll(`.opt[data-m="${m.id}"]`).forEach(btn=>{
+    btn.onclick=()=>{
+      const qi=+btn.dataset.q, oi=+btn.dataset.o, correct=m.quiz[qi].answer;
+      const sib=document.querySelectorAll(`.opt[data-m="${m.id}"][data-q="${qi}"]`);
+      sib.forEach(b=>{b.classList.add('dim');b.disabled=false;});
+      sib.forEach(b=>{
+        const bo=+b.dataset.o;
+        if(bo===correct){b.classList.add('correct');b.classList.remove('dim');}
+        if(b===btn&&oi!==correct){b.classList.add('wrong');b.classList.remove('dim');}
+      });
+      document.getElementById(`expl-${m.id}-${qi}`).classList.add('show');
+      STATE.quiz[m.id]=STATE.quiz[m.id]||[];
+      STATE.quiz[m.id][qi]=(oi===correct);
+      // ensure length
+      for(let i=0;i<m.quiz.length;i++) if(STATE.quiz[m.id][i]===undefined) STATE.quiz[m.id][i]=STATE.quiz[m.id][i]||false;
+      save();renderNav();
+    };
+  });
+}
+
+function render(){
+  const main=document.getElementById('main');
+  if(cur==='home'){ main.innerHTML=homeHTML(); afterRender(); return; }
+  if(cur==='bridge'){ main.innerHTML=bridgeHTML(); afterRender(); return; }
+  if(cur==='glossary'){ main.innerHTML=glossaryHTML(); afterRender(); return; }
+  const m=MODS.find(x=>x.id===cur); if(!m){go('home');return;}
+  const n=moduleNum(m.id);
+  let h=`<div class="hero">
+    <div class="kicker">Module ${n} of ${MODS.length} <span class="chip rocket">Rocket anchor</span><span class="chip fsae">FSAE bridge</span></div>
+    <h1>${m.title}</h1>
+    <div class="lead">${para(m.physics[0])}</div></div>`;
+  for(let i=1;i<m.physics.length;i++) h+=`<p>${para(m.physics[i])}</p>`;
+
+  h+=`<h2><span class="bar"></span>Key equations</h2><div class="eqs">${m.equations.map(eqHTML).join('')}</div>`;
+
+  h+=`<div class="card rocket"><div class="card-h tag-rocket"><span class="dot"></span>Rocket anchor — how the BE-3U model uses this</div>${para(m.rocket_anchor)}</div>`;
+  h+=`<div class="card fsae"><div class="card-h tag-fsae"><span class="dot"></span>FSAE EV bridge — your design decision</div>${para(m.fsae_bridge)}</div>`;
+
+  h+=`<div class="worked"><div class="wh">Worked example</div>${para(m.worked_example)}</div>`;
+
+  h+=`<h2><span class="bar"></span>Try it — interactive calculator</h2>${calcHTML(m.calc)}`;
+  h+=quizHTML(m);
+
+  // pager
+  const idx=PAGES.findIndex(p=>p.id===cur);
+  const prev=PAGES[idx-1], next=PAGES[idx+1];
+  h+=`<div class="pager">
+    <button class="btn" ${prev?'':'disabled'} onclick="${prev?`go('${prev.id}')`:''}">← ${prev?prev.title:''}</button>
+    <button class="btn primary" ${next?'':'disabled'} onclick="${next?`go('${next.id}')`:''}">${next?next.title:'Done'} →</button></div>`;
+  main.innerHTML=h;
+  afterRender(m);
+}
+
+function afterRender(m){
+  if(m&&m.calc) wireCalc(m.calc);
+  if(m&&m.quiz) wireQuiz(m);
+}
+
+function homeHTML(){
+  return `<div class="hero">
+    <div class="kicker">Learning software <span class="chip rocket">Blue Origin BE-3U</span><span class="chip fsae">Formula Student EV</span></div>
+    <h1>From a Rocket-Engine Thermal Model<br>to Your FSAE EV Cooling &amp; Aero</h1>
+    <div class="lead">The exact same physics that keeps a BE-3U upper-stage engine alive — conduction across bolted joints,
+    forced-convection HTCs in propellant ducts, radiation to space, a nodal SINDA network, and a Biot-number mesh study —
+    is what sizes your battery cold plate, your radiator, and your aero package. This course teaches the thermal fundamentals
+    with the rocket model as the anchor and a Formula Student electric car as the destination.</div></div>
+
+    <div class="kpis">
+      <div class="kpi"><div class="v" style="color:var(--rocket)">9</div><div class="l">Modules</div></div>
+      <div class="kpi"><div class="v" style="color:var(--fsae)">9</div><div class="l">Live calculators</div></div>
+      <div class="kpi"><div class="v" style="color:var(--accent2)">${MODS.reduce((a,m)=>a+m.quiz.length,0)}</div><div class="l">Quiz questions</div></div>
+      <div class="kpi"><div class="v" style="color:var(--accent)">77</div><div class="l">Facts checked</div></div>
+    </div>
+
+    <h2><span class="bar"></span>How the bridge works</h2>
+    <p>Each module opens with the <strong>physics + equations</strong>, then shows <span class="tag-rocket">how the real rocket model uses it</span>,
+    then <span class="tag-fsae">how you apply it to an FSAE EV</span>, a fully <strong>worked numeric example</strong>, a <strong>calculator you can drive</strong>, and a short <strong>quiz</strong>.</p>
+
+    <div class="card rocket"><div class="card-h tag-rocket"><span class="dot"></span>The anchor: BE-3U System Thermal Model</div>
+    An ANSYS Thermal Desktop / SINDA model of the BE-3U engine: hardware lumped into nodes, joined by conduction/convection/contact/radiation conductors,
+    propellant fluid networks scaled by ṁ·cp, surface-to-surface + orbital radiation, run across hot &amp; cold design-day transient mission timelines.
+    Its companion Sinda-Fluint study shows when a coarse thermal mesh is over-conservative — a pure Biot-number lesson.</div>
+
+    <div class="card fsae"><div class="card-h tag-fsae"><span class="dot"></span>The destination: a Formula Student EV</div>
+    A 300–600 V battery pack, an 80 kW PMSM + inverter, and an aero package, all on an energy-limited ~22 km endurance run.
+    You'll size cold plates, a radiator (ε-NTU), coolant flow, decide air vs liquid cooling, and trade downforce against cooling drag —
+    every decision grounded in the same equations.</div>
+
+    <h2><span class="bar"></span>Start here</h2>
+    <div class="pager"><span></span>
+      <button class="btn primary" onclick="go('${MODS[0].id}')">Begin Module 1: ${MODS[0].title} →</button></div>
+
+    <div class="disclaimer"><strong>Provenance &amp; scope.</strong> Physics, equations and numbers were researched across standard heat-transfer references
+    and adversarially fact-checked (62 of 77 claims confirmed correct, the rest corrected and applied — e.g. the ε-NTU inversion and Biot characteristic length).
+    The two Blue Origin source pages are used to explain <em>modeling methodology</em>; no proprietary geometry, results, or controlled data are reproduced.
+    Calculators are teaching tools — validate any real design against test data, as the rocket team does (≈10–20% thermal-model-to-test accuracy is normal).</div>`;
+}
+
+function bridgeHTML(){
+  let rows=window.BRIDGE_TABLE.map(b=>`<tr><td>${para(b.rocket)}</td><td>${para(b.fsae)}</td><td>${mathHTML(b.physics)}</td></tr>`).join('');
+  return `<div class="hero"><div class="kicker">Reference <span class="chip rocket">rocket</span><span class="chip fsae">FSAE</span></div>
+    <h1>The Bridge Map</h1>
+    <div class="lead">Every rocket-engine thermal-model concept and its Formula Student EV equivalent, sharing one set of governing physics.</div></div>
+    <table class="bridge"><thead><tr><th>BE-3U rocket thermal model</th><th>FSAE EV equivalent</th><th>Shared physics</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <div class="pager"><button class="btn" onclick="go('${MODS[MODS.length-1].id}')">← Last module</button>
+      <button class="btn primary" onclick="go('glossary')">Glossary &amp; Sources →</button></div>`;
+}
+
+function glossaryHTML(){
+  const gl=window.GLOSSARY.map(g=>`<div class="gl"><div class="t">${para(g.term)}</div><div class="d">${mathHTML(g.def)}</div></div>`).join('');
+  const sm=window.SOURCE_MAP;
+  const prim=sm.primary.map(s=>`<li><strong>${para(s.title)}</strong> <span class="pill">primary</span><br><span class="srcs">${para(s.note)}</span><br><a href="${s.url}">${s.url}</a></li>`).join('');
+  const rel=sm.related.map(s=>`<li>${para(s)}</li>`).join('');
+  const ext=sm.external.map(s=>`<li>${para(s)}</li>`).join('');
+  return `<div class="hero"><div class="kicker">Reference</div><h1>Glossary &amp; Sources</h1>
+    <div class="lead">Quick definitions for every dimensionless group and method, plus where this material came from.</div></div>
+    <h2><span class="bar"></span>Glossary</h2><div class="gloss">${gl}</div>
+    <h2><span class="bar"></span>Primary sources (Blue Origin Confluence)</h2><ul class="srcs">${prim}</ul>
+    <h2><span class="bar"></span>Related thermal-analysis resources found in Confluence</h2><ul class="srcs">${rel}</ul>
+    <h2><span class="bar"></span>External / textbook references (verified)</h2><ul class="srcs">${ext}</ul>
+    <div class="pager"><button class="btn" onclick="go('bridge')">← The Bridge Map</button>
+      <button class="btn primary" onclick="go('home')">Back to start →</button></div>`;
+}
+
+window.go=go;
+window.addEventListener('hashchange',()=>{const id=location.hash.slice(1);if(id&&id!==cur&&PAGES.find(p=>p.id===id)){cur=id;STATE.visited[id]=true;save();renderNav();render();}});
+renderNav();render();
+</script>
+</body>
+</html>

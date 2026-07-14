@@ -1108,6 +1108,14 @@ $gridPointIDs = @()
 # `$null += obj` makes it a SCALAR PSObject (not a 1-element array), and the SECOND
 # += then throws "does not contain a method named 'op_Addition'".
 $gridPlaneIds = @()
+# $csysRecords is the INDEX-HOLE csys registry (STAGE 5): one record per created
+# grid point, @{ PointId; HoleFeatId; PlaneIds=@(Xplane,face,Zplane)=X/Y/Z-normal }. STAGE 2.5
+# fills PointId + PlaneIds (the SAME ordered triple that built the point =
+# X/Y/Z-normal); STAGE 3 fills HoleFeatId as each hole is drilled. STAGE 5 looks up
+# the hole the user picks and re-uses its plane triple to make the csys. MUST be @()
+# at top level (same scalar-PSObject += trap as $gridPlaneIds above); empty in
+# PREDEFINED mode (no tracked planes) -> STAGE 5 degrades to a manual 3-plane pick.
+$csysRecords = @()
 if ($null -ne $orthoGeo) {
     $modeLabel = if ($orthoGeo.Mode -eq 'custom') { "custom layout" } else { "orthogrid" }
     Write-Host "  ====================================================================" -ForegroundColor Cyan
@@ -1155,7 +1163,7 @@ if ($null -ne $orthoGeo) {
                 Write-Host "    X=0 -> using TOP base datum $topBaseId directly" -ForegroundColor DarkGray
                 continue
             }
-            $res = New-OffsetPlane -Label "X$($xPlaneIds.Count)" -Offset ([double]$xOff) -BaseId ([int]$topBaseId)
+            $res = New-OffsetPlane -Label "X$($xPlaneIds.Count)" -Offset ([double]$xOff) -BaseId ([int]$topBaseId) -SkipSymbolWait
             if ($null -eq $res.FeatId) { Write-Host "  X-plane at offset $xOff FAILED." -ForegroundColor Red; $ok = $false; break }
             $xPlaneIds += [int]$res.FeatId
         }
@@ -1170,7 +1178,7 @@ if ($null -ne $orthoGeo) {
                     Write-Host "    Z=0 -> using FRONT base datum $frontBaseId directly" -ForegroundColor DarkGray
                     continue
                 }
-                $res = New-OffsetPlane -Label "Z$($zPlaneIds.Count)" -Offset ([double]$zOff) -BaseId ([int]$frontBaseId)
+                $res = New-OffsetPlane -Label "Z$($zPlaneIds.Count)" -Offset ([double]$zOff) -BaseId ([int]$frontBaseId) -SkipSymbolWait
                 if ($null -eq $res.FeatId) { Write-Host "  Z-plane at offset $zOff FAILED." -ForegroundColor Red; $ok = $false; break }
                 $zPlaneIds += [int]$res.FeatId
             }
@@ -1194,6 +1202,10 @@ if ($null -ne $orthoGeo) {
         }
 
         # 3. One intersection point per input point: face n X-plane[Xi] n Z-plane[Zi].
+        # This loop is the ORIGINAL point-creation code -- it fires ONLY the creation
+        # macros, with NO COM reads between them (reading ListItems mid-loop disrupts
+        # the very commits it would poll for). The index-csys registry is built AFTER
+        # the loop as pure post-processing (below), so it cannot affect point creation.
         if ($ok) {
             $beforePts = Get-PointIdSet -Model $model -TypeObj $pfcType
             $ptIdx = 0
@@ -1208,6 +1220,29 @@ if ($null -ne $orthoGeo) {
             }
             Show-Progress 100 "Done"
             $newIds = Resolve-NewPointIds -Model $model -TypeObj $pfcType -Before $beforePts
+            # INDEX-CSYS REGISTRY (post-processing; does NOT touch point creation):
+            # Creo assigns datum-point ids in ascending CREATION order and $plan.Triples
+            # is in creation order, so index k of the sorted new ids IS the k-th triple.
+            # Zip them into PointId -> PlaneIds records. PLANE ORDER = X-normal, then
+            # Y-normal, then Z-normal (the order ProCmdDatumCsys assigns axes from):
+            #   X-normal = the X-offset plane (offset from TOP; per the grid contract,
+            #              "X = TOP-direction offset", so TOP's normal IS the X axis),
+            #   Y-normal = the SIDE face (the box length/thickness axis),
+            #   Z-normal = the Z-offset plane (offset from FRONT; FRONT's normal = Z).
+            # So the order is [xPlane, face, zPlane] -- NOT [face, xPlane, zPlane]
+            # (that put SIDE=Y first and flipped the csys direction). Only when the
+            # counts match exactly, else leave the registry empty (STAGE 5 then falls
+            # back to a manual pick rather than mis-map a csys to the wrong hole).
+            if (@($newIds).Count -eq @($plan.Triples).Count) {
+                $csysRecords = @()
+                for ($k = 0; $k -lt $newIds.Count; $k++) {
+                    $tri = $plan.Triples[$k]
+                    # GridX/GridZ = the hole's design coordinate (offset from the base
+                    # datums), carried so STAGE 6 can export coords relative to the index csys.
+                    $csysRecords += [pscustomobject]@{ PointId = [int]$newIds[$k]; HoleFeatId = $null; PlaneIds = @([int]$xPlaneIds[$tri.Xi], [int]$facePlaneId, [int]$zPlaneIds[$tri.Zi]); GridX = [double]$tri.X; GridZ = [double]$tri.Z }
+                }
+                Write-Host ("  (index-csys registry: {0} point(s) mapped to their planes, X/Y/Z-normal)" -f @($csysRecords).Count) -ForegroundColor DarkGray
+            }
             if ($newIds.Count -eq $orthoGeo.Count) {
                 $gridPointIDs = @($newIds)
                 Write-Host ("  All {0} datum points created. IDs: {1}" -f $newIds.Count, (($newIds | Select-Object -First 10) -join ", ")) -ForegroundColor Green
@@ -1433,6 +1468,13 @@ if ($go -notmatch '^[Yy]$') {
     $failed = 0
     $aborted = $false
 
+    # index-csys: ONE feature snapshot BEFORE the drill loop (outside it, so hole
+    # creation is untouched). After the loop we diff ONCE and, if the new-feature
+    # count matches the hole count exactly, zip sorted-ascending (= creation order)
+    # onto $pointIDs to record each point's HoleFeatId. If it doesn't match cleanly
+    # (a hole added an axis/note), we skip the tie -- clicking the datum POINT still
+    # resolves via the point registry. Only when a registry exists to enrich.
+    $beforeDrillFeat = if (@($csysRecords).Count -gt 0) { Get-FeatureIdSet } else { $null }
 
     foreach ($ptId in $pointIDs) {
         $idx++
@@ -1470,6 +1512,29 @@ if ($go -notmatch '^[Yy]$') {
         }
     }
     if (-not $aborted) { Show-Progress 100 "Done" }
+
+    # index-csys: tie holes to points OUTSIDE the loop (one diff), creation-order
+    # groups. Resolve-HoleFeatGroups splits the new features into one group per hole
+    # (a hole may add an axis/note as well as the hole feature), so clicking ANY of a
+    # hole's features in STAGE 5 resolves (Resolve-IndexHolePlanes matches HoleFeatIds).
+    if ($null -ne $beforeDrillFeat -and -not $aborted -and $madeHoles -gt 0) {
+        $afterDrillFeat = Get-FeatureIdSet
+        $newDrillFeats  = @($afterDrillFeat.Keys | Where-Object { -not $beforeDrillFeat.ContainsKey($_) } | Sort-Object)
+        $grp = Resolve-HoleFeatGroups -NewFeatIds $newDrillFeats -HoleCount @($pointIDs).Count
+        if ($grp.Ok) {
+            for ($k = 0; $k -lt $pointIDs.Count; $k++) {
+                $rec = $csysRecords | Where-Object { $null -ne $_.PointId -and [int]$_.PointId -eq [int]$pointIDs[$k] } | Select-Object -First 1
+                if ($null -ne $rec) {
+                    $rec.HoleFeatId = [int]$grp.Groups[$k][0]
+                    try { $rec | Add-Member -NotePropertyName HoleFeatIds -NotePropertyValue @($grp.Groups[$k]) -Force } catch {}
+                }
+            }
+            $extra = if ($grp.PerHole -gt 1) { (" ({0} features each)" -f $grp.PerHole) } else { "" }
+            Write-Host ("  (index-csys: {0} hole(s) tied to their points{1})" -f @($pointIDs).Count, $extra) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("  (index-csys: hole->point tie skipped -- {0}; click the datum POINT for the index csys)" -f $grp.Reason) -ForegroundColor DarkGray
+        }
+    }
 
     Write-Host ""
 
@@ -1649,6 +1714,151 @@ if ($doSlots) {
 }
 
 # ============================================================================
+# STAGE 5 -- INDEX-HOLE COORDINATE SYSTEM (datum csys at a chosen hole)
+# ============================================================================
+# The user picks ONE drilled hole to be the INDEX hole (the origin of a datum
+# coordinate system). Each grid point was built as the intersection of 3
+# mutually-perpendicular planes (STAGE 2.5) recorded, per point, in $csysRecords
+# in X/Y/Z-normal order = [X-plane from TOP, SIDE face, Z-plane from FRONT]; STAGE 3
+# tied each hole's feature id to its point. So: read what the user selected, look
+# up its plane triple, and re-select those SAME 3 planes -> ProCmdDatumCsys -> OK
+# (Build-CsysFromPlanesMacro, the proven 3-plane intersection recipe with
+# ProCmdDatumPointGeneral swapped for ProCmdDatumCsys). Created iff a NEW feature
+# appears (canary) -- never "done" on a no-op. --no-index-csys skips it. In
+# PREDEFINED mode (no registry) it degrades to a manual 3-plane pick.
+Write-Host ""
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+Write-Host "   STAGE 5 - index-hole coordinate system (optional)" -ForegroundColor Cyan
+Write-Host "  ====================================================================" -ForegroundColor Cyan
+
+# outcomes for the FINAL WORD summary (parity with the GUI Done step)
+$indexCsysFeatId    = $null
+$indexCsvPath       = $null
+$indexPointsCreated = 0
+
+if ($ScriptArgs -match '(?i)--no-index-csys') {
+    Write-Host "  (--no-index-csys) skipping the index-hole coordinate system." -ForegroundColor DarkGray
+} else {
+    $ansCsys = Read-Host "  Create a coordinate system at an index hole? (y/N)"
+    if ($ansCsys -notmatch '^[Yy]$') {
+        Write-Host "  Skipped the index-hole coordinate system." -ForegroundColor DarkGray
+    } elseif ($csysRecords.Count -gt 0) {
+        # REGISTRY path: user selects the index HOLE; we resolve its plane triple.
+        Write-Host ""
+        Write-Host "  In Creo, SELECT THE HOLE you want as the index hole (click the hole" -ForegroundColor Cyan
+        Write-Host "  feature in the model tree, or the datum point it was drilled on)," -ForegroundColor Cyan
+        Write-Host "  then press ENTER here." -ForegroundColor Cyan
+        Read-Host
+        $sel = Read-IndexSelectionIds
+        $res = Resolve-IndexHolePlanes -Records $csysRecords -FeatureIds $sel.FeatureIds -PointIds $sel.PointIds
+        if (-not $res.Ok) {
+            Write-Host "  Could not tie the selection to a drilled hole: $($res.Reason)." -ForegroundColor Yellow
+            # diagnostics so a miss is debuggable (what got read vs. what's on file)
+            Write-Host ("  (read feature ids: {0}; point ids: {1})" -f (($sel.FeatureIds | Select-Object -First 12) -join ', '), (($sel.PointIds | Select-Object -First 12) -join ', ')) -ForegroundColor DarkGray
+            $withHole = @($csysRecords | Where-Object { $null -ne $_.HoleFeatId })
+            Write-Host ("  (index registry: {0} record(s), {1} with a hole id; sample hole ids: {2})" -f @($csysRecords).Count, @($withHole).Count, ((@($withHole | ForEach-Object { $_.HoleFeatId }) | Select-Object -First 12) -join ', ')) -ForegroundColor DarkGray
+            Write-Host "  Nothing created. Select the HOLE feature (or its datum point) and re-run." -ForegroundColor Yellow
+        } else {
+            Write-Host ("  Index hole resolved ({0}); point id {1}, planes {2}." -f $res.Reason, $res.PointId, ($res.PlaneIds -join ", ")) -ForegroundColor Green
+            Write-Host "  Creating the coordinate system automatically from the hole's 3 planes (X/Y/Z-normal, no clicks)..." -ForegroundColor Cyan
+            $cs = Invoke-IndexCsys -PlaneIds @($res.PlaneIds) -Show
+            if ($cs.Ok) {
+                $indexCsysFeatId = $cs.NewFeatId
+                Write-Host ("  Done -- coordinate system created (new feature id {0}). Verify axes visually in Creo." -f $cs.NewFeatId) -ForegroundColor Green
+
+                # --- STAGE 6: export every hole's coordinate relative to this index csys ---
+                # Pure math from the grid layout (no COM coordinate read): csys X = grid X,
+                # csys Z = grid Z, csys Y = 0 (all holes on the SIDE face). The index hole
+                # is the origin (0,0,0). CSV lands next to the drilljig eval packets.
+                $base = ($modelFile -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
+                if ([string]::IsNullOrWhiteSpace($base)) { $base = 'drilljig' }   # never an identity-less, underscore-leading filename
+                $csvPath = Join-Path $ScriptDir ($base + "_holes_from_index_csys.csv")
+                $exp = Export-IndexHoleCsv -Records $csysRecords -IndexPointId $res.PointId -Diameter $holeDiaFinal -Path $csvPath
+                if ($exp.Ok) {
+                    $indexCsvPath = $exp.Path
+                    Write-Host ("  Exported {0} hole coordinate(s) relative to the index csys ->" -f $exp.Count) -ForegroundColor Green
+                    Write-Host ("    $($exp.Path)") -ForegroundColor White
+                    Write-Host "    Columns: X_index / Y_index / Z_index (in the index frame; Y=0, all holes on the face)," -ForegroundColor DarkGray
+                    Write-Host "    plus GridX/GridZ (design offsets), Diameter, IsIndexHole. Verify axis SIGNS vs the csys." -ForegroundColor DarkGray
+                    # human-readable provenance report sidecar (part / date / csys / index / units + table)
+                    $reportPath = Join-Path $ScriptDir ($base + "_index_report.txt")
+                    $csysMeta = @{ PartNumber = $modelFile; CsysFeatId = $cs.NewFeatId; Units = 'model units'; WhenIso = (Get-Date).ToString('o') }
+                    $rep = Write-IndexHoleReport -Records $csysRecords -IndexPointId $res.PointId -Diameter $holeDiaFinal -Meta $csysMeta -Path $reportPath
+                    if ($rep.Ok) { Write-Host ("    (readable report -> $($rep.Path))") -ForegroundColor DarkGray }
+                } else {
+                    Write-Host ("  Could not export hole coordinates: {0}" -f $exp.Reason) -ForegroundColor Yellow
+                }
+
+                # --- STAGE 7: create datum points REFERENCED FROM the index csys ---
+                # One datum-point feature offset from the csys, at every exported
+                # coordinate (Offset Coordinate System, Cartesian). WIDGETS UNVERIFIED
+                # (see Build-CsysOffsetPointsMacro) -> canary-gated; a no-op prints the
+                # record recipe and creates nothing. --no-csys-points skips it.
+                if ($ScriptArgs -match '(?i)--no-csys-points') {
+                    Write-Host "  (--no-csys-points) skipping csys-referenced datum points." -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  (Experimental: the offset-coordinate-system dialog widgets are a best GUESS -" -ForegroundColor DarkGray
+                    Write-Host "   not yet recorded live. If created, VERIFY the points' placement in Creo.)" -ForegroundColor DarkGray
+                    $ansPts = Read-Host "  Also create datum points referenced from this coordinate system? (y/N)"
+                    if ($ansPts -match '^[Yy]$') {
+                        $hr = Get-HolesRelativeToIndex -Records $csysRecords -IndexPointId $res.PointId -Diameter $holeDiaFinal
+                        if ($hr.Ok -and @($hr.Rows).Count -gt 0) {
+                            Write-Host ("  Creating {0} datum point(s) offset from the csys (X/Y/Z from the export)..." -f @($hr.Rows).Count) -ForegroundColor Cyan
+                            $cp = Invoke-CsysOffsetPoints -CsysFeatId ([int]$cs.NewFeatId) -Rows @($hr.Rows)
+                            if ($cp.Ok) {
+                                $indexPointsCreated = $cp.Created
+                                # count matched, but the offset-csys widgets are a guess -> the
+                                # count alone does NOT prove the points are offset FROM the csys at
+                                # the intended X/Y/Z. Report UNVERIFIED (amber), never a green "done".
+                                Write-Host ("  {0} datum point(s) created -- UNVERIFIED: widgets are a best guess," -f $cp.Created) -ForegroundColor Yellow
+                                Write-Host "  so the count matched but the PLACEMENT is not checked. Verify in Creo that" -ForegroundColor Yellow
+                                Write-Host "  each point is offset from the coordinate system at the intended X/Z." -ForegroundColor Yellow
+                            } elseif ($cp.Created -gt 0) {
+                                Write-Host ("  Created {0} of {1} point(s) -- inspect Creo (count mismatch)." -f $cp.Created, $cp.Expected) -ForegroundColor Yellow
+                            } else {
+                                Write-Host ("  No csys-referenced points created: {0}" -f $cp.Reason) -ForegroundColor Yellow
+                                Write-Host "  The offset-csys dialog widgets are a GUESS. Record the mapkey (see" -ForegroundColor DarkGray
+                                Write-Host "  Build-CsysOffsetPointsMacro's header recipe) and I'll lock them." -ForegroundColor DarkGray
+                            }
+                        } else {
+                            Write-Host ("  No coordinates to place: {0}" -f $hr.Reason) -ForegroundColor Yellow
+                        }
+                    } else {
+                        Write-Host "  Skipped csys-referenced datum points." -ForegroundColor DarkGray
+                    }
+                }
+            } else {
+                Write-Host ("  Coordinate system NOT created: {0}" -f $cs.Reason) -ForegroundColor Yellow
+            }
+        }
+    } else {
+        # MANUAL path: no registry (predefined points). User selects 3 perpendicular
+        # planes in X/Y/Z-normal order.
+        Write-Host ""
+        Write-Host "  No tracked hole planes this run (predefined points). Select 3 mutually-" -ForegroundColor Yellow
+        Write-Host "  perpendicular planes IN ORDER (X-normal, then Y-normal, then Z-normal) -" -ForegroundColor Yellow
+        Write-Host "  their intersection is the csys origin." -ForegroundColor Yellow
+        $manualIds = @()
+        foreach ($axis in @('X','Y','Z')) {
+            Read-Host "    Click the $axis-normal plane in Creo, then press ENTER"
+            $id = Read-SelectedId
+            if ($null -eq $id) { Write-Host "    Nothing selected for $axis - aborting the csys." -ForegroundColor Yellow; $manualIds = @(); break }
+            $manualIds += [int]$id
+            Write-Host "      $axis-normal plane feature id = $id" -ForegroundColor DarkGray
+        }
+        if (@($manualIds).Count -eq 3) {
+            $cs = Invoke-IndexCsys -PlaneIds @($manualIds) -Show
+            if ($cs.Ok) {
+                $indexCsysFeatId = $cs.NewFeatId
+                Write-Host ("  Done -- coordinate system created (new feature id {0}). Verify axes visually in Creo." -f $cs.NewFeatId) -ForegroundColor Green
+            } else {
+                Write-Host ("  Coordinate system NOT created: {0}" -f $cs.Reason) -ForegroundColor Yellow
+            }
+        }
+    }
+}
+
+# ============================================================================
 # FINAL WORD
 # ============================================================================
 Write-Host ""
@@ -1664,6 +1874,12 @@ if ($null -ne $script:buildConfirmed) {
         Write-Host "  Box build: NOT independently confirmed - see the blind-evaluator verdict above." -ForegroundColor Yellow
         Write-Host "  (An eval packet was written; it can also be judged offline.)" -ForegroundColor DarkGray
     }
+}
+# Index-csys / export / points summary (parity with the GUI Done step).
+if ($null -ne $indexCsysFeatId) {
+    Write-Host ("  Index coordinate system: created (feature id {0}); verify axes visually." -f $indexCsysFeatId) -ForegroundColor Green
+    if ($null -ne $indexCsvPath) { Write-Host ("  Hole coordinates (relative to the index csys): $indexCsvPath") -ForegroundColor White }
+    if ($indexPointsCreated -gt 0) { Write-Host ("  Datum points referenced from the index csys: {0} created -- UNVERIFIED (verify placement in Creo)." -f $indexPointsCreated) -ForegroundColor Yellow }
 }
 
 } finally {

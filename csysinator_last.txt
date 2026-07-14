@@ -1,0 +1,6 @@
+model: 004-913-9631-001.prt
+edge center: -300.797035228532  166.335519450126  -170.906   radius 85.4483
+base datums: X<-TOP=2  Y<-SIDE=4  Z<-FRONT=6
+axis X: offset_fed=-300.797035  reuseBase=False  baseId=2
+axis Y: offset_fed=166.335519  reuseBase=False  baseId=4
+axis Z: offset_fed=-170.906  reuseBase=False  baseId=6

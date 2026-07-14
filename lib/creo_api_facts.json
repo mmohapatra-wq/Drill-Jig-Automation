@@ -598,6 +598,26 @@
       "symbols": ["IpfcCoordSystem", "CoordSys", "IpfcTransform3D", "GetOrigin", "GetXAxis", "GetYAxis", "GetZAxis", "ITEM_COORD_SYS"],
       "evidence": "vb-docs ('Transforming to Coordinate System Datum Coordinates'; IpfcTransform3D GetXAxis/GetYAxis/GetZAxis); lib/creo_geometry.ps1 Read-CoordSysTransform; csysinator.cmd.",
       "verifiedOn": null
+    },
+    {
+      "id": "csys-at-3-plane-intersection",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "A datum COORDINATE SYSTEM can be created at the INTERSECTION of 3 mutually-perpendicular planes by SELECTING all 3 (accumulated) then '~ Command ProCmdDatumCsys' -> '~ Activate Odui_Dlg_00 stdbtn_1' (OK). This is a DIFFERENT csys mode from the origin-edge+orientation-picks flow (datumcsys-dialog-sequence) - here the 3 planes fully define the origin (their common point) AND orientation, so NO mouse picks and NO orientation tab are needed. It is the exact analog of point-at-3-plane-intersection-by-id (3 planes -> ProCmdDatumPointGeneral): the SAME accumulate-selection recipe, with the point command swapped for the csys command. The plane SELECTION ORDER sets which axis aligns to which; drilljig feeds [SIDE-face, X-plane(from TOP), Z-plane(from FRONT)] = X/Y/Z-normal under the default-datum convention. The by-ID accumulation FEED (repeated tree-search select-by-ID with buffer_clean only on the 1st, per selectbyid-accumulates-multiref) carries the proof of the sibling point command; csysinator/drilljig fire it CANARY-GATED (a new feature must appear) so a no-op is never reported as created.",
+      "antipattern": "Confusing this with datumcsys-dialog-sequence (that flow picks an origin edge + orientation plane by MOUSE and IS refuted for by-ID feed); assuming a specific axis-to-plane assignment without a visual check (the selection order sets it, and plane normals read null on this build so it cannot be verified programmatically).",
+      "symbols": ["ProCmdDatumCsys", "Odui_Dlg_00", "stdbtn_1", "ProCmdMdlTreeSearch", "buffer_clean"],
+      "evidence": "Operator's recorded mapkey 'yes' (2026-07-13): select 3 planes in PHTLeft.AssyTree (T3 10 / T3 6 / T3 13) -> ProCmdDatumCsys -> stdbtn_1 (then ProCmdViewShow the new csys). Implemented in lib/drilljig_core.ps1 Build-CsysFromPlanesMacro / Invoke-IndexCsys; wired into drilljig.cmd STAGE 5, drilljig-gui.cmd Index stage, and standalone csysinator.cmd. CONFIRMED LIVE 2026-07-13: the by-ID feed of 3 accumulated planes to ProCmdDatumCsys created the csys (operator: 'the coordinate system is being able to be made', via the 3-plane pick path). The remaining open item is NOT the macro but the hole->point->planes REGISTRY (the hole click must resolve to its triple with NO plane picks): the STAGE-2.5 per-point attribution + STAGE-3 hole-feature tie now POLL for the commit (a one-shot read outran it, leaving the registry empty) and a creation-order zip rebuilds it if attribution comes up short.",
+      "verifiedOn": "2026-07-13"
+    },
+    {
+      "id": "datum-point-offset-from-csys-table",
+      "category": "mapkey",
+      "status": "docs-only",
+      "fact": "Creating datum points REFERENCED FROM a coordinate system (Datum Point -> 'Offset Coordinate System', pick the csys, Cartesian, type an X/Y/Z table) SHOULD be mapkey-automatable with NO geometry picks -- the reference is a single csys (selectable by id) and the offsets are TYPED, unlike the offset-from-surface/edges mode which needs @sel picks (datum-point-offset-from-refs-needs-picks, refuted). The exact dialog widget names are NOT yet recorded, so lib/drilljig_core.ps1 Build-CsysOffsetPointsMacro uses BEST-GUESS tokens (ProCmdDatumPoint, Odui_Dlg_00, t1.PntTypeOptMenu='Offset Coordinate System', t1.add_pnt_btn, t1.pnt_table row cols xax/yax/zax, stdbtn_1) inherited from the abandoned Build-PointGridMacro. Invoke-CsysOffsetPoints canary-gates on a NEW datum point appearing (before/after ITEM_POINT diff) so a no-op is never reported as success.",
+      "antipattern": "Trusting the guessed offset-csys widget names without a live recording; claiming the points were created when the macro was a no-op (the canary must gate it).",
+      "symbols": ["ProCmdDatumPoint", "Odui_Dlg_00", "t1.PntTypeOptMenu", "Offset Coordinate System", "t1.add_pnt_btn", "t1.pnt_table", "xax", "yax", "zax", "stdbtn_1"],
+      "evidence": "No recording exists in the repo/trails for the offset-csys datum-point dialog (grep 2026-07-13 found only the guessed Build-PointGridMacro). To promote to confirmed-live: record 'Datum Point > Offset Coordinate System' with 2 rows (visible_mapkeys=yes), transcribe the real tokens into Build-CsysOffsetPointsMacro, then re-run drilljig STAGE 7 and confirm N new points appear. Wired into drilljig.cmd + drilljig-gui.cmd STAGE 7 (after the STAGE-6 export), canary-gated, --no-csys-points to skip.",
+      "verifiedOn": null
     }
   ]
 }

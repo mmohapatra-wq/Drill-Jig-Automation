@@ -544,13 +544,13 @@ if ($canPlanes) {
         $plan.XCoords.Count, $plan.ZCoords.Count) -ForegroundColor Cyan
     foreach ($xOff in $plan.XCoords) {
         if ([math]::Abs([double]$xOff) -le $tolP) { continue }   # X=0 -> the TOP base datum (already there)
-        $res = New-OffsetPlane -Label "SlotX$($createdPlaneIds.Count)" -Offset ([double]$xOff) -BaseId ([int]$topBaseId)
+        $res = New-OffsetPlane -Label "SlotX$($createdPlaneIds.Count)" -Offset ([double]$xOff) -BaseId ([int]$topBaseId) -SkipSymbolWait
         if ($null -ne $res.FeatId) { $createdPlaneIds += [int]$res.FeatId }
         else { Write-Host "  X-edge plane at offset $xOff FAILED (continuing)." -ForegroundColor Yellow }
     }
     foreach ($zOff in $plan.ZCoords) {
         if ([math]::Abs([double]$zOff) -le $tolP) { continue }   # Z=0 -> the FRONT base datum
-        $res = New-OffsetPlane -Label "SlotZ$($createdPlaneIds.Count)" -Offset ([double]$zOff) -BaseId ([int]$frontBaseId)
+        $res = New-OffsetPlane -Label "SlotZ$($createdPlaneIds.Count)" -Offset ([double]$zOff) -BaseId ([int]$frontBaseId) -SkipSymbolWait
         if ($null -ne $res.FeatId) { $createdPlaneIds += [int]$res.FeatId }
         else { Write-Host "  Z-edge plane at offset $zOff FAILED (continuing)." -ForegroundColor Yellow }
     }

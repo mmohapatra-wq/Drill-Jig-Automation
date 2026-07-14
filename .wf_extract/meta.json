@@ -1,0 +1,25 @@
+{
+  "gui_assumptions": [
+    "Get-OrthogridGeometry is in scope at call time (dot-sourced from lib\\orthogrid.ps1 before this function runs), exactly per the GRID MATH CONTRACT; this function calls it and never re-derives the box/point math.",
+    "The result object from Get-OrthogridGeometry is a pscustomobject I can pass through unchanged and Add-Member onto; I attach 'Thickness' with -Force so a re-run or pre-existing member does not throw.",
+    "Thickness is treated as 'provided' only when it parses to a value > 0. The param is typed [double] and PS 5.1 coerces the $null default to 0.0, so I cannot distinguish 'omitted' from a literal 0; <=0 is treated as not-provided (no read-only thickness row, no Thickness member, no thickness in the readout). A genuine zero-depth value is not a meaningful drill depth, so this is acceptable.",
+    "Z is drawn increasing upward (model corner origin at the panel's bottom-left) by flipping to screen Y; X increases to the right. This matches the contract's Points (X,Z measured from the (Edge,Edge) corner) for an intuitive top-down plate preview.",
+    "The OK button is gated purely on Get-OrthogridGeometry.Valid (recomputed on every field change and re-checked on click). I deliberately do NOT assign btnOk.DialogResult, closing the form manually only after validation, so a disabled/invalid state can never accept.",
+    "Defaults (CcX=CcZ=Edge=0.5, Nx=5, Nz=4) come straight from the requested param signature; with these the dialog opens valid and OK enabled.",
+    "Inner helper functions New-FieldLabel / New-FieldBox are defined inside Show-OrthogridDialog so the function remains self-contained when spliced inline (they do not leak useful names beyond it and rely only on the row-layout locals).",
+    "The function relies on no enclosing-scope variables other than Get-OrthogridGeometry; $script:ogResult / $script:ogAccepted are private state it creates itself. If a caller happens to use those exact $script: names elsewhere they would collide, but the names are sufficiently specific that this is not expected in drilljig.cmd.",
+    "Panel/control coordinates assume a fixed 560x420 client area; the preview panel auto-scales its content, so exact pixel positions are cosmetic and safe across DPI within reason."
+  ],
+  "manualFallbackIncluded": true,
+  "unverifiedWidgets": [
+    "ProCmdDatumPoint (datum-point tool command; may be ProCmdDatumPointOffCsys)",
+    "Odui_Dlg_00.t1.PntTypeOptMenu (point-type dropdown -> 'Offset Coordinate System' table mode)",
+    "Odui_Dlg_00.t1.DirRefList (TOP/FRONT in-plane direction-reference collector(s); may be two separate collectors or buffer-fed)",
+    "Odui_Dlg_00.t1.pnt_table (the editable X/Z points table)",
+    "Odui_Dlg_00.t1.add_pnt_btn (add-row button)",
+    "pnt_table column key 'xax_axis' (per-row X/TOP-offset cell)",
+    "pnt_table column key 'zax_axis' (per-row Z/FRONT-offset cell)",
+    "Odui_Dlg_00.stdbtn_1 (OK -- reused from New-OffsetPlane, same dialog family; most likely correct of the set)"
+  ],
+  "recordLiveSteps": "RECORD-LIVE RECIPE (run ONCE to replace every guessed widget in Build-PointGridMacro; the ONLY proven parts are the leading Get-SelectByIdMacro select-by-ID fragment and the atomic-RunMacro double-backtick escaping):\n1. In Creo set visible_mapkeys = yes (File > Options > Configuration Editor, Apply; or add `visible_mapkeys yes` to config.pro) so every widget interaction is echoed into the trail file.\n2. Note the active trail.txt.N path (Tools > Trail/Training Files), or just read the newest trail.txt.* afterward.\n3. In the model tree, pre-select the SIDE base/default datum plane (the plate face the holes drill into).\n4. Model > Datum > Point > Offset Coordinate System (the TABLE variant, not the on-surface sketched point). Pick the SIDE datum as the placement reference and TOP/FRONT as the two in-plane offset directions; set the dropdown to 'Cartesian'.\n5. Click 'Add Point' / add a row and type a known X and Z (e.g. 1.0 / 2.0). Add a SECOND row with a different X/Z so the row index and the X/Z column tokens are unambiguous in the trail. Click OK.\n6. Open the newest trail.txt.* and copy every ~ Command / ~ Select / ~ Open / ~ Close / ~ Update / ~ Input / ~ Activate / ~ Trigger line from steps 4-5 (drop ~ Trail / ~ Timer / ~ Move noise). Those are the REAL widget tokens: the datum-point command, the dialog id (Odui_Dlg_00 or other), the point-type dropdown value, the direction-reference collector(s), the table id, the add-row button, the X/Z column keys, and the OK button.\n7. Replace the guessed tokens in Build-PointGridMacro with the recorded ones; keep the whole open->table->OK as ONE concatenated RunMacro string, keep the leading Get-SelectByIdMacro select-by-ID of the SIDE base datum, and keep the per-point row loop (one add-row + X + Z per Get-OrthogridGeometry.Points entry).\n8. Delete the UNVERIFIED banner, re-run drilljig; the canary (VersionStamp changed) + exact new-point-COUNT gate in the driver confirms it took. If it still misses, the manual fallback (Invoke-ManualPointGrid) is guaranteed and prints the X/Z table for hand-creation."
+}

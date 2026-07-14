@@ -79,6 +79,10 @@ $slotFlipDefault = ($ScriptArgs -match '(?i)--slot-flip')
 $slotPatternFlip = ($ScriptArgs -match '(?i)--pattern-flip')
 $slotNoPattern   = ($ScriptArgs -match '(?i)--no-pattern')
 $noSlotRelief    = ($ScriptArgs -match '(?i)--no-slot-relief')
+# STAGE 5 index-hole coordinate system (same contract as drilljig.cmd --no-index-csys)
+$noIndexCsys     = ($ScriptArgs -match '(?i)--no-index-csys')
+# STAGE 7 csys-referenced datum points (offset-csys; widgets UNVERIFIED)
+$noCsysPoints    = ($ScriptArgs -match '(?i)--no-csys-points')
 
 # ============================================================================
 # The shared CONTEXT hashtable - every wizard step reads/writes it. Holds the
@@ -129,11 +133,22 @@ $ctx = @{
     # STAGE 2.5 points
     GridPointIDs = @()
     GridPlaneIds = @()
+    # INDEX-HOLE csys registry (STAGE 5): one record per created grid point,
+    # @{ PointId; HoleFeatId; PlaneIds=@(Xplane,face,Zplane) } in X/Y/Z-normal order.
+    # Filled by the drill step's point + hole loops; read by the Index stage.
+    CsysRecords = @()
     # STAGE 3
     PointIDs    = @()
     BodyIndex   = 0
     HoleDiaFinal = 0.0
     Drilled     = $false
+    # STAGE 5 index csys
+    IndexPlaneIds = @()   # resolved plane triple for the picked index hole
+    IndexPointId  = $null # the picked index hole's datum-point id (for the STAGE 6 export)
+    IndexOk       = $false
+    CsysDone      = $false
+    CsysCsvPath   = $null # where STAGE 6 wrote the hole coordinates
+    CsysPointsCreated = 0 # STAGE 7: count of datum points created offset from the csys
     # STAGE 4 chip-relief SLOTS (slotinator method; replaces relief holes + paths)
     SlotArmed    = $false     # slot-a armed the seed sketcher; gates slot-b
     SlotSkip     = $false     # metal declined, or no layout -> skip the slot stage
@@ -1209,7 +1224,7 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
                 foreach ($xOff in $plan.XCoords) {
                     if ([math]::Abs([double]$xOff) -le $tol) { $xPlaneIds += [int]$topBaseId; continue }
                     $wiz.Pump()
-                    $res = New-OffsetPlane -Label "X$($xPlaneIds.Count)" -Offset ([double]$xOff) -BaseId ([int]$topBaseId)
+                    $res = New-OffsetPlane -Label "X$($xPlaneIds.Count)" -Offset ([double]$xOff) -BaseId ([int]$topBaseId) -SkipSymbolWait
                     if ($null -eq $res.FeatId) { $ok = $false; break }
                     $xPlaneIds += [int]$res.FeatId
                 }
@@ -1218,7 +1233,7 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
                     foreach ($zOff in $plan.ZCoords) {
                         if ([math]::Abs([double]$zOff) -le $tol) { $zPlaneIds += [int]$frontBaseId; continue }
                         $wiz.Pump()
-                        $res = New-OffsetPlane -Label "Z$($zPlaneIds.Count)" -Offset ([double]$zOff) -BaseId ([int]$frontBaseId)
+                        $res = New-OffsetPlane -Label "Z$($zPlaneIds.Count)" -Offset ([double]$zOff) -BaseId ([int]$frontBaseId) -SkipSymbolWait
                         if ($null -eq $res.FeatId) { $ok = $false; break }
                         $zPlaneIds += [int]$res.FeatId
                     }
@@ -1226,6 +1241,9 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
                 if ($ok) {
                     for ($qi=0; $qi -lt $xPlaneIds.Count; $qi++) { if ([int]$xPlaneIds[$qi] -ne [int]$topBaseId) { $c.GridPlaneIds += [pscustomobject]@{ FeatId=[int]$xPlaneIds[$qi]; Axis='X'; Offset=[double]$plan.XCoords[$qi] } } }
                     for ($qi=0; $qi -lt $zPlaneIds.Count; $qi++) { if ([int]$zPlaneIds[$qi] -ne [int]$frontBaseId) { $c.GridPlaneIds += [pscustomobject]@{ FeatId=[int]$zPlaneIds[$qi]; Axis='Z'; Offset=[double]$plan.ZCoords[$qi] } } }
+                    # ORIGINAL point-creation loop: fires ONLY the creation macros, no
+                    # COM reads between them. The index-csys registry is built AFTER the
+                    # loop (post-processing), so it cannot affect point creation.
                     $beforePts = Get-PointIdSet -Model $model -TypeObj $pfcType
                     $pi = 0
                     foreach ($tri in $plan.Triples) {
@@ -1236,6 +1254,18 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
                     }
                     $newIds = Resolve-NewPointIds -Model $model -TypeObj $pfcType -Before $beforePts
                     if (@($newIds).Count -ge 1) { $c.GridPointIDs = @($newIds) }
+                    # INDEX-CSYS REGISTRY (post-processing; does NOT touch point creation):
+                    # creation-order zip (sorted new point ids <-> $plan.Triples). PLANE
+                    # ORDER = X-normal (X-offset plane, from TOP), Y-normal (SIDE face),
+                    # Z-normal (Z-offset plane, from FRONT) -- the order ProCmdDatumCsys
+                    # assigns axes from. See drilljig.cmd for the full rationale.
+                    if (@($newIds).Count -eq @($plan.Triples).Count) {
+                        $c.CsysRecords = @()
+                        for ($k = 0; $k -lt $newIds.Count; $k++) {
+                            $t2 = $plan.Triples[$k]
+                            $c.CsysRecords += [pscustomobject]@{ PointId=[int]$newIds[$k]; HoleFeatId=$null; PlaneIds=@([int]$xPlaneIds[$t2.Xi], [int]$facePlaneId, [int]$zPlaneIds[$t2.Zi]); GridX=[double]$t2.X; GridZ=[double]$t2.Z }
+                        }
+                    }
                     if (@($newIds).Count -ne $c.OrthoGeo.Count) { $wiz.Log(("Point count: wanted {0}, got {1}." -f $c.OrthoGeo.Count, @($newIds).Count)) }
                 }
                 if ($c.GridPointIDs.Count -gt 0) {
@@ -1273,8 +1303,12 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
         }
 
         # ---- STAGE 3: drill through holes ----
+        # ORIGINAL drill loop: fires ONLY the hole macros, no COM reads between them.
+        # The index-csys hole->point tie is done OUTSIDE the loop (one diff below), so
+        # hole creation is untouched.
         $wiz.Log(("Drilling {0} through-hole(s) at diameter {1}..." -f @($c.PointIDs).Count, $c.HoleDiaFinal))
         $total = @($c.PointIDs).Count; $idx=0; $made=0; $noop=0; $failed=0; $aborted=$false
+        $beforeDrillFeat = if (@($c.CsysRecords).Count -gt 0) { Get-FeatureIdSet } else { $null }
         foreach ($ptId in $c.PointIDs) {
             $idx++
             $wiz.SetProgress([Math]::Floor(($idx/$total)*100), ("hole $idx / $total"))
@@ -1290,6 +1324,25 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
             }
         }
         $c.Drilled = ($made -gt 0)
+        # index-csys hole->point tie (outside the loop): one diff + creation-order groups
+        # (a hole may add an axis/note, so match a GROUP per hole - see Resolve-HoleFeatGroups).
+        if ($null -ne $beforeDrillFeat -and -not $aborted -and $made -gt 0) {
+            $afterDrillFeat = Get-FeatureIdSet
+            $newDrillFeats  = @($afterDrillFeat.Keys | Where-Object { -not $beforeDrillFeat.ContainsKey($_) } | Sort-Object)
+            $grp = Resolve-HoleFeatGroups -NewFeatIds $newDrillFeats -HoleCount @($c.PointIDs).Count
+            if ($grp.Ok) {
+                for ($k = 0; $k -lt @($c.PointIDs).Count; $k++) {
+                    $rec = $c.CsysRecords | Where-Object { $null -ne $_.PointId -and [int]$_.PointId -eq [int]$c.PointIDs[$k] } | Select-Object -First 1
+                    if ($null -ne $rec) {
+                        $rec.HoleFeatId = [int]$grp.Groups[$k][0]
+                        try { $rec | Add-Member -NotePropertyName HoleFeatIds -NotePropertyValue @($grp.Groups[$k]) -Force } catch {}
+                    }
+                }
+                $wiz.Log(("Index-csys: {0} hole(s) tied to their points ({1} feature(s) each)." -f @($c.PointIDs).Count, $grp.PerHole))
+            } else {
+                $wiz.Log(("Index-csys: hole->point tie skipped ({0}); click the datum POINT for the index csys." -f $grp.Reason))
+            }
+        }
         if ($aborted) { $wiz.SetChip('drill', 'drill: aborted', 'aborted') }
         elseif ($made -eq $total -and $failed -eq 0) { $wiz.SetChip('drill', ("drill: {0} holes" -f $made), 'built') }
         else { $wiz.SetChip('drill', ("drill: {0}/{1}" -f $made, $total), 'unverified') }
@@ -1455,6 +1508,111 @@ $slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + 
     }
 [void]$steps.Add($slotFinishStep)
 
+# ---- STAGE: Index -- index-hole coordinate system --------------------------
+# The user picks ONE drilled hole to be the index hole (the csys origin). Each grid
+# point was built as the intersection of 3 mutually-perpendicular planes recorded
+# per point in $c.CsysRecords (X/Y/Z-normal order); the SAME triple re-selected and
+# fed to ProCmdDatumCsys makes a coordinate system at that point. Split into
+# index-a (pick + resolve the hole's plane triple, arm/verify) and index-b (fire the
+# csys), so the Creo hole PICK is a proper wizard verify (Next gates on a resolved
+# triple), matching the datum/box pick-then-run pattern. index-a self-skips when
+# there is no registry (predefined points) or the flag is set.
+$indexPickStep = New-WizardStep -Key 'index-a' -Title 'Index hole: pick it' -Stage 'Index' -Kind 'pick' -PrimaryText 'Continue' `
+    -Validate {
+        param($c)
+        if ($noIndexCsys -or @($c.CsysRecords).Count -eq 0) { return $true }   # nothing to gate; index-b skips
+        return (@($c.IndexPlaneIds).Count -eq 3)
+    } `
+    -Build {
+        param($panel, $c, $wiz)
+        if ($noIndexCsys) { Add-Para $panel "Index coordinate system disabled (--no-index-csys). Press Next to finish." 8 60 'gray'; return }
+        if (@($c.CsysRecords).Count -eq 0) {
+            Add-Para $panel ("No tracked hole planes this run (predefined points, or points/holes were not tracked). The index coordinate system re-uses the 3 planes drilljig built each hole from, so it needs an orthogrid/custom run. Press Next to skip.") 8 70 'gray'
+            return
+        }
+        Add-ArmBanner $panel ("In Creo, SELECT THE HOLE you want as the index hole (click the hole in the model tree, or the datum point it was drilled on)." + [Environment]::NewLine + "Then click verify.") 8
+        Add-VerifyControls -Panel $panel -Context $c -Wizard $wiz -Top 130 -OnVerify {
+            param($cc, $w)
+            $sel = Read-IndexSelectionIds
+            if (@($sel.FeatureIds).Count -eq 0 -and @($sel.PointIds).Count -eq 0) { return @{ Ok=$false; Message='Nothing selected. Select the hole (or its datum point) in Creo, then verify.' } }
+            $res = Resolve-IndexHolePlanes -Records $cc.CsysRecords -FeatureIds $sel.FeatureIds -PointIds $sel.PointIds
+            if (-not $res.Ok) {
+                $withHole = @($cc.CsysRecords | Where-Object { $null -ne $_.HoleFeatId })
+                $diag = ("read feat ids: {0}; point ids: {1}; registry {2} rec(s), {3} with a hole id" -f (($sel.FeatureIds | Select-Object -First 12) -join ','), (($sel.PointIds | Select-Object -First 12) -join ','), @($cc.CsysRecords).Count, @($withHole).Count)
+                return @{ Ok=$false; Message=("Could not tie the selection to a drilled hole: {0}.`n({1})`nSelect the hole feature (or its datum point)." -f $res.Reason, $diag) }
+            }
+            $cc.IndexPlaneIds = @($res.PlaneIds)
+            $cc.IndexPointId  = $res.PointId
+            $w.SetChip('index', 'index: hole picked', 'set')
+            return @{ Ok=$true; Message=("Index hole resolved ({0}); point id {1}. Press Continue to create the coordinate system." -f $res.Reason, $res.PointId) }
+        }
+    } `
+    -OnNext { param($c,$wiz) return $true }
+[void]$steps.Add($indexPickStep)
+
+$indexRunStep = New-WizardStep -Key 'index-b' -Title 'Index hole: create the coordinate system' -Stage 'Index' -Kind 'run' -PrimaryText 'Create coordinate system' `
+    -Validate { param($c) return $true } `
+    -Build {
+        param($panel, $c, $wiz)
+        if ($noIndexCsys -or @($c.CsysRecords).Count -eq 0) { Add-Para $panel "No index coordinate system to create. Press Next to finish." 8 60 'gray'; return }
+        if (@($c.IndexPlaneIds).Count -ne 3) { Add-Para $panel "No index hole was resolved on the previous step. Press Next to finish." 8 60 'gray'; return }
+        Add-Para $panel ("Ready: a datum coordinate system will be created automatically at the picked hole (the 3 planes that built its point are used, X/Y/Z-normal - no clicks needed). Press the button to run." ) 8 80 'Gray'
+    } `
+    -OnNext {
+        param($c, $wiz)
+        if ($noIndexCsys -or @($c.CsysRecords).Count -eq 0 -or @($c.IndexPlaneIds).Count -ne 3) { return $true }
+        $script:GuiWiz = $wiz
+        $wiz.BeginRun('Creating the index coordinate system...')
+        $wiz.Log(("Creating the coordinate system from planes {0} (X/Y/Z-normal), automatically..." -f ($c.IndexPlaneIds -join ', ')))
+        $cs = Invoke-IndexCsys -PlaneIds @($c.IndexPlaneIds) -Show
+        $c.IndexOk = [bool]$cs.Ok
+        $c.CsysDone = $true
+        if ($cs.Ok) {
+            $wiz.SetChip('index', 'index: csys created', 'built')
+            $wiz.Log(("Coordinate system created (new feature id {0}). Verify axes visually." -f $cs.NewFeatId))
+            $wiz.MarkCommitted()
+            # STAGE 6: export every hole's coordinate relative to this index csys (pure
+            # math from the grid layout; csys X=grid X, Z=grid Z, Y=0). CSV next to the eval packets.
+            try {
+                $base = ($c.ModelName -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
+                if ([string]::IsNullOrWhiteSpace($base)) { $base = 'drilljig' }
+                $csvPath = Join-Path $ScriptDir ($base + "_holes_from_index_csys.csv")
+                $exp = Export-IndexHoleCsv -Records $c.CsysRecords -IndexPointId $c.IndexPointId -Diameter $c.HoleDiaFinal -Path $csvPath
+                if ($exp.Ok) {
+                    $c.CsysCsvPath = $exp.Path; $wiz.Log(("Exported {0} hole coordinate(s) relative to the index csys -> {1}" -f $exp.Count, $exp.Path))
+                    $reportPath = Join-Path $ScriptDir ($base + "_index_report.txt")
+                    $csysMeta = @{ PartNumber = $c.ModelName; CsysFeatId = $cs.NewFeatId; Units = 'model units'; WhenIso = (Get-Date).ToString('o') }
+                    $rep = Write-IndexHoleReport -Records $c.CsysRecords -IndexPointId $c.IndexPointId -Diameter $c.HoleDiaFinal -Meta $csysMeta -Path $reportPath
+                    if ($rep.Ok) { $wiz.Log(("Readable report -> {0}" -f $rep.Path)) }
+                }
+                else { $wiz.Log(("Could not export hole coordinates: {0}" -f $exp.Reason)) }
+            } catch { $wiz.Log("  export error: $($_.Exception.Message)") }
+            # STAGE 7: optionally create datum points REFERENCED FROM the index csys
+            # (offset-csys, at the exported coords). WIDGETS UNVERIFIED -> canary-gated.
+            if (-not $noCsysPoints) {
+                $ansPts = Show-WizardMessage -Text ("Also create datum points referenced from this coordinate system (offset-csys, at the exported coordinates)?" + [Environment]::NewLine + [Environment]::NewLine + "Experimental: the offset-coordinate-system dialog widgets are a best GUESS (not yet recorded live). If created, VERIFY the points' placement in Creo.") -Title 'Index coordinate system' -Buttons 'YesNo' -Icon 'Question'
+                if ($ansPts -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    try {
+                        $hr = Get-HolesRelativeToIndex -Records $c.CsysRecords -IndexPointId $c.IndexPointId -Diameter $c.HoleDiaFinal
+                        if ($hr.Ok -and @($hr.Rows).Count -gt 0) {
+                            $wiz.Log(("Creating {0} datum point(s) offset from the csys (experimental widgets)..." -f @($hr.Rows).Count))
+                            $cp = Invoke-CsysOffsetPoints -CsysFeatId ([int]$cs.NewFeatId) -Rows @($hr.Rows)
+                            # count match is NOT proof the placement is right (widgets guessed) -> amber UNVERIFIED, never a green 'built'.
+                            if ($cp.Ok) { $c.CsysPointsCreated = $cp.Created; $wiz.SetChip('index', ("index: csys + {0} pts (unverified)" -f $cp.Created), 'unverified'); $wiz.Log(("{0} datum point(s) created -- UNVERIFIED: verify their placement in Creo (offset-csys widgets are a guess)." -f $cp.Created)) }
+                            elseif ($cp.Created -gt 0) { $wiz.Log(("Created {0} of {1} points (count mismatch) - inspect Creo." -f $cp.Created, $cp.Expected)) }
+                            else { $wiz.Log(("No csys-referenced points created: {0}" -f $cp.Reason)); $wiz.Log('The offset-csys dialog widgets are a GUESS - record the mapkey to lock them.') }
+                        }
+                    } catch { $wiz.Log("  csys-points error: $($_.Exception.Message)") }
+                }
+            }
+        } else {
+            $wiz.SetChip('index', 'index: not created', 'unverified')
+            $wiz.Log(("Coordinate system NOT created: {0}" -f $cs.Reason))
+        }
+        return $true
+    }
+[void]$steps.Add($indexRunStep)
+
 # ---- STAGE: Done -- summary -------------------------------------------------
 $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' -PrimaryText 'Finish' `
     -Validate { param($c) return $true } `
@@ -1469,6 +1627,12 @@ $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' 
         if ($c.Drilled) { $msg += "  Holes: drilled (verify visually in Creo)." + [Environment]::NewLine }
         if ($c.SlotsDone) { $msg += "  Chip-relief slots: cut (verify each spans its row, correct depth + face)." + [Environment]::NewLine }
         elseif ($c.SlotSkip) { $msg += "  Chip-relief slots: skipped." + [Environment]::NewLine }
+        if ($c.CsysDone) {
+            $msg += if ($c.IndexOk) { "  Index coordinate system: created (verify axes visually in Creo)." } else { "  Index coordinate system: NOT created (see the log)." }
+            $msg += [Environment]::NewLine
+            if ($c.CsysCsvPath) { $msg += ("  Hole coordinates (relative to the index csys): {0}" -f $c.CsysCsvPath) + [Environment]::NewLine }
+            if ($c.CsysPointsCreated -gt 0) { $msg += ("  Datum points referenced from the index csys: {0} created -- UNVERIFIED (verify placement in Creo)." -f $c.CsysPointsCreated) + [Environment]::NewLine }
+        }
         if ($script:macroFailures -gt 0) { $msg += [Environment]::NewLine + ("  NOTE: {0} mapkey failure(s) during the run - inspect Creo." -f $script:macroFailures) }
         $msg += [Environment]::NewLine + [Environment]::NewLine + "Verify all geometry in Creo. Press Finish to close (the Creo session stays open)."
         Add-Para $panel $msg 8 260 $null $false
@@ -1480,7 +1644,7 @@ $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' 
 # ============================================================================
 # RUN THE WIZARD
 # ============================================================================
-$stages = @('Bushing','Layout','Datums','Box','Drill','Relief','Done')
+$stages = @('Bushing','Layout','Datums','Box','Drill','Relief','Index','Done')
 $subtitle = "Connected: $([System.IO.Path]::GetFileName($modelFile))"
 
 try {

@@ -451,12 +451,31 @@ function Resolve-SelectedPointIds {
 }
 
 # Create ONE offset plane from a base ref selected BY ID. Returns
-# [pscustomobject]@{ Symbol; FeatId } (either may be $null). Verbatim recipe +
-# poll (heavier models commit the plane more slowly). GUI-log aware.
+# [pscustomobject]@{ Symbol; FeatId } (either may be $null). GUI-log aware.
+#
+# WAIT STRATEGY (perf, 2026-07-09): the OLD loop re-enumerated the ENTIRE model
+# dimension list (Get-LinearDimMap = ListItems(ITEM_DIMENSION) + 3 property reads
+# per dim) every 100ms from t=0 for up to 20s. That heavy COM walk GROWS as planes
+# accumulate AND competes with Creo for the main thread DURING the very commit it is
+# polling for -- the same self-defeating busy-wait the VersionStamp waiters warn
+# about (boxinator: "flooding Creo with COM reads *during* the regen it's waiting on
+# slows the very operation it's polling for"). It also ran for grid/slot planes whose
+# Symbol is never read. Now:
+#   (A) wait for the commit with the CHEAP single-property VersionStamp poll, and
+#   (B) do the heavy feature/dim enumeration only a FEW times, AFTER the commit is
+#       signalled -- not from t=0.
+# -SkipSymbolWait additionally skips the dim-map diff entirely: grid X/Z planes and
+# slot-edge planes need only .FeatId (they are intersected / shown by id, never
+# re-driven by symbol), so those planes never touch the dimension list at all. The
+# box planes (SIDE/TOP/FRONT) omit the switch because their Symbol drives the resize
+# loop + the slot-depth read.
 function New-OffsetPlane {
-    param([string]$Label, [double]$Offset, [int]$BaseId)
-    $before     = Get-LinearDimMap -Model $script:DJModel -TypeObj $script:DJType
+    param([string]$Label, [double]$Offset, [int]$BaseId, [switch]$SkipSymbolWait)
+    $needSym    = -not $SkipSymbolWait
+    $before     = if ($needSym) { Get-LinearDimMap -Model $script:DJModel -TypeObj $script:DJType } else { @{} }
     $beforeFeat = Get-FeatureIdSet
+    $preStamp   = $null; try { $preStamp = [string]$script:DJModel.VersionStamp } catch {}
+
     $macro =
         (Get-SelectByIdMacro -FeatId $BaseId) +
         "~ Command ``ProCmdDatumPlane``;" +
@@ -466,26 +485,53 @@ function New-OffsetPlane {
         "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
     Invoke-Macro "$Label plane: open + offset $Offset + OK" $macro
 
-    $MaxWaitSec = 20
-    $newSyms = @(); $after = $before
-    for ($i = 0; $i -lt ($MaxWaitSec * 10); $i++) {
-        $after   = Get-LinearDimMap -Model $script:DJModel -TypeObj $script:DJType
-        $newSyms = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
-        if ($newSyms.Count -ge 1) { break }
-        if ($i -eq 20) { Write-DJ "    (waiting for Creo to commit the $Label plane...)" 'DarkGray' }
-        Start-Sleep -Milliseconds 100
+    # (A) CHEAP wait for the commit: poll ONE property (VersionStamp) until it moves.
+    # Heavy models commit slower, so keep the generous 20s ceiling -- but each poll
+    # touches a single COM property, not the whole (growing) dim list.
+    $stampMoved = $false
+    if ($null -ne $preStamp) {
+        $deadlineA = [DateTime]::Now.AddSeconds(20)
+        while ([DateTime]::Now -lt $deadlineA) {
+            try { if ([string]$script:DJModel.VersionStamp -ne $preStamp) { $stampMoved = $true; break } } catch {}
+            Start-Sleep -Milliseconds 40
+        }
+        if (-not $stampMoved) { Write-DJ "    (waiting for Creo to commit the $Label plane timed out at 20s)" 'DarkGray' }
     }
-    $afterFeat = Get-FeatureIdSet
-    $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) })
-    $newFeatId = if ($newFeats.Count -ge 1) { [int]$newFeats[0] } else { $null }
 
-    if ($newSyms.Count -eq 0) {
-        Write-DJ "    No new linear dim appeared for the $Label plane after ${MaxWaitSec}s (feat id $newFeatId)." 'Yellow'
+    # (B) Commit signalled -> enumerate to grab the new feature id (+ the new offset
+    # dim symbol only when needed). Bounded by a short deadline so a missed signal
+    # can't hang; the new feature/dim is normally enumerable the instant the stamp
+    # moves. Take the first new feature (existing lib semantics; warn if >1 dim).
+    $newFeatId = $null; $sym = $null; $after = $before
+    $deadlineB = [DateTime]::Now.AddSeconds($(if ($stampMoved) { 8 } else { 1 }))
+    while ($true) {
+        $afterFeat = Get-FeatureIdSet
+        $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) })
+        if ($newFeats.Count -ge 1) { $newFeatId = [int]$newFeats[0] }
+        if ($needSym) {
+            $after   = Get-LinearDimMap -Model $script:DJModel -TypeObj $script:DJType
+            $newSyms = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
+            if ($newSyms.Count -ge 1) {
+                if ($newSyms.Count -gt 1) { Write-DJ "    More than one new dim appeared ($($newSyms -join ', ')); taking the first." 'Yellow' }
+                $sym = [string]$newSyms[0]; break
+            }
+        } elseif ($null -ne $newFeatId) {
+            break
+        }
+        if ([DateTime]::Now -ge $deadlineB) { break }
+        Start-Sleep -Milliseconds 50
+    }
+
+    if ($needSym -and $null -eq $sym) {
+        Write-DJ "    No new linear dim appeared for the $Label plane (feat id $newFeatId)." 'Yellow'
         return [pscustomobject]@{ Symbol = $null; FeatId = $newFeatId }
     }
-    if ($newSyms.Count -gt 1) { Write-DJ "    More than one new dim appeared ($($newSyms -join ', ')); taking the first." 'Yellow' }
-    $sym = [string]$newSyms[0]
-    Write-DJ "    $Label offset dim: $sym = $($after[$sym])" 'Green'
+    if (-not $needSym -and $null -eq $newFeatId) {
+        Write-DJ "    No new feature appeared for the $Label plane." 'Yellow'
+        return [pscustomobject]@{ Symbol = $null; FeatId = $null }
+    }
+    if ($needSym) { Write-DJ "    $Label offset dim: $sym = $($after[$sym])" 'Green' }
+    else          { Write-DJ "    $Label plane feat id $newFeatId (offset $Offset)" 'DarkGray' }
     return [pscustomobject]@{ Symbol = $sym; FeatId = $newFeatId }
 }
 
@@ -624,13 +670,13 @@ function New-SlotGuidePlanes {
     $tolP = 1e-6
     foreach ($xOff in $plan.XCoords) {
         if ([math]::Abs([double]$xOff) -le $tolP) { continue }   # X~0 -> the TOP base datum (already visible)
-        $res = New-OffsetPlane -Label "SlotX$($ids.Count)" -Offset ([double]$xOff) -BaseId ([int]$TopBaseId)
+        $res = New-OffsetPlane -Label "SlotX$($ids.Count)" -Offset ([double]$xOff) -BaseId ([int]$TopBaseId) -SkipSymbolWait
         if ($null -ne $res.FeatId) { $ids += [int]$res.FeatId }
         elseif ($null -ne $Log) { & $Log ("  slot X-edge plane at offset $xOff FAILED (continuing).") }
     }
     foreach ($zOff in $plan.ZCoords) {
         if ([math]::Abs([double]$zOff) -le $tolP) { continue }   # Z~0 -> the FRONT base datum
-        $res = New-OffsetPlane -Label "SlotZ$($ids.Count)" -Offset ([double]$zOff) -BaseId ([int]$FrontBaseId)
+        $res = New-OffsetPlane -Label "SlotZ$($ids.Count)" -Offset ([double]$zOff) -BaseId ([int]$FrontBaseId) -SkipSymbolWait
         if ($null -ne $res.FeatId) { $ids += [int]$res.FeatId }
         elseif ($null -ne $Log) { & $Log ("  slot Z-edge plane at offset $zOff FAILED (continuing).") }
     }
@@ -723,4 +769,369 @@ function Invoke-VerifiedSeedCut {
             return @{ Ok = $false; Flip = $curFlip; FeatId = $featId }
         }
     }
+}
+
+# ============================================================================
+# INDEX-HOLE COORDINATE SYSTEM (csysinator, shared by drilljig.cmd +
+# drilljig-gui.cmd + the standalone csysinator.cmd). Moved here 2026-07-13.
+# ============================================================================
+# The user's flow: after the holes are drilled, they pick ONE hole to be the
+# INDEX hole (the origin of a datum coordinate system). Every drilljig grid point
+# was created as the INTERSECTION OF 3 mutually-perpendicular planes (STAGE 2.5,
+# Build-IntersectPointMacro): SIDE face + an X-offset plane (from TOP) + a Z-offset
+# plane (from FRONT). The SAME 3 planes, re-selected and fed to ProCmdDatumCsys,
+# create a coordinate system at that intersection point.
+#
+# THE RECIPE (operator's recorded mapkey 'yes', 2026-07-13): select the 3
+# perpendicular planes IN ORDER (X-normal, Y-normal, Z-normal), then
+# ProCmdDatumCsys -> stdbtn_1 (OK). This is BYTE-FOR-BYTE the proven 3-plane
+# intersection recipe (point-at-3-plane-intersection-by-id + selectbyid-accumulates-
+# multiref, confirmed live 2026-06-24) with ProCmdDatumPointGeneral swapped for
+# ProCmdDatumCsys. drilljig stores each hole's csys plane triple in X/Y/Z-normal
+# order = [X-plane(from TOP), SIDE-face, Z-plane(from FRONT)]: the X-offset plane's
+# normal is the model X axis (per the grid contract "X = TOP-direction offset"), the
+# Z-offset plane's is Z, and the SIDE face is the Y-normal. NOTE this is a REORDER of
+# the point-build order (Build-IntersectPointMacro is called [face, X, Z]); the
+# intersection point is order-independent, but the csys axis assignment is not -- so
+# the registry deliberately reorders to [X, face, Z] to get X/Y/Z-normal.
+#
+# NOT YET CONFIRMED LIVE in this by-ID form (the operator's mapkey selected the
+# planes via the model tree PHTLeft.AssyTree; here they are fed by tree-search
+# select-by-ID, the accumulation channel proven for ProCmdDatumPointGeneral). So
+# it is CANARY-GATED (a new feature must appear) and never reports "created" on a
+# no-op ([[feedback_canary_must_not_assume_on_failure]]).
+
+# Build-CsysFromPlanesMacro - select the ordered plane triple BY ID (accumulate)
+# then ProCmdDatumCsys -> OK. PURE (no COM). The 1st plane clears the buffer, the
+# 2nd/3rd accumulate (-NoClear). Order = the caller's PlaneIds order (X/Y/Z-normal).
+# ONE atomic RunMacro (a dialog's command context does not survive across calls).
+function Build-CsysFromPlanesMacro {
+    param([int[]]$PlaneIds)
+    $m = (Get-SelectByIdMacro -FeatId $PlaneIds[0])
+    for ($i = 1; $i -lt $PlaneIds.Count; $i++) {
+        $m += (Get-SelectByIdMacro -FeatId $PlaneIds[$i] -NoClear)
+    }
+    $m += "~ Command ``ProCmdDatumCsys``;" +
+          "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+    return $m
+}
+
+# Get-CsysShowMacro - unhide the created csys (select by id + ProCmdViewShow), the
+# last two lines of the operator's mapkey. PURE.
+function Get-CsysShowMacro {
+    param([int]$FeatId)
+    return (Get-SelectByIdMacro -FeatId $FeatId) +
+           "~ Command ``ProCmdViewShow@PopupMenuTree``;"
+}
+
+# Resolve-IndexHolePlanes - PURE lookup. Given the drilljig csys registry
+# ($Records: each @{ HoleFeatId; PointId; PlaneIds=@(int,int,int) }) and the ids
+# resolved from the user's selection ($FeatureIds and $PointIds, both id-only),
+# find the record for the picked index hole and return its ordered plane triple.
+# Match precedence: HoleFeatId in FeatureIds, then PointId in PointIds, then
+# PointId in FeatureIds (a datum-point feature can surface as a feature id).
+# Returns @{ Ok; PlaneIds; PointId; HoleFeatId; Reason }. Never throws.
+function Resolve-IndexHolePlanes {
+    param([array]$Records, [array]$FeatureIds, [array]$PointIds)
+    $feat = @{}; foreach ($f in @($FeatureIds)) { try { $feat[[int]$f] = $true } catch {} }
+    $pts  = @{}; foreach ($p in @($PointIds))  { try { $pts[[int]$p]  = $true } catch {} }
+    if ($null -eq $Records -or @($Records).Count -eq 0) {
+        return @{ Ok = $false; PlaneIds = @(); PointId = $null; HoleFeatId = $null; Reason = 'no index registry (predefined points, or points/holes were not tracked this run)' }
+    }
+    foreach ($rec in $Records) {
+        $hf = $null; try { if ($null -ne $rec.HoleFeatId) { $hf = [int]$rec.HoleFeatId } } catch {}
+        if ($null -ne $hf -and $feat.ContainsKey($hf)) {
+            return @{ Ok = $true; PlaneIds = @($rec.PlaneIds); PointId = $rec.PointId; HoleFeatId = $hf; Reason = 'matched hole feature id' }
+        }
+        # a hole can create >1 feature (hole + axis/note); match ANY of them so
+        # whichever id a tree-click surfaces resolves.
+        $hfAll = @()
+        try { if ($null -ne $rec.HoleFeatIds) { $hfAll = @($rec.HoleFeatIds | ForEach-Object { [int]$_ }) } } catch {}
+        foreach ($h in $hfAll) {
+            if ($feat.ContainsKey([int]$h)) {
+                return @{ Ok = $true; PlaneIds = @($rec.PlaneIds); PointId = $rec.PointId; HoleFeatId = $rec.HoleFeatId; Reason = 'matched a hole sub-feature id' }
+            }
+        }
+    }
+    foreach ($rec in $Records) {
+        $pt = $null; try { if ($null -ne $rec.PointId) { $pt = [int]$rec.PointId } } catch {}
+        if ($null -ne $pt -and $pts.ContainsKey($pt)) {
+            return @{ Ok = $true; PlaneIds = @($rec.PlaneIds); PointId = $pt; HoleFeatId = $rec.HoleFeatId; Reason = 'matched datum point id' }
+        }
+    }
+    foreach ($rec in $Records) {
+        $pt = $null; try { if ($null -ne $rec.PointId) { $pt = [int]$rec.PointId } } catch {}
+        if ($null -ne $pt -and $feat.ContainsKey($pt)) {
+            return @{ Ok = $true; PlaneIds = @($rec.PlaneIds); PointId = $pt; HoleFeatId = $rec.HoleFeatId; Reason = 'matched datum point (selected as a feature)' }
+        }
+    }
+    return @{ Ok = $false; PlaneIds = @(); PointId = $null; HoleFeatId = $null; Reason = 'the selection did not match any drilled index hole / grid point this run' }
+}
+
+# Read-IndexSelectionIds - read the current selection buffer into @{ FeatureIds;
+# PointIds } (both id-only, deduped, never .Point coords). For each buffered item:
+# its own .Id is a candidate feature id; a resolvable GetFeature().Id is added too
+# (a hole surface/edge -> its owning feature); ListSubItems(ITEM_POINT) ids feed
+# PointIds; an item that IS a datum point feeds PointIds. Reads $script:DJSession/
+# DJType. @{ FeatureIds=@(); PointIds=@() } on an empty buffer.
+function Read-IndexSelectionIds {
+    $featSet = @{}; $ptSet = @{}
+    $contents = $null
+    try { $contents = ($script:DJSession.CurrentSelectionBuffer()).Contents } catch {}
+    if ($null -eq $contents -or $contents.Count -eq 0) { return @{ FeatureIds = @(); PointIds = @() } }
+    foreach ($item in $contents) {
+        $si = $null
+        try { $si = $item.SelItem } catch { continue }
+        if ($null -eq $si) { continue }
+        # the item's own id (feature id when a feature is picked in the tree)
+        try { $featSet[[int]$si.Id] = $true } catch {}
+        # owning feature (a picked surface/edge of the hole -> the hole feature)
+        try { $ff = $si.GetFeature(); if ($null -ne $ff) { $featSet[[int]$ff.Id] = $true } } catch {}
+        # the item IS a datum point
+        try { if ([int]$si.Type -eq [int]$script:DJType.ITEM_POINT) { $ptSet[[int]$si.Id] = $true } } catch {}
+        # a point-bearing feature -> its contained point ids
+        try { foreach ($pt in @($si.ListSubItems($script:DJType.ITEM_POINT))) { try { $ptSet[[int]$pt.Id] = $true } catch {} } } catch {}
+    }
+    return @{ FeatureIds = @($featSet.Keys); PointIds = @($ptSet.Keys) }
+}
+
+# Resolve-HoleFeatGroups - PURE. Split the set of NEW feature ids that appeared
+# across the whole drill loop into one contiguous group per hole, in creation order.
+# A single hole can add more than one ITEM_FEATURE (the hole + an axis/note), so the
+# old "new-feature-count must equal hole-count" tie was skipped whenever a hole added
+# extras -> HoleFeatId stayed blank -> clicking the HOLE (vs its datum point) did not
+# resolve in STAGE 5. Fix: when the new-feature count is an exact MULTIPLE (k) of the
+# hole count, the holes were drilled in $pointIDs order and Creo assigns feature ids
+# in ascending creation order, so the sorted ids form N contiguous groups of k. Group
+# i belongs to hole i. Returns @{ Ok; Groups (array of int[] per hole); PerHole=k;
+# Reason }. Ok=$false (no mis-attribution) when the count is not a clean multiple.
+function Resolve-HoleFeatGroups {
+    param([int[]]$NewFeatIds, [int]$HoleCount)
+    $ids = @(@($NewFeatIds) | ForEach-Object { [int]$_ } | Sort-Object)
+    if ($HoleCount -lt 1 -or $ids.Count -lt 1) { return @{ Ok = $false; Groups = @(); PerHole = 0; Reason = 'no new features or no holes' } }
+    if (($ids.Count % $HoleCount) -ne 0)       { return @{ Ok = $false; Groups = @(); PerHole = 0; Reason = ("{0} new feature(s) is not a multiple of {1} hole(s)" -f $ids.Count, $HoleCount) } }
+    $k = [int]($ids.Count / $HoleCount)
+    $groups = @()
+    for ($i = 0; $i -lt $HoleCount; $i++) {
+        $g = @()
+        for ($j = 0; $j -lt $k; $j++) { $g += [int]$ids[$i * $k + $j] }
+        $groups += ,@($g)
+    }
+    return @{ Ok = $true; Groups = @($groups); PerHole = $k; Reason = 'ok' }
+}
+
+# Invoke-IndexCsys - COM orchestration: fire Build-CsysFromPlanesMacro for the
+# ordered $PlaneIds, gate on a NEW FEATURE appearing (the canary - a csys creation
+# adds exactly one feature; a no-op means the macro was silently dropped, so we do
+# NOT report success). Optionally show the new csys. Reads $script:DJSession/DJModel/
+# DJType. Returns @{ Ok; NewFeatId; NewFeatCount; Reason }.
+function Invoke-IndexCsys {
+    param([int[]]$PlaneIds, [switch]$Show)
+    if ($null -eq $PlaneIds -or @($PlaneIds).Count -lt 3) {
+        return @{ Ok = $false; NewFeatId = $null; NewFeatCount = 0; Reason = 'need 3 plane ids' }
+    }
+    $beforeFeat = Get-FeatureIdSet
+    $preStamp = $null; try { $preStamp = [string]$script:DJModel.VersionStamp } catch {}
+    Invoke-Macro "index csys: select 3 planes -> ProCmdDatumCsys -> OK" (Build-CsysFromPlanesMacro -PlaneIds $PlaneIds)
+    if ($null -ne $preStamp) { [void](Wait-ModelModified -Model $script:DJModel -PreviousStamp $preStamp -TimeoutMs 15000) }
+    else { Start-Sleep -Milliseconds 400 }   # no stamp to wait on -> a brief settle so a slow commit isn't misread as a no-op (false negative)
+    $afterFeat = Get-FeatureIdSet
+    $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) } | Sort-Object)
+    if ($newFeats.Count -lt 1) {
+        return @{ Ok = $false; NewFeatId = $null; NewFeatCount = 0; Reason = 'no new feature appeared (the csys macro was a no-op - inspect Creo / widget drift)' }
+    }
+    $newId = [int]$newFeats[-1]
+    if ($Show) {
+        try { $script:DJSession.RunMacro((Get-CsysShowMacro -FeatId $newId)) } catch {}
+    }
+    return @{ Ok = $true; NewFeatId = $newId; NewFeatCount = $newFeats.Count; Reason = 'created' }
+}
+
+# ============================================================================
+# EXPORT hole coordinates relative to the index coordinate system
+# ============================================================================
+# After the index csys is created (STAGE 5), export every drilled hole's coordinate
+# IN THE INDEX CSYS FRAME. NO COM coordinate read (IpfcPoint.Point crashes on this
+# build): we already know each hole's design coordinate from the grid layout, and the
+# index csys was placed AT the index hole with axes aligned to the grid --
+#   csys X  ||  grid X  (the X-offset plane's normal),
+#   csys Z  ||  grid Z  (the Z-offset plane's normal),
+#   csys Y  =   through-thickness (0 for every hole -- they all sit on the SIDE face).
+# So a hole's csys coordinate is exactly (gridX - indexX, 0, gridZ - indexZ). Axis
+# SIGNS follow the csys orientation (verified visually); the deltas are exact from the
+# design layout, not a fragile measured read.
+
+# Get-HolesRelativeToIndex - PURE (no COM). $Records = the csys registry (each with
+# PointId + GridX + GridZ, optionally HoleFeatId); $IndexPointId = the picked index
+# hole's datum-point id. Returns @{ Ok; Rows; Reason }, one row per hole with its
+# coordinate relative to the index hole. Never throws.
+function Get-HolesRelativeToIndex {
+    param([array]$Records, $IndexPointId, [double]$Diameter = 0.0)
+    if ($null -eq $Records -or @($Records).Count -eq 0) { return @{ Ok = $false; Rows = @(); Reason = 'no hole records to export' } }
+    $idxRec = $null
+    foreach ($r in $Records) { try { if ($null -ne $r.PointId -and [int]$r.PointId -eq [int]$IndexPointId) { $idxRec = $r; break } } catch {} }
+    if ($null -eq $idxRec) { return @{ Ok = $false; Rows = @(); Reason = ("index point id {0} is not in the registry" -f $IndexPointId) } }
+    $ix = 0.0; $iz = 0.0
+    try { $ix = [double]$idxRec.GridX } catch {}
+    try { $iz = [double]$idxRec.GridZ } catch {}
+    $rows = @(); $n = 0
+    foreach ($r in $Records) {
+        $n++
+        $gx = 0.0; $gz = 0.0
+        try { $gx = [double]$r.GridX } catch {}
+        try { $gz = [double]$r.GridZ } catch {}
+        $isIdx = $false
+        try { $isIdx = ($null -ne $r.PointId -and [int]$r.PointId -eq [int]$IndexPointId) } catch {}
+        $hfid = $null; try { $hfid = $r.HoleFeatId } catch {}
+        $rows += [pscustomobject]@{
+            Hole        = $n
+            PointId     = $r.PointId
+            HoleFeatId  = $hfid
+            X_index     = [math]::Round($gx - $ix, 6)
+            Y_index     = 0.0
+            Z_index     = [math]::Round($gz - $iz, 6)
+            GridX       = [math]::Round($gx, 6)
+            GridZ       = [math]::Round($gz, 6)
+            Diameter    = [math]::Round([double]$Diameter, 6)
+            IsIndexHole = $isIdx
+        }
+    }
+    return @{ Ok = $true; Rows = @($rows); Reason = 'ok' }
+}
+
+# Export-IndexHoleCsv - build the rows (Get-HolesRelativeToIndex) and write a CSV.
+# Returns @{ Ok; Path; Count; Reason }. The only IO is one Export-Csv.
+function Export-IndexHoleCsv {
+    param([array]$Records, $IndexPointId, [double]$Diameter, [string]$Path)
+    $res = Get-HolesRelativeToIndex -Records $Records -IndexPointId $IndexPointId -Diameter $Diameter
+    if (-not $res.Ok) { return @{ Ok = $false; Path = $Path; Count = 0; Reason = $res.Reason } }
+    try {
+        @($res.Rows) | Export-Csv -NoTypeInformation -Path $Path -Encoding UTF8
+    } catch {
+        return @{ Ok = $false; Path = $Path; Count = 0; Reason = ("could not write CSV: {0}" -f $_.Exception.Message) }
+    }
+    return @{ Ok = $true; Path = $Path; Count = @($res.Rows).Count; Reason = 'ok' }
+}
+
+# Format-IndexHoleReport - PURE. Turn the hole rows (Get-HolesRelativeToIndex output)
+# + provenance metadata into a human-readable, inspection-friendly text report (a
+# provenance header + an aligned table). Keeps the CSV strictly tabular for machines
+# while this sidecar is for people / travelers. $Meta keys (all optional):
+# PartNumber, CsysFeatId, Units, WhenIso. The index hole (IsIndexHole) supplies the
+# origin point id + grid coords in the header. Returns the report string. No IO.
+function Format-IndexHoleReport {
+    param([array]$Rows, [hashtable]$Meta = @{})
+    $part  = if ($Meta.ContainsKey('PartNumber') -and $Meta.PartNumber) { [string]$Meta.PartNumber } else { '(unknown)' }
+    $csys  = if ($Meta.ContainsKey('CsysFeatId') -and $null -ne $Meta.CsysFeatId) { [string]$Meta.CsysFeatId } else { '(unknown)' }
+    $units = if ($Meta.ContainsKey('Units') -and $Meta.Units) { [string]$Meta.Units } else { 'model units' }
+    $when  = if ($Meta.ContainsKey('WhenIso') -and $Meta.WhenIso) { [string]$Meta.WhenIso } else { '(not stamped)' }
+    $rows  = @($Rows)
+    $idxRow = @($rows | Where-Object { $_.IsIndexHole }) | Select-Object -First 1
+    $idxDesc = if ($null -ne $idxRow) { ("point {0}  (grid {1}, {2})" -f $idxRow.PointId, $idxRow.GridX, $idxRow.GridZ) } else { '(none)' }
+    $others  = @($rows | Where-Object { -not $_.IsIndexHole }).Count
+
+    $nl = [Environment]::NewLine
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("Drill-jig hole coordinates -- relative to the index coordinate system")
+    [void]$sb.AppendLine("=====================================================================")
+    [void]$sb.AppendLine(("Part number  : {0}" -f $part))
+    [void]$sb.AppendLine(("Generated    : {0}" -f $when))
+    [void]$sb.AppendLine(("Csys feature : {0}" -f $csys))
+    [void]$sb.AppendLine(("Index hole   : {0}" -f $idxDesc))
+    [void]$sb.AppendLine(("Units        : {0}" -f $units))
+    [void]$sb.AppendLine(("Holes        : {0}  ({1} index + {2} other)" -f $rows.Count, $(if ($null -ne $idxRow) { 1 } else { 0 }), $others))
+    [void]$sb.AppendLine("Axis frame   : X along grid X, Z along grid Z, Y = through-thickness (0 for holes on the face).")
+    [void]$sb.AppendLine("               Origin is the index hole. Verify axis SIGNS against the created csys.")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine(("  {0,4}  {1,8}  {2,10}  {3,10}  {4,10}  {5,9}  {6}" -f 'Hole','PointId','X_index','Y_index','Z_index','Diameter','Index'))
+    [void]$sb.AppendLine("  ----  --------  ----------  ----------  ----------  ---------  -----")
+    foreach ($r in $rows) {
+        $flag = if ($r.IsIndexHole) { 'YES' } else { '' }
+        [void]$sb.AppendLine(("  {0,4}  {1,8}  {2,10:0.0000}  {3,10:0.0000}  {4,10:0.0000}  {5,9:0.0000}  {6}" -f `
+            $r.Hole, $r.PointId, [double]$r.X_index, [double]$r.Y_index, [double]$r.Z_index, [double]$r.Diameter, $flag))
+    }
+    return $sb.ToString()
+}
+
+# Write-IndexHoleReport - build the rows + format the report + write it to $Path.
+# Returns @{ Ok; Path; Count; Reason }. One Set-Content IO.
+function Write-IndexHoleReport {
+    param([array]$Records, $IndexPointId, [double]$Diameter, [hashtable]$Meta = @{}, [string]$Path)
+    $res = Get-HolesRelativeToIndex -Records $Records -IndexPointId $IndexPointId -Diameter $Diameter
+    if (-not $res.Ok) { return @{ Ok = $false; Path = $Path; Count = 0; Reason = $res.Reason } }
+    try {
+        $text = Format-IndexHoleReport -Rows @($res.Rows) -Meta $Meta
+        Set-Content -Path $Path -Value $text -Encoding UTF8
+    } catch {
+        return @{ Ok = $false; Path = $Path; Count = 0; Reason = ("could not write report: {0}" -f $_.Exception.Message) }
+    }
+    return @{ Ok = $true; Path = $Path; Count = @($res.Rows).Count; Reason = 'ok' }
+}
+
+# ============================================================================
+# CSYS-REFERENCED DATUM POINTS (STAGE 7) - create datum points OFFSET FROM the
+# index csys at the exported coordinates, so the points are parametrically tied to
+# that coordinate system (Creo: Datum Point -> "Offset Coordinate System", pick the
+# csys, Cartesian, type an X/Y/Z table).
+#
+# *** WIDGET NAMES UNVERIFIED - BEST GUESS. THIS DIALOG HAS NOT BEEN RECORDED.   ***
+# *** Treat exactly like the old Build-PointGridMacro: fire it, GATE it on a NEW ***
+# *** point actually appearing (Invoke-CsysOffsetPoints canary), and if nothing  ***
+# *** is created, print the RECORD-LIVE recipe and STOP -- never claim success.  ***
+#
+# RECORD-LIVE RECIPE to lock the widgets (do ONCE, then transcribe below):
+#   1. Creo: config.pro visible_mapkeys = yes ; Apply. Note the active trail.txt.N.
+#   2. Pre-select the index csys in the model tree.
+#   3. Model > Datum > Point > Offset Coordinate System. Pick the csys as the
+#      reference; set the dropdown to Cartesian.
+#   4. Add a row, type a known X/Y/Z (e.g. 1 / 0 / 2). Add a SECOND row with a
+#      different X/Y/Z so the row index + column tokens are unambiguous. Click OK.
+#   5. Copy every ~ Command/Open/Close/Select/Update/Input/Activate/Trigger line
+#      from the newest trail (drop ~ Trail/Timer/Move noise) and replace the guessed
+#      tokens below, keeping the whole open->table->OK as ONE atomic RunMacro.
+
+# Build-CsysOffsetPointsMacro - PURE. Select the csys BY ID, open the datum-point
+# tool in Offset-Coordinate-System mode, add one table row per coordinate (Cartesian
+# X/Y/Z), OK. ONE atomic RunMacro. $Rows: objects with .X_index/.Y_index/.Z_index
+# (the Get-HolesRelativeToIndex output). GUESSED widgets flagged above.
+function Build-CsysOffsetPointsMacro {
+    param([int]$CsysFeatId, [array]$Rows)
+    $m = (Get-SelectByIdMacro -FeatId $CsysFeatId) +
+        "~ Command ``ProCmdDatumPoint``;" +
+        "~ Open  ``Odui_Dlg_00`` ``t1.PntTypeOptMenu``;" +
+        "~ Close ``Odui_Dlg_00`` ``t1.PntTypeOptMenu``;" +
+        "~ Select ``Odui_Dlg_00`` ``t1.PntTypeOptMenu`` 1 ``Offset Coordinate System``;"
+    $r = 0
+    foreach ($row in @($Rows)) {
+        $x = [double]$row.X_index; $y = [double]$row.Y_index; $z = [double]$row.Z_index
+        $m += "~ Activate ``Odui_Dlg_00`` ``t1.add_pnt_btn``;" +
+              "~ Update  ``Odui_Dlg_00`` ``t1.pnt_table`` $r ``xax`` ``$x``;" +
+              "~ Update  ``Odui_Dlg_00`` ``t1.pnt_table`` $r ``yax`` ``$y``;" +
+              "~ Update  ``Odui_Dlg_00`` ``t1.pnt_table`` $r ``zax`` ``$z``;"
+        $r++
+    }
+    $m += "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+    return $m
+}
+
+# Invoke-CsysOffsetPoints - fire Build-CsysOffsetPointsMacro (ONE RunMacro) and GATE
+# on new datum points actually appearing (before/after ITEM_POINT diff -- never
+# "macro fired"). NO reads between the macro and the count (one RunMacro, one diff).
+# Returns @{ Ok; Created; Expected; Reason }. Reads $script:DJSession/DJModel/DJType.
+function Invoke-CsysOffsetPoints {
+    param([int]$CsysFeatId, [array]$Rows)
+    $expected = @($Rows).Count
+    if ($CsysFeatId -le 0 -or $expected -lt 1) {
+        return @{ Ok = $false; Created = 0; Expected = $expected; Reason = 'need a csys feature id and at least one row' }
+    }
+    $before = Get-PointIdSet -Model $script:DJModel -TypeObj $script:DJType
+    $stamp  = $null; try { $stamp = [string]$script:DJModel.VersionStamp } catch {}
+    Invoke-Macro "csys-referenced datum points ($expected)" (Build-CsysOffsetPointsMacro -CsysFeatId $CsysFeatId -Rows $Rows)
+    if ($null -ne $stamp) { [void](Wait-ModelModified -Model $script:DJModel -PreviousStamp $stamp -TimeoutMs 20000) }
+    $new = @(Resolve-NewPointIds -Model $script:DJModel -TypeObj $script:DJType -Before $before)
+    if (@($new).Count -lt 1) {
+        return @{ Ok = $false; Created = 0; Expected = $expected; Reason = 'no new datum point appeared (the offset-csys dialog widgets are UNVERIFIED - record the mapkey; see Build-CsysOffsetPointsMacro header)' }
+    }
+    $ok = (@($new).Count -eq $expected)
+    return @{ Ok = $ok; Created = @($new).Count; Expected = $expected; Reason = $(if ($ok) { 'ok' } else { 'point count did not match the coordinate count - inspect Creo' }) }
 }

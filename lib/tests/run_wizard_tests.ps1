@@ -256,7 +256,10 @@ foreach ($lf in @('wizard.ps1','drilljig_core.ps1')) {
 $coreFns = @('Initialize-DrilljigCore','New-OffsetPlane','Set-PlaneOffset','Set-ReliefHoleDepth',
              'Build-HoleMacro','Build-ReliefHoleMacro','Get-SelectByIdMacro','Get-SelectDatumByIdMacro',
              'Read-SelectedId','Read-SelectionPlanePicks','Find-DefaultDatumPicks','Resolve-SelectedPointIds',
-             'Get-BodyList','Get-CatalogRows','Group-CatalogByOD','Invoke-Macro','Invoke-ForceRegen','Wait-ModelModified')
+             'Get-BodyList','Get-CatalogRows','Group-CatalogByOD','Invoke-Macro','Invoke-ForceRegen','Wait-ModelModified',
+             'Build-CsysFromPlanesMacro','Get-CsysShowMacro','Resolve-IndexHolePlanes','Read-IndexSelectionIds','Invoke-IndexCsys',
+             'Get-HolesRelativeToIndex','Export-IndexHoleCsv','Build-CsysOffsetPointsMacro','Invoke-CsysOffsetPoints',
+             'Resolve-HoleFeatGroups','Format-IndexHoleReport','Write-IndexHoleReport')
 $missingCore = @($coreFns | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
 Assert-True "all drilljig-core functions resolve" ($missingCore.Count -eq 0) ("missing: {0}" -f ($missingCore -join ', '))
 
