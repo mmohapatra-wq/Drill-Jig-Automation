@@ -71,7 +71,7 @@ Write-Host "  ------------------------------------------------------------------
 # Connect
 # ----------------------------------------------------------------------------
 try {
-    $proc = Get-Process | Where-Object { $_.ProcessName -eq "xtop" }
+    $proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
     if ($null -eq $proc) { throw "Running Creo process (xtop) not found" }
     $Env:PRO_DIRECTORY = $proc.Path.TrimEnd("xtop.exe")
     $Env:PRO_COMM_MSG_EXE = ($proc.Path -replace "xtop.exe", "pro_comm_msg.exe")

@@ -87,7 +87,7 @@ Write-Host ""
 try {
     Write-Output "Setting up Creo VB API environment..."
 
-    $proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
+    $proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
     if ($null -eq $proc) {
         throw "Running Creo process (xtop) not found. Please start Creo Parametric and try again."
     }

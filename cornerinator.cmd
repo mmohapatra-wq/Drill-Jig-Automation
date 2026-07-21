@@ -90,6 +90,11 @@ function Wait-ModelModified {
     $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
     while ([DateTime]::Now -lt $deadline) {
         try { if ($Model.VersionStamp -ne $PreviousStamp) { return $true } } catch {}
+        # Poll gap (proven pattern from boxinator/drilljig_core): without it this loop
+        # busy-waits, pegging a CPU core AND flooding Creo with COM VersionStamp reads
+        # *during* the regen it is polling for -- which slows the very operation. 40ms
+        # is far finer than any Creo regen, so detection latency is imperceptible.
+        Start-Sleep -Milliseconds 40
     }
     return $false
 }

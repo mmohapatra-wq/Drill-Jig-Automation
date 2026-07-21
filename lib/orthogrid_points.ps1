@@ -433,6 +433,200 @@ function global:Get-SharedPlanePlan {
     }
 }
 
+# ============================================================================
+# INDEX-FIRST MODE (2026-07-15) -- build the grid off an index-hole base csys
+# ============================================================================
+# The user wants the jig's features to reference the index hole WITHOUT moving
+# any geometry (moving the base csys after the fact cuts the jig -- fact
+# drilljig-no-single-movable-parent). The approach: create the base csys AT the
+# index hole from the start (Invoke-OutputCsys), and build the grid off it.
+# *** LIVE FINDING 2026-07-16 (supersedes an earlier, WRONG note that claimed the
+# *** base csys did NOT translate its child planes): a datum plane offset from the
+# *** index csys's axis IS measured FROM THE CSYS ORIGIN -- an absolute-valued plane
+# *** off the index csys OVERSHOT by +index (confirmed by the operator). So the
+# *** front-ends offset every grid plane RELATIVE to the index hole
+# *** (gridCoord - indexGridCoord), the index hole's own column/row is offset 0 and
+# *** REUSES the csys anchor plane (no new plane -> a row of N makes N-1 planes), and
+# *** the holes land at their correct ABSOLUTE positions while being referenced from
+# *** the index hole. Get-RelativeSharedPlanePlan below computes exactly this shift.
+# These are PURE helpers (no COM). Get-IndexHolePlan gives the candidates + the
+# chosen hole's grid coords; Get-RelativeSharedPlanePlan applies the index shift and
+# is exercised by the offline tests (the front-ends inline the same subtraction).
+
+# Get-IndexHolePlan -- given a layout's Points and an optional chosen index (by 0-based
+# ordinal Key into Points), return the index-hole candidates + the chosen index's grid
+# coords. Load-bearing outputs are IndexGridX/IndexGridZ (HasIndex=$false when none
+# chosen -> caller keeps today's origin-based behavior). Never throws (skips malformed
+# points like Get-SharedPlanePlan). global: scope for the hybrid .cmd closure model.
+function global:Get-IndexHolePlan {
+    param(
+        [array]$Points,
+        $IndexKey = $null
+    )
+    $cands = @()
+    if ($null -ne $Points) {
+        $ord = 0
+        foreach ($pt in $Points) {
+            $x = $null; $z = $null
+            try { if ($null -ne $pt.X) { $x = [double]$pt.X } } catch {}
+            try { if ($null -ne $pt.Z) { $z = [double]$pt.Z } } catch {}
+            if ($null -eq $x -or $null -eq $z) { $ord++; continue }   # keep Key aligned to the input ordinal
+            $i = $null; $j = $null
+            try { if ($null -ne $pt.I) { $i = [int]$pt.I } } catch {}
+            try { if ($null -ne $pt.J) { $j = [int]$pt.J } } catch {}
+            $ijTxt = if ($null -ne $i -and $null -ne $j) { " (I=$i,J=$j)" } else { "" }
+            $cands += [pscustomobject]@{
+                Key   = $ord
+                I     = $i
+                J     = $j
+                X     = [double]$x
+                Z     = [double]$z
+                Label = ("#{0}{1}  X={2:0.###} Z={3:0.###}" -f $ord, $ijTxt, $x, $z)
+            }
+            $ord++
+        }
+    }
+    $ix = $null; $iz = $null; $has = $false
+    if ($null -ne $IndexKey) {
+        $k = $null
+        try { $k = [int]$IndexKey } catch {}
+        if ($null -ne $k) {
+            $match = @($cands | Where-Object { $_.Key -eq $k })
+            if ($match.Count -gt 0) { $ix = [double]$match[0].X; $iz = [double]$match[0].Z; $has = $true }
+        }
+    }
+    return [pscustomobject]@{
+        Candidates = @($cands)
+        IndexGridX = $ix
+        IndexGridZ = $iz
+        HasIndex   = $has
+    }
+}
+
+# Get-RelativeSharedPlanePlan -- Get-SharedPlanePlan with every distinct X/Z offset
+# shifted by -IndexGridX / -IndexGridZ. Triples are reused verbatim (a uniform shift
+# is monotonic, so sort order / dedup / each point's Xi/Zi are all preserved). This is
+# the index-relative plan: the front-ends perform the SAME (gridCoord - indexGridCoord)
+# subtraction inline at plane-creation time (a datum plane off the index csys is
+# measured from the csys origin, confirmed live 2026-07-16), and reuse the csys anchor
+# plane for the coordinate that shifts to ~0 (the index hole's own column/row). This
+# helper computes/verifies that shift for the offline tests. Never throws. global: scope.
+function global:Get-RelativeSharedPlanePlan {
+    param(
+        [array]$Points,
+        [double]$IndexGridX = 0.0,
+        [double]$IndexGridZ = 0.0,
+        [double]$Tol = 1e-6
+    )
+    $plan = Get-SharedPlanePlan -Points $Points -Tol $Tol
+    $relX = @(@($plan.XCoords) | ForEach-Object { [double]$_ - $IndexGridX })
+    $relZ = @(@($plan.ZCoords) | ForEach-Object { [double]$_ - $IndexGridZ })
+    return [pscustomobject]@{
+        XCoords = @($relX)
+        ZCoords = @($relZ)
+        Triples = @($plan.Triples)
+    }
+}
+
+# ============================================================================
+# Get-IndexDirectionalPlanePlan -- the user's N-INDEXED DIRECTIONAL check (2026-07-21).
+# ============================================================================
+# WHY THIS EXISTS (root cause of the "scattered holes, same every run, index-flip
+# doesn't help" bug on a NON-CORNER index):
+#   In index-first mode the grid pitch planes used to be built off the INTERSECTED
+#   index csys ($baseCsysId) at a SIGNED offset (gridCoord - indexCoord). That csys's
+#   axis DIRECTIONS are derived by Creo from 3 intersecting planes' normals, which read
+#   NULL on this build -> the +/- axis orientation is not deterministic/verifiable. For
+#   a MIN-CORNER index every offset is >= 0 so the ambiguity never bites; for an INTERIOR
+#   index the offsets split into  -cc .. 0 .. +cc  and the negative-side planes resolve to
+#   the WRONG side while the positive-side ones land right -> scattered, deterministic,
+#   and un-fixable by --index-flip (negating ALL offsets just swaps which side is wrong).
+#
+# THE FIX this helper enables: build every pitch plane off a RELIABLE frame
+# (CSYS_PAT_DEF, whose axes ARE the model axes) at the ABSOLUTE grid coordinate. Because
+# absolute-coordinate ordering IS the column/row (N) ordering, a hole with N > index-N
+# lands on the +side of the index automatically -- the DIRECTION the user wants -- with
+# NO negative offsets and NO dependency on the intersected-csys axis orientation.
+#
+# WHAT IT COMPUTES (exactly the user's construction): treat each DISTINCT X coordinate as
+# one "X hole" column N = 1..Nx (ascending), likewise Z as N = 1..Nz. Find the index
+# hole's own column N (IndexNX) and row N (IndexNZ). Per column/row report:
+#   N          - 1-based rank (ascending), the loop variable the user described
+#   IndexN     - the index hole's N in that direction
+#   RelN       - N - IndexN  (0 = index's own column/row; <0 = "left/below"; >0 = "right/above")
+#   Direction  - sign(RelN): -1 / 0 / +1  (the negative/positive-offset decision)
+#   AbsCoord   - the coordinate itself (what a plane off CSYS_PAT_DEF is offset to)
+#   RelOffset  - AbsCoord - IndexCoord (signed; the OLD index-csys offset, kept for the
+#                diagnostic + as a cross-check that sign(RelOffset) == Direction)
+#   IsIndex    - RelN == 0 (the index's own column/row -> reuse the anchor plane)
+#
+# Inputs: -Points (layout, .X/.Z), -IndexGridX/-IndexGridZ (the chosen index's coords),
+#         -Tol (shared-plane dedup + coord match). PURE, never throws, global: scope.
+# Returns [pscustomobject]:
+#   XPlanes [array] one entry per distinct X column (see fields above), ascending by N
+#   ZPlanes [array] one entry per distinct Z row
+#   Nx / Nz  (= XPlanes.Count / ZPlanes.Count, the per-direction hole counts)
+#   IndexNX / IndexNZ  (the index hole's column/row N; 0 if the index coord isn't found)
+#   Triples [array] passthrough from Get-SharedPlanePlan (Xi/Zi index into XPlanes/ZPlanes)
+# XPlanes/ZPlanes stay index-parallel to Get-SharedPlanePlan's XCoords/ZCoords (ascending),
+# so a Triple's .Xi/.Zi index straight into them -- the front-ends iterate these entries.
+# ============================================================================
+function global:Get-IndexDirectionalPlanePlan {
+    param(
+        [array]$Points,
+        [double]$IndexGridX = 0.0,
+        [double]$IndexGridZ = 0.0,
+        [double]$Tol = 1e-6
+    )
+    $plan = Get-SharedPlanePlan -Points $Points -Tol $Tol
+
+    # rank of the index coord among a distinct-coord list (1-based); 0 if not present.
+    $rankOf = {
+        param([double[]]$Coords, [double]$V)
+        for ($k = 0; $k -lt $Coords.Count; $k++) {
+            if ([math]::Abs([double]$Coords[$k] - $V) -le $Tol) { return ($k + 1) }
+        }
+        return 0
+    }
+    $indexNX = & $rankOf @($plan.XCoords) ([double]$IndexGridX)
+    $indexNZ = & $rankOf @($plan.ZCoords) ([double]$IndexGridZ)
+
+    # build the per-column / per-row directional records. $Coords is ascending, so
+    # array index k -> N = k+1 (the user's 1..count loop variable).
+    $buildDir = {
+        param([double[]]$Coords, [int]$IndexN, [double]$IndexCoord)
+        $out = @()
+        for ($k = 0; $k -lt $Coords.Count; $k++) {
+            $n    = $k + 1
+            $relN = if ($IndexN -gt 0) { $n - $IndexN } else { 0 }
+            $dir  = if ($relN -lt 0) { -1 } elseif ($relN -gt 0) { 1 } else { 0 }
+            $abs  = [double]$Coords[$k]
+            $out += [pscustomobject]@{
+                N         = $n
+                IndexN    = $IndexN
+                RelN      = $relN
+                Direction = $dir
+                AbsCoord  = $abs
+                RelOffset = ($abs - $IndexCoord)
+                IsIndex   = ($relN -eq 0 -and $IndexN -gt 0)
+            }
+        }
+        return ,@($out)
+    }
+    $xPlanes = & $buildDir @($plan.XCoords) $indexNX ([double]$IndexGridX)
+    $zPlanes = & $buildDir @($plan.ZCoords) $indexNZ ([double]$IndexGridZ)
+
+    return [pscustomobject]@{
+        XPlanes = @($xPlanes)
+        ZPlanes = @($zPlanes)
+        Nx      = @($xPlanes).Count
+        Nz      = @($zPlanes).Count
+        IndexNX = $indexNX
+        IndexNZ = $indexNZ
+        Triples = @($plan.Triples)
+    }
+}
+
 # ----------------------------------------------------------------------------
 # Get-PatternExpectedNewPoints -- how many NEW datum points a Direction pattern
 # of one seed should ADD. A 2-direction Nx*Nz pattern has Nx*Nz total members but

@@ -15,3 +15,15 @@ CREO_MAPKEY_AUTOMATION_GUIDE.md
 
 # slotpat-probe recorder output (throwaway trail transcription)
 slotpat_recipe.txt
+
+# holepat-probe recorder output (throwaway trail transcription)
+holepat_recipe.txt
+
+# csystrf-probe recorder output (throwaway trail transcription)
+csystrf_recipe.txt
+
+# fastener-probe read-path diagnostic output (throwaway)
+fastener_probe_report.txt
+
+# fastener layout handoff (per-run artifact, like last_jig_spec.json)
+fastener_layout.json

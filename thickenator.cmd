@@ -103,7 +103,7 @@ Write-Host ""
 # Set environment variables for VB API connection
 try {
     # Find running Creo process (xtop.exe) to determine installation paths
-    $proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
+    $proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
     if ($null -eq $proc) {
         throw "Running Creo process (xtop) not found"
     }

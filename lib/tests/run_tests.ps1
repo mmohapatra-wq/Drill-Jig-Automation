@@ -389,6 +389,45 @@ Assert-True "numeric pass gates TRUE with null verdict" `
     (Show-ConvergenceReport -Verdict $null -Numeric $numPass)
 
 # ----------------------------------------------------------------------------
+# Read-FastenerCentersFromModel - the shared fastener-center reader (assembly branch)
+# Stubs the selection buffer -> SelItem.Path.GetTransform($true).GetOrigin() chain
+# and asserts the dedup-by-component-id logic + never-throws contract. (The PART
+# branch calls the live Get-CylinderAxes, exercised via the .cmd tools live.)
+# ----------------------------------------------------------------------------
+Write-Host "  -- creo_geometry: Read-FastenerCentersFromModel (assembly) --" -ForegroundColor White
+
+# a fake selection whose Path yields a component id + a transform whose origin is (ox,oy,oz).
+function New-FakeCompSel {
+    param([int]$Cid, [double]$Ox, [double]$Oy, [double]$Oz)
+    $fcOrigin = @($Ox, $Oy, $Oz)
+    $fcXform  = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name GetOrigin -Value { $fcOrigin }.GetNewClosure()
+    $fcPath   = [pscustomobject]@{ ComponentIds = @($Cid) } |
+                Add-Member -PassThru -MemberType ScriptMethod -Name GetTransform -Value { param($b) $fcXform }.GetNewClosure()
+    return [pscustomobject]@{ Path = $fcPath }
+}
+$fkSelItems = @(
+    (New-FakeCompSel -Cid 57 -Ox -2.5547 -Oy 0 -Oz 3.0624),
+    (New-FakeCompSel -Cid 59 -Ox -2.5547 -Oy 0 -Oz 18.0624),
+    (New-FakeCompSel -Cid 59 -Ox -2.5547 -Oy 0 -Oz 18.0624)   # duplicate component id -> merged
+)
+$fkBuffer  = [pscustomobject]@{ Contents = $fkSelItems }
+$fkSession = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { $fkBuffer }.GetNewClosure()
+$fkModel   = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name FileName -Value { 'x.asm' }
+# FileName is a property on the real COM object; here pass IsAsm explicitly to avoid the accessor.
+$rd = Read-FastenerCentersFromModel -Session $fkSession -Model ([pscustomobject]@{ FileName = 'x.asm' }) -TypeObj $null -IsAsm $true
+Assert-True "fastener read (asm): Ok" ($rd.Ok)
+Assert-True "fastener read (asm): dedup by component id -> 2 centers" ($rd.Count -eq 2)
+Assert-True "fastener read (asm): IsAsm flagged" ($rd.IsAsm)
+Assert-True "fastener read (asm): read method labeled" ($rd.ReadMethod -match 'component-path')
+Assert-True "fastener read (asm): first center is the transform origin" (
+    (Approx $rd.Centers[0][0] -2.5547 1e-4) -and (Approx $rd.Centers[0][2] 3.0624 1e-4))
+# empty selection -> Ok false, no throw
+$fkEmptySess = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { [pscustomobject]@{ Contents = @() } }.GetNewClosure()
+$rdEmpty = Read-FastenerCentersFromModel -Session $fkEmptySess -Model $null -TypeObj $null -IsAsm $true
+Assert-True "fastener read (asm): empty selection -> not ok, no throw" (-not $rdEmpty.Ok)
+Assert-True "fastener read: null model -> not ok, no throw" (-not (Read-FastenerCentersFromModel -Session $null -Model $null -TypeObj $null).Ok)
+
+# ----------------------------------------------------------------------------
 # SUMMARY
 # ----------------------------------------------------------------------------
 Write-Host ""

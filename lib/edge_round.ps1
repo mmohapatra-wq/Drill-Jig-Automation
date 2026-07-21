@@ -40,6 +40,11 @@ function Wait-EdgeModelChange {
     $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
     while ([DateTime]::Now -lt $deadline) {
         try { if ($Model.VersionStamp -ne $PreviousStamp) { return $true } } catch {}
+        # Poll gap (proven pattern from boxinator/drilljig_core): without it this loop
+        # busy-waits, pegging a CPU core AND flooding Creo with COM VersionStamp reads
+        # *during* the round-feature regen it is polling for -- which slows the very
+        # operation. 40ms is far finer than any Creo regen; detection stays instant.
+        Start-Sleep -Milliseconds 40
     }
     return $false
 }

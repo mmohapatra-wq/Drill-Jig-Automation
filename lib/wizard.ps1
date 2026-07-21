@@ -147,15 +147,66 @@ function global:Get-MaxCommittedIndex {
 }
 
 # ----------------------------------------------------------------------------
-# PURE: Test-CanGoBack - is Back allowed from $CurrentIndex? Back lands on the
-# previous step ($CurrentIndex-1); it is allowed only when that target sits
-# strictly AFTER the last committed step (so you can never cross a committed
-# mutation boundary). At index 0 there is nowhere to go.
+# PURE: Test-CanGoBack - is a Back step FREE (no confirmation needed)? Back lands
+# on the previous step ($CurrentIndex-1); it is FREE only when that target sits
+# strictly AFTER the last committed step, i.e. no committed Creo mutation lies at
+# or before it. At index 0 there is nowhere to go. NOTE (2026-07-21): this no
+# longer HARD-BLOCKS Back - the Back button is now enabled on every non-first page
+# (Test-BackButtonEnabled). This predicate instead decides whether the click is
+# free (true) or must first CONFIRM crossing a committed-geometry boundary (false).
 # ----------------------------------------------------------------------------
 function global:Test-CanGoBack {
     param([int]$CurrentIndex, [int]$MaxCommittedIndex)
     if ($CurrentIndex -le 0) { return $false }
     return (($CurrentIndex - 1) -gt $MaxCommittedIndex)
+}
+
+# ----------------------------------------------------------------------------
+# PURE: Test-BackButtonEnabled - should the Back button be ENABLED (clickable) on
+# the current page? Back is offered on EVERY page except the very first (index 0),
+# where there is nowhere to go (user request 2026-07-21: "add back buttons to every
+# single possible page"). This deliberately decouples the button's ENABLEMENT from
+# Test-CanGoBack: a page after a committed Creo mutation still gets a live Back
+# button; the Back CLICK handler uses Test-CanGoBack to decide whether that step is
+# free or needs an informed-consent confirmation first. (BeginRun force-disables all
+# input during a blocking Creo run, so this is only consulted when idle.)
+# ----------------------------------------------------------------------------
+function global:Test-BackButtonEnabled {
+    param([int]$CurrentIndex)
+    return ($CurrentIndex -gt 0)
+}
+
+# ----------------------------------------------------------------------------
+# PURE: Get-FirstStepIndexForStage - the index of the FIRST step belonging to a
+# given breadcrumb stage name, or -1 if that stage has no steps. The clickable
+# breadcrumb jumps to this index. Global so the rail's click closure resolves it.
+# ----------------------------------------------------------------------------
+function global:Get-FirstStepIndexForStage {
+    param([array]$Steps, [string]$StageName)
+    if ($null -eq $Steps) { return -1 }
+    for ($i = 0; $i -lt $Steps.Count; $i++) {
+        if ([string]$Steps[$i].Stage -eq [string]$StageName) { return $i }
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# PURE: Resolve-BreadcrumbClickStage - map an X pixel coordinate on the breadcrumb
+# rail to the 0-based stage index it falls in. The rail draws N evenly-spaced pills,
+# each occupying a horizontal slot of width (RailWidth / N) with pill i centered at
+# slot*(i+0.5); so the slot for a click is floor(X / slot). Returns -1 for an out-of-
+# range click or a non-positive geometry. Global so the rail click closure resolves it.
+# ----------------------------------------------------------------------------
+function global:Resolve-BreadcrumbClickStage {
+    param([double]$X, [double]$RailWidth, [int]$StageCount)
+    if ($StageCount -le 0 -or $RailWidth -le 0) { return -1 }
+    if ($X -lt 0 -or $X -gt $RailWidth) { return -1 }
+    $slot = $RailWidth / $StageCount
+    if ($slot -le 0) { return -1 }
+    $idx = [int][Math]::Floor($X / $slot)
+    if ($idx -lt 0) { $idx = 0 }
+    if ($idx -ge $StageCount) { $idx = $StageCount - 1 }
+    return $idx
 }
 
 # ----------------------------------------------------------------------------
@@ -346,13 +397,17 @@ function Show-Wizard {
     # by the decision-tree step (descend card-by-card) and the pick steps (show the
     # verified result) without advancing.
     $wz = [pscustomobject]@{
-        Index     = 0
-        Steps     = $Steps
-        Stages    = $Stages
-        Context   = $Context
-        Completed = $false
-        Busy      = $false
-        Render    = $null
+        Index      = 0
+        Steps      = $Steps
+        Stages     = $Stages
+        Context    = $Context
+        Completed  = $false
+        Busy       = $false
+        Render     = $null
+        # MaxReached = the furthest step index the user has advanced to. The clickable
+        # breadcrumb lets you jump BACK to any already-reached stage (never skip AHEAD
+        # past setup you have not done). Bumped in the Next handler after each advance.
+        MaxReached = 0
     }
 
     # --- Form ---------------------------------------------------------------
@@ -376,6 +431,36 @@ function Show-Wizard {
     $rail.Anchor   = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $rail.BackColor = $formBack
     $form.Controls.Add($rail)
+
+    # RESIZE REPAINT (fixes the "duplicated progress chart" on maximize/restore).
+    # The rail is Right-anchored, so it STRETCHES when the window grows, and every
+    # pill is painted at a WIDTH-PROPORTIONAL X ($slot = ClientWidth / N). But a
+    # WinForms Panel does NOT repaint its whole surface on a resize by default: on a
+    # GROW Windows blits the old pixels and only invalidates the newly-exposed strip,
+    # so the old pills stay drawn at their old-width X positions while the Paint
+    # handler draws the new ones at the new positions -> two overlapping breadcrumbs.
+    # (It "self-heals on the next page" only because $renderStep issues a full
+    # $rail.Invalidate().) The fix is to force a FULL invalidate on every resize:
+    #   - ResizeRedraw = $true tells the control to invalidate its whole client area
+    #     on resize (protected property, set via reflection since it's not public).
+    #   - Add_Resize -> Invalidate() is the belt-and-suspenders guarantee that works
+    #     even if ResizeRedraw can't be set, and covers SHRINK (where Windows repaints
+    #     nothing) as well as GROW. Invalidate() with no rect invalidates the entire
+    #     client rectangle, so the stale pills are always cleared before the repaint.
+    # DoubleBuffered is set alongside ResizeRedraw: a drag-resize fires Resize many
+    # times, each now forcing a full repaint, so buffering the paint off-screen keeps
+    # that flicker-free. Both are protected Control properties (not public), so set
+    # them via reflection; failure is non-fatal (the Add_Resize invalidate below still
+    # fixes the duplicate, just without the anti-flicker polish).
+    try {
+        $ctlType = [System.Windows.Forms.Control]
+        $bf = [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic
+        $rrProp = $ctlType.GetProperty('ResizeRedraw', $bf)
+        if ($null -ne $rrProp) { $rrProp.SetValue($rail, $true, $null) }
+        $dbProp = $ctlType.GetProperty('DoubleBuffered', $bf)
+        if ($null -ne $dbProp) { $dbProp.SetValue($rail, $true, $null) }
+    } catch {}
+    $rail.Add_Resize({ param($s, $e) try { $s.Invalidate() } catch {} })
 
     $rail.Add_Paint({
         param($s, $e)
@@ -443,6 +528,28 @@ function Show-Wizard {
         }
     })
 
+    # Clickable breadcrumb: click a stage pill to JUMP straight to it - the "go
+    # through and change anything at any point" mechanism (user 2026-07-21). Only
+    # stages ALREADY REACHED are jumpable (target <= $wz.MaxReached) so you can never
+    # skip AHEAD past setup you have not done; jumping BACK to re-edit is always free.
+    $rail.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $rail.Add_MouseClick({
+        param($s, $e)
+        & $InvokeGuarded {
+            if ($wz.Busy) { return }
+            $n = @($wz.Stages).Count
+            $si = Resolve-BreadcrumbClickStage -X ([double]$e.X) -RailWidth ([double]$s.ClientSize.Width) -StageCount $n
+            if ($si -lt 0) { return }
+            $stageName = [string]@($wz.Stages)[$si]
+            $target = Get-FirstStepIndexForStage -Steps $wz.Steps -StageName $stageName
+            if ($target -lt 0) { return }               # stage has no steps
+            if ($target -gt $wz.MaxReached) { return }  # never skip ahead past reached
+            if ($target -eq $wz.Index) { return }       # already on this stage's first step
+            $wz.Index = $target
+            if ($null -ne $wz.Render) { & $wz.Render }
+        } 'breadcrumb click'
+    }.GetNewClosure())
+
     # --- CENTER canvas (a white card with a step heading + a body panel) -----
     $card = New-Object System.Windows.Forms.Panel
     $card.Location  = New-Object System.Drawing.Point($pad, ($railH + 4))
@@ -483,8 +590,11 @@ function Show-Wizard {
     $chipBand.Location  = New-Object System.Drawing.Point($pad, ($form.ClientSize.Height - $barH))
     $chipBand.Size      = New-Object System.Drawing.Size(($form.ClientSize.Width - 2*$pad), 30)
     $chipBand.Anchor    = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-    $chipBand.WrapContents = $false
-    $chipBand.AutoScroll   = $false
+    # WrapContents + AutoScroll: with many stages the recap chips can exceed the band
+    # width; wrapping keeps the first row visible and the vertical scrollbar makes any
+    # overflow reachable instead of silently clipping chips off the right edge.
+    $chipBand.WrapContents = $true
+    $chipBand.AutoScroll   = $true
     $chipBand.BackColor    = $formBack
     $chipBand.Padding      = New-Object System.Windows.Forms.Padding(2, 4, 2, 0)
     $form.Controls.Add($chipBand)
@@ -497,14 +607,20 @@ function Show-Wizard {
     $lblStatus.Font      = $fontBody
     $form.Controls.Add($lblStatus)
 
+    # SubTitle ("Connected: <part>") -- lives at the TOP-RIGHT of the content card, NOT
+    # the bottom action bar. It used to sit bottom-right where it OVERLAPPED the Back
+    # button (the "back button is hidden under the Connected text" report 2026-07-21).
+    # The card header's right side is empty (step no. + title are left-aligned), so this
+    # is collision-free with both the Back button (bottom bar) and the title.
     $lblSub = New-Object System.Windows.Forms.Label
-    $lblSub.Size      = New-Object System.Drawing.Size(280, 22)
-    $lblSub.Location  = New-Object System.Drawing.Point(($form.ClientSize.Width - 470), ($form.ClientSize.Height - $barH + 34))
-    $lblSub.Anchor    = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $lblSub.Size      = New-Object System.Drawing.Size(300, 20)
+    $lblSub.Location  = New-Object System.Drawing.Point(($card.Width - 312), 16)
+    $lblSub.Anchor    = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
     $lblSub.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
     $lblSub.ForeColor = $mutedColor
+    $lblSub.BackColor = $canvasBack
     $lblSub.Text      = $SubTitle
-    $form.Controls.Add($lblSub)
+    $card.Controls.Add($lblSub)
 
     $btnNext = New-Object System.Windows.Forms.Button
     $btnNext.Size      = New-Object System.Drawing.Size(160, 36)
@@ -518,16 +634,21 @@ function Show-Wizard {
     $btnNext.Text      = 'Next'
     $form.Controls.Add($btnNext)
 
+    # Back button - HIGH CONTRAST so it is unmistakably a button (the earlier dark-on-
+    # dark fill was invisible against the form -> "there are no back buttons"). A lighter
+    # slate fill + bright border + bold near-white text, sized to match Next, sitting to
+    # its left. Hidden on the first page (nowhere to go); shown+enabled on every other.
     $btnBack = New-Object System.Windows.Forms.Button
-    $btnBack.Size      = New-Object System.Drawing.Size(96, 36)
-    $btnBack.Location  = New-Object System.Drawing.Point(($form.ClientSize.Width - $pad - 160 - 108), ($form.ClientSize.Height - $barH + 30))
+    $btnBack.Size      = New-Object System.Drawing.Size(120, 36)
+    $btnBack.Location  = New-Object System.Drawing.Point(($form.ClientSize.Width - $pad - 160 - 132), ($form.ClientSize.Height - $barH + 30))
     $btnBack.Anchor    = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
     $btnBack.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $btnBack.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90,104,132)
-    $btnBack.BackColor = $canvasBack
-    $btnBack.ForeColor = $inkColor
-    $btnBack.Font      = New-Object System.Drawing.Font('Segoe UI', 10)
-    $btnBack.Text      = '< Back'
+    $btnBack.FlatAppearance.BorderSize  = 1
+    $btnBack.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120,170,255)
+    $btnBack.BackColor = [System.Drawing.Color]::FromArgb(54, 72, 112)   # cardHover: clearly lighter than the form
+    $btnBack.ForeColor = [System.Drawing.Color]::White
+    $btnBack.Font      = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+    $btnBack.Text      = ([char]0x2039) + ' Back'
     $form.Controls.Add($btnBack)
 
     # --- RUN view controls (hidden until a blocking op runs) -----------------
@@ -555,7 +676,11 @@ function Show-Wizard {
     $applyEnable = {
         param([bool]$on)
         $card.Enabled    = $on
-        $btnBack.Enabled = ($on -and (Test-CanGoBack -CurrentIndex $wz.Index -MaxCommittedIndex (Get-MaxCommittedIndex -Steps $wz.Steps)))
+        # Back is shown+enabled on every non-first page (Test-BackButtonEnabled), hidden
+        # on the first page (nowhere to go). Only $on (not-busy) additionally gates it.
+        $bok = (Test-BackButtonEnabled -CurrentIndex $wz.Index)
+        $btnBack.Visible = $bok
+        $btnBack.Enabled = ($on -and $bok)
         # btnNext enable is owned by Refresh (Validate); leave it to the caller
     }
 
@@ -628,6 +753,165 @@ function Show-Wizard {
         $wz.Busy = $false
     }.GetNewClosure()
 
+    # ------------------------------------------------------------------------
+    # AskInline - an IN-CANVAS replacement for Show-WizardMessage. Instead of a
+    # floating MessageBox, it paints an opaque OVERLAY panel over the card region,
+    # shows a heading + wrapped text + a button row, and blocks SYNCHRONOUSLY on a
+    # nested DoEvents pump until a button is clicked (returning the mirror of a
+    # MessageBox DialogResult: 'Yes' | 'No' | 'OK' | 'Cancel'). This keeps every
+    # prompt inside the one wizard window (user request 2026-07-21) instead of a
+    # separate popup, while preserving the same call-and-branch semantics.
+    #
+    #   $Heading    bold title line
+    #   $Text       body (wrapped)
+    #   $Buttons    'OK' | 'OKCancel' | 'YesNo'   (default 'OK')
+    #   $NoActivate  when $true, do NOT pull the wizard to the front. Use this when
+    #               the operator must interact with CREO right after the prompt
+    #               (redraw a rectangle, click a tree node, switch the active model):
+    #               a focus-stealing overlay would break that Creo interaction.
+    #
+    # WHY an overlay on $form (not $card/$body): $card.Enabled is toggled by
+    # $applyEnable/BeginRun (a card-child would go disabled exactly when input is
+    # disabled), and $body gets .Controls.Clear()'d on every render. $form is never
+    # disabled, so the overlay stays clickable in BOTH idle and mid-run contexts.
+    #
+    # RE-ENTRANCY: $wz.Busy=$true neutralizes the breadcrumb-click / Back / Next /
+    # Refresh guards (all check `if ($wz.Busy) { return }`). Back/Next live on $form
+    # (NOT $card), so a card-sized overlay does NOT cover them -> disable them too and
+    # restore afterward. Two call contexts (box-a, slot-b OnNext) are ALREADY inside
+    # BeginRun with Busy=$true, so we SAVE $prevBusy and restore to it (never blindly
+    # to $false, which would prematurely re-enable input mid-run).
+    #
+    # The nested DoEvents pump inside a click handler is the same nesting
+    # MessageBox.Show(owner,...) already imposes (it runs a modal loop from inside the
+    # same Add_Click), so parity holds. A form-death escape (IsDisposed/Disposing)
+    # returns a safe don't-proceed default so a mid-prompt window close can't spin.
+    # ------------------------------------------------------------------------
+    $wiz | Add-Member -MemberType ScriptMethod -Name AskInline -Value {
+        param([string]$Heading, [string]$Text, [string]$Buttons = 'OK', [bool]$NoActivate = $false)
+
+        # safe don't-proceed default if the form dies mid-prompt (mirrors an X-closed box)
+        $deadDefault = switch ($Buttons) { 'YesNo' { 'No' } 'OKCancel' { 'Cancel' } default { 'OK' } }
+
+        # save prior state (see RE-ENTRANCY note above)
+        $prevBusy = $wz.Busy
+        $prevBack = $btnBack.Enabled
+        $prevNext = $btnNext.Enabled
+        $wz.Busy = $true
+        $btnBack.Enabled = $false
+        $btnNext.Enabled = $false
+
+        # bring the wizard forward so the overlay is visible even when Creo had focus -
+        # one-shot only (a sustained TopMost would sit over Creo and break the next pick).
+        if (-not $NoActivate) {
+            try { $form.TopMost = $true; $form.Activate(); $form.TopMost = $false } catch {}
+        }
+
+        # The button-click handlers are .GetNewClosure()s, which capture LOCALS BY VALUE
+        # into their own module scope -- assigning a plain `$result` scalar inside a click
+        # would set the closure's COPY, never this method's variable, so the pump below
+        # would spin forever (the captured-variable gotcha this codebase hits repeatedly).
+        # A hashtable is a REFERENCE type: the closures capture the same $rbox reference and
+        # mutate .R through to it, which the pump then sees. (Same fix as stashing OnPick
+        # state in the shared context object.)
+        $rbox = @{ R = $null }
+        $overlay = $null
+        try {
+            $overlay = New-Object System.Windows.Forms.Panel
+            $overlay.Bounds    = $card.Bounds
+            $overlay.Anchor    = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+            $overlay.BackColor = $canvasBack
+            $overlay.Tag       = 'askinline'
+            $form.Controls.Add($overlay)
+            $overlay.BringToFront()
+
+            $hw = [Math]::Max(120, $overlay.Width - 56)
+            $lblH = New-Object System.Windows.Forms.Label
+            $lblH.AutoSize    = $true
+            $lblH.MaximumSize = New-Object System.Drawing.Size($hw, 0)
+            $lblH.Location    = New-Object System.Drawing.Point(28, 28)
+            $lblH.Font        = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
+            $lblH.ForeColor   = $inkColor
+            $lblH.BackColor   = [System.Drawing.Color]::Transparent
+            $lblH.Text        = [string]$Heading
+            $overlay.Controls.Add($lblH)
+
+            $lblB = New-Object System.Windows.Forms.Label
+            $lblB.AutoSize    = $true
+            $lblB.MaximumSize = New-Object System.Drawing.Size($hw, 0)
+            $lblB.MinimumSize = New-Object System.Drawing.Size($hw, 0)
+            $lblB.Location    = New-Object System.Drawing.Point(28, ($lblH.Bottom + 12))
+            $lblB.Font        = New-Object System.Drawing.Font('Segoe UI', 11)
+            $lblB.ForeColor   = $inkColor
+            $lblB.BackColor   = [System.Drawing.Color]::Transparent
+            $lblB.Text        = [string]$Text
+            $overlay.Controls.Add($lblB)
+
+            # button row: label -> DialogResult-mirror string
+            $specs = switch ($Buttons) {
+                'YesNo'    { @(@{ T='Yes'; R='Yes'; Accent=$true }, @{ T='No';     R='No';     Accent=$false }) }
+                'OKCancel' { @(@{ T='OK';  R='OK';  Accent=$true }, @{ T='Cancel'; R='Cancel'; Accent=$false }) }
+                default    { @(@{ T='OK';  R='OK';  Accent=$true }) }
+            }
+            $bx = 28
+            $by = $lblB.Bottom + 24
+            foreach ($sp in $specs) {
+                $b = New-Object System.Windows.Forms.Button
+                $b.Text      = [string]$sp.T
+                $b.Size      = New-Object System.Drawing.Size(130, 38)
+                $b.Location  = New-Object System.Drawing.Point($bx, $by)
+                $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+                $b.Tag       = 'askinline'
+                $b.Font      = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+                if ($sp.Accent) {
+                    $b.FlatAppearance.BorderSize = 0
+                    $b.BackColor = $accentColor
+                    $b.ForeColor = [System.Drawing.Color]::White
+                } else {
+                    $b.FlatAppearance.BorderSize  = 1
+                    $b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120,170,255)
+                    $b.BackColor = $cardBack
+                    $b.ForeColor = [System.Drawing.Color]::White
+                }
+                $rv = [string]$sp.R
+                $b.Add_Click({
+                    param($s, $e)
+                    $old = $ErrorActionPreference
+                    try { $ErrorActionPreference = 'Continue'; $rbox.R = $rv }
+                    catch { try { & $wzLogError $_ 'AskInline click' } catch {} }
+                    finally { $ErrorActionPreference = $old }
+                }.GetNewClosure())
+                $overlay.Controls.Add($b)
+                $bx += 146
+            }
+
+            try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+            # nested modal pump (parity with MessageBox.Show(owner,...))
+            while ($null -eq $rbox.R) {
+                if ($form.IsDisposed -or $form.Disposing) { $rbox.R = $deadDefault; break }
+                try { [System.Windows.Forms.Application]::DoEvents() } catch {}
+                Start-Sleep -Milliseconds 15
+            }
+        } catch {
+            try { & $wzLogError $_ 'AskInline' } catch {}
+            if ($null -eq $rbox.R) { $rbox.R = $deadDefault }
+        } finally {
+            if ($null -ne $overlay) {
+                try { $form.Controls.Remove($overlay); $overlay.Dispose() } catch {}
+            }
+            $wz.Busy = $prevBusy
+            # If we were mid-run (BeginRun owns Back/Next), leave them disabled; else
+            # restore + re-gate Next via Validate.
+            if ($prevBusy) {
+                try { $btnBack.Enabled = $false; $btnNext.Enabled = $false } catch {}
+            } else {
+                try { $btnBack.Enabled = $prevBack; $btnNext.Enabled = $prevNext } catch {}
+                try { $wiz.Refresh() } catch {}
+            }
+        }
+        return $rbox.R
+    }.GetNewClosure()
+
     $wiz | Add-Member -MemberType ScriptMethod -Name MarkCommitted -Value {
         try { $wz.Steps[$wz.Index].Committed = $true } catch {}
     }.GetNewClosure()
@@ -684,7 +968,10 @@ function Show-Wizard {
             try { $enable = [bool](& $step.Validate $wz.Context) } catch { $enable = $false }
         }
         $btnNext.Enabled = $enable
-        $btnBack.Enabled = (Test-CanGoBack -CurrentIndex $wz.Index -MaxCommittedIndex (Get-MaxCommittedIndex -Steps $wz.Steps))
+        # Back shown+enabled on every non-first page, hidden on the first (nowhere to go).
+        $bok = (Test-BackButtonEnabled -CurrentIndex $wz.Index)
+        $btnBack.Visible = $bok
+        $btnBack.Enabled = $bok
     }.GetNewClosure()
 
     # Next: programmatic advance request (used by auto-advancing choice cards).
@@ -699,6 +986,23 @@ function Show-Wizard {
     # card-by-card and to show a pick's verified result.
     $wiz | Add-Member -MemberType ScriptMethod -Name Rerender -Value {
         try { $form.BeginInvoke([Action]{ if ($null -ne $wz.Render) { & $wz.Render } }) | Out-Null } catch {}
+    }.GetNewClosure()
+
+    # GoToStepKey: jump the wizard to the step with the given Key and render it.
+    # Used by a RUN step's "Rebuild" affordance to send the operator back to that
+    # feature's arm/setup step so they can redo it. Marshalled like Rerender. No-op
+    # if the key is unknown. Does NOT lower MaxReached (the stage stays reachable).
+    $wiz | Add-Member -MemberType ScriptMethod -Name GoToStepKey -Value {
+        param([string]$Key)
+        try {
+            for ($i = 0; $i -lt $wz.Steps.Count; $i++) {
+                if ([string]$wz.Steps[$i].Key -eq [string]$Key) {
+                    $wz.Index = $i
+                    $form.BeginInvoke([Action]{ if ($null -ne $wz.Render) { & $wz.Render } }) | Out-Null
+                    return
+                }
+            }
+        } catch {}
     }.GetNewClosure()
 
     # --- the render routine -------------------------------------------------
@@ -735,13 +1039,17 @@ function Show-Wizard {
     $wz.Render = $renderStep
 
     # --- Back click ---------------------------------------------------------
+    # Back is FREE (no modal) on every page except the first - the user asked for
+    # frictionless movement to "change anything at any point". Going back never undoes
+    # Creo geometry; each RUN step is idempotent on re-entry (it won't rebuild unless
+    # you explicitly Rebuild it), and built RUN steps show an honest "already built"
+    # banner. Test-CanGoBack is retained (pure, tested) but no longer gates the click.
     $btnBack.Add_Click({
         & $InvokeGuarded {
             if ($wz.Busy) { return }
-            if (Test-CanGoBack -CurrentIndex $wz.Index -MaxCommittedIndex (Get-MaxCommittedIndex -Steps $wz.Steps)) {
-                $wz.Index = $wz.Index - 1
-                & $renderStep
-            }
+            if ($wz.Index -le 0) { return }
+            $wz.Index = $wz.Index - 1
+            & $renderStep
         } 'Back click'
     }.GetNewClosure())
 
@@ -780,6 +1088,9 @@ function Show-Wizard {
             if (-not $advance) { & $renderStep; return }
 
             $wz.Index = $wz.Index + 1
+            # track the furthest step reached so the clickable breadcrumb knows which
+            # stages are jumpable (reached) vs. still ahead (not yet set up).
+            if ($wz.Index -gt $wz.MaxReached) { $wz.MaxReached = $wz.Index }
             if ($wz.Index -ge $wz.Steps.Count) {
                 $wz.Completed = $true
                 $form.Close()
@@ -793,6 +1104,15 @@ function Show-Wizard {
 
     # X / Alt-F4 = cancel (unless we already completed)
     $form.Add_FormClosed({ }.GetNewClosure())
+
+    # Open MAXIMIZED to fill the full monitor (user 2026-07-21). The whole layout is
+    # anchor-based (rail Top/L/R; card+body all four sides; chip band + Back/Next
+    # Bottom), so the anchors -- established above against the 900x640 ClientSize --
+    # stretch cleanly to fill the screen. Set WindowState LAST (after every control is
+    # laid out, before ShowDialog) so: (1) the anchor offsets are recorded at the design
+    # size then scaled up, and (2) by the time Add_Shown fires renderStep, $body.Width/
+    # Height already reflect the maximized size and each step builds at full width.
+    $form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
 
     [void]$form.ShowDialog()
     $completed = [bool]$wz.Completed
@@ -831,6 +1151,31 @@ function Add-WizardChoiceCards {
     $cBorder = [System.Drawing.Color]::FromArgb(72, 92, 132)
 
     $gap = 18
+    $innerW = [Math]::Max(20, $CardWidth - 24)
+    $titleFont = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+    $subFont   = New-Object System.Drawing.Font('Segoe UI', 9)
+    $flags = [System.Windows.Forms.TextFormatFlags]::WordBreak -bor [System.Windows.Forms.TextFormatFlags]::TextBoxControl
+
+    # UNIFORM CARD HEIGHT sized to the tallest card's wrapped content, so a long
+    # subtitle is NEVER clipped (the old fixed CardHeight clipped the subtitle area to
+    # CardHeight-64) AND the grid rows stay aligned. Measure each option's title +
+    # subtitle wrapped to the inner card width; cardH = max(requested, tallest content).
+    $measure = {
+        param([string]$txt, $font)
+        if ([string]::IsNullOrEmpty($txt)) { return 0 }
+        try { return [int][System.Windows.Forms.TextRenderer]::MeasureText($txt, $font, (New-Object System.Drawing.Size($innerW, 100000)), $flags).Height } catch { return 18 }
+    }
+    $titleHs = @{}
+    $cardH = $CardHeight
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        $th = [int](& $measure ([string]$Options[$i].Title) $titleFont)
+        if ($th -lt 22) { $th = 22 }
+        $titleHs[$i] = $th
+        $sh = if ($Options[$i].Subtitle) { [int](& $measure ([string]$Options[$i].Subtitle) $subFont) } else { 0 }
+        $need = 12 + $th + $(if ($sh -gt 0) { 6 + $sh } else { 0 }) + 12
+        if ($need -gt $cardH) { $cardH = $need }
+    }
+
     # honor -Top so the cards start BELOW the step heading (the heading is an
     # Add-Para at a small y; previously $cy ignored $Top and started at 8, so the
     # first row of cards OVERLAPPED the heading -- the "box spacing is wrong" report).
@@ -843,32 +1188,34 @@ function Add-WizardChoiceCards {
         $col = $i % $perRow
         $row = [Math]::Floor($i / $perRow)
         $cx = 8 + $col * ($CardWidth + $gap)
-        $cy = $Top + $row * ($CardHeight + $gap)
+        $cy = $Top + $row * ($cardH + $gap)
 
         $cardP = New-Object System.Windows.Forms.Panel
         $cardP.Location  = New-Object System.Drawing.Point($cx, $cy)
-        $cardP.Size      = New-Object System.Drawing.Size($CardWidth, $CardHeight)
+        $cardP.Size      = New-Object System.Drawing.Size($CardWidth, $cardH)
         $cardP.BackColor = $cBack
         $cardP.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
         $cardP.Cursor    = [System.Windows.Forms.Cursors]::Hand
         $cardP.Tag       = $i
 
+        $th = [int]$titleHs[$i]
         $t = New-Object System.Windows.Forms.Label
         $t.AutoSize  = $false
         $t.Location  = New-Object System.Drawing.Point(12, 12)
-        $t.Size      = New-Object System.Drawing.Size(($CardWidth - 24), 44)
-        $t.Font      = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
+        $t.Size      = New-Object System.Drawing.Size($innerW, $th)
+        $t.Font      = $titleFont
         $t.ForeColor = $cInk
         $t.BackColor = [System.Drawing.Color]::Transparent
         $t.Text      = [string]$opt.Title
         $cardP.Controls.Add($t)
 
         if ($opt.Subtitle) {
+            $subTop = 12 + $th + 6
             $sb = New-Object System.Windows.Forms.Label
             $sb.AutoSize  = $false
-            $sb.Location  = New-Object System.Drawing.Point(12, 56)
-            $sb.Size      = New-Object System.Drawing.Size(($CardWidth - 24), ($CardHeight - 64))
-            $sb.Font      = New-Object System.Drawing.Font('Segoe UI', 9)
+            $sb.Location  = New-Object System.Drawing.Point(12, $subTop)
+            $sb.Size      = New-Object System.Drawing.Size($innerW, ($cardH - $subTop - 10))
+            $sb.Font      = $subFont
             $sb.ForeColor = $cMuted
             $sb.BackColor = [System.Drawing.Color]::Transparent
             $sb.Text      = [string]$opt.Subtitle

@@ -102,6 +102,98 @@ Assert-True "cannot go back when target == committed" (-not (Test-CanGoBack -Cur
 $gs[1].Committed = $false; $gs[0].Committed = $true
 Assert-True "back to a step after the committed one is allowed (idx 2 -> 1, committed 0)" (Test-CanGoBack -CurrentIndex 2 -MaxCommittedIndex 0)
 
+# Test-BackButtonEnabled: Back is offered on EVERY page except the first (user
+# request 2026-07-21). It is decoupled from Test-CanGoBack - a committed-boundary
+# page still shows a live Back button (the click handler confirms the crossing).
+Assert-True "back button disabled on the first page (index 0)" (-not (Test-BackButtonEnabled -CurrentIndex 0))
+Assert-True "back button enabled on index 1" (Test-BackButtonEnabled -CurrentIndex 1)
+Assert-True "back button enabled on a later page" (Test-BackButtonEnabled -CurrentIndex 7)
+# the decoupling: at a committed-boundary crossing Test-CanGoBack is FALSE (needs a
+# confirm) yet the Back BUTTON is still enabled (index > 0) so the user CAN choose it.
+Assert-True "back button enabled even where a back is NOT free (committed crossing)" `
+    ((Test-BackButtonEnabled -CurrentIndex 2) -and (-not (Test-CanGoBack -CurrentIndex 2 -MaxCommittedIndex 1)))
+
+# ----------------------------------------------------------------------------
+# Interwoven navigation (2026-07-21): clickable breadcrumb jump-to-stage helpers.
+# ----------------------------------------------------------------------------
+Write-Host "  -- interwoven navigation (breadcrumb jump) --" -ForegroundColor White
+$navSteps = @(
+    (New-WizardStep -Key a -Title A -Stage Bushing -Build {}),
+    (New-WizardStep -Key b -Title B -Stage Layout  -Build {}),
+    (New-WizardStep -Key c -Title C -Stage Layout  -Build {}),   # 2 steps share Layout
+    (New-WizardStep -Key d -Title D -Stage Box     -Build {})
+)
+Assert-True "first-step-of-stage: Bushing -> 0" ((Get-FirstStepIndexForStage -Steps $navSteps -StageName 'Bushing') -eq 0)
+Assert-True "first-step-of-stage: Layout -> 1 (the FIRST Layout step)" ((Get-FirstStepIndexForStage -Steps $navSteps -StageName 'Layout') -eq 1)
+Assert-True "first-step-of-stage: Box -> 3" ((Get-FirstStepIndexForStage -Steps $navSteps -StageName 'Box') -eq 3)
+Assert-True "first-step-of-stage: absent stage -> -1" ((Get-FirstStepIndexForStage -Steps $navSteps -StageName 'Ghost') -eq -1)
+Assert-True "first-step-of-stage: null steps -> -1" ((Get-FirstStepIndexForStage -Steps $null -StageName 'Box') -eq -1)
+
+# Resolve-BreadcrumbClickStage: rail width W, N stages -> slot W/N, click X -> floor(X/slot).
+# 4 stages across 800px -> slots [0,200)->0 [200,400)->1 [400,600)->2 [600,800]->3
+Assert-True "breadcrumb click: left edge -> stage 0"   ((Resolve-BreadcrumbClickStage -X 10   -RailWidth 800 -StageCount 4) -eq 0)
+Assert-True "breadcrumb click: 250 -> stage 1"         ((Resolve-BreadcrumbClickStage -X 250  -RailWidth 800 -StageCount 4) -eq 1)
+Assert-True "breadcrumb click: 590 -> stage 2"         ((Resolve-BreadcrumbClickStage -X 590  -RailWidth 800 -StageCount 4) -eq 2)
+Assert-True "breadcrumb click: 700 -> stage 3"         ((Resolve-BreadcrumbClickStage -X 700  -RailWidth 800 -StageCount 4) -eq 3)
+Assert-True "breadcrumb click: right edge clamps to last" ((Resolve-BreadcrumbClickStage -X 800 -RailWidth 800 -StageCount 4) -eq 3)
+Assert-True "breadcrumb click: X out of range -> -1"   ((Resolve-BreadcrumbClickStage -X 900  -RailWidth 800 -StageCount 4) -eq -1)
+Assert-True "breadcrumb click: negative X -> -1"       ((Resolve-BreadcrumbClickStage -X -5   -RailWidth 800 -StageCount 4) -eq -1)
+Assert-True "breadcrumb click: 0 stages -> -1"         ((Resolve-BreadcrumbClickStage -X 100  -RailWidth 800 -StageCount 0) -eq -1)
+Assert-True "breadcrumb click: 0 width -> -1"          ((Resolve-BreadcrumbClickStage -X 100  -RailWidth 0   -StageCount 4) -eq -1)
+
+# ----------------------------------------------------------------------------
+# Bushing-tree back-and-forth history (Push/Pop/Reset-TreeHistory) - user 2026-07-21:
+# "go back and forth between the bushing sleeve selection" + the "Change selection ->
+# Tree finished" bug (a .GetNewClosure() handler read the un-captured top-level
+# $treeRoot as $null; now the root + history live in the CONTEXT). These global
+# helpers live in drilljig-gui.cmd's STEP BUILDERS region; load just that region
+# (defining functions is headless-safe) and exercise the pure hashtable state machine.
+# ----------------------------------------------------------------------------
+Write-Host "  -- bushing-tree back-nav history --" -ForegroundColor White
+try {
+    $guiSrc = Get-Content -Raw (Join-Path $root 'drilljig-gui.cmd')
+    $bh0 = $guiSrc.IndexOf('# STEP BUILDERS'); $bh1 = $guiSrc.IndexOf('# Build the connection up front')
+    Invoke-Expression $guiSrc.Substring($bh0, $bh1 - $bh0) | Out-Null
+    Assert-True "tree-hist: Push/Pop/Reset-TreeHistory resolve" (@('Push-TreeHistory','Pop-TreeHistory','Reset-TreeWalk' | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
+    $tc = @{
+        Path = [System.Collections.ArrayList]::new(); Picks = [System.Collections.ArrayList]::new()
+        TreeNode = 'ROOT'; TreeRoot = 'ROOT'; TreeHistory = [System.Collections.ArrayList]::new()
+        PendingSpec = $null; BushStage = $null; BushID = $null; BushLen = $null; Grouped = $null
+        HoleDia = $null; BushingLen = $null; TreeDone = $false
+    }
+    # forward: question pick -> descend to an outcome + enter the 'id' sub-stage
+    Push-TreeHistory -Context $tc
+    [void]$tc.Path.Add('metal'); $tc.TreeNode = 'OUTCOME'; $tc.PendingSpec = 'spec'; $tc.BushStage = 'id'
+    Assert-True "tree-hist: 1 snapshot after first push" (@($tc.TreeHistory).Count -eq 1)
+    # forward: id -> len
+    Push-TreeHistory -Context $tc
+    $tc.BushID = 'id075'; $tc.BushStage = 'len'
+    Assert-True "tree-hist: 2 snapshots after second push" (@($tc.TreeHistory).Count -eq 2)
+    # pop once -> back to the 'id' sub-stage (BushID cleared, PendingSpec kept, not done)
+    $r1 = Pop-TreeHistory -Context $tc
+    Assert-True "tree-hist: pop returns true"            ([bool]$r1)
+    Assert-True "tree-hist: pop restores BushStage 'id'" ($tc.BushStage -eq 'id')
+    Assert-True "tree-hist: pop cleared BushID"          ($null -eq $tc.BushID)
+    Assert-True "tree-hist: pop kept PendingSpec"        ($tc.PendingSpec -eq 'spec')
+    Assert-True "tree-hist: 1 snapshot left"             (@($tc.TreeHistory).Count -eq 1)
+    # pop again -> back to the question (ROOT node, Path trimmed, PendingSpec cleared)
+    $r2 = Pop-TreeHistory -Context $tc
+    Assert-True "tree-hist: second pop true"             ([bool]$r2)
+    Assert-True "tree-hist: back at ROOT node"           ($tc.TreeNode -eq 'ROOT')
+    Assert-True "tree-hist: Path trimmed to 0"           (@($tc.Path).Count -eq 0)
+    Assert-True "tree-hist: PendingSpec cleared"         ($null -eq $tc.PendingSpec)
+    # pop on empty history -> false, no throw
+    Assert-True "tree-hist: pop empty returns false"     (-not (Pop-TreeHistory -Context $tc))
+    # Reset-TreeWalk clears everything back to the root
+    Push-TreeHistory -Context $tc; $tc.TreeNode = 'X'; [void]$tc.Path.Add('y'); [void]$tc.Picks.Add('p'); $tc.TreeDone = $true
+    Reset-TreeWalk -Context $tc
+    Assert-True "tree-hist: reset -> TreeNode = TreeRoot" ($tc.TreeNode -eq 'ROOT')
+    Assert-True "tree-hist: reset clears history"         (@($tc.TreeHistory).Count -eq 0)
+    Assert-True "tree-hist: reset clears Path+Picks+Done"  ((@($tc.Path).Count -eq 0) -and (@($tc.Picks).Count -eq 0) -and (-not $tc.TreeDone))
+} catch {
+    Assert-True "tree back-nav history harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+}
+
 # ----------------------------------------------------------------------------
 # Chip color palette
 # ----------------------------------------------------------------------------
@@ -140,6 +232,41 @@ Assert-True "Get-FracLabel fallback" ((Get-FracLabel 'no easyname here' 'OD' 'FB
 Assert-True "Get-FixedOdSpec 3/4"    (Approx (Get-FixedOdSpec 'the OD of the hole will be 3/4 in') 0.75)
 Assert-True "Get-FixedOdSpec none"   ($null -eq (Get-FixedOdSpec 'no diameter mentioned here'))
 
+Write-Host "  -- core: slot-depth input (tight/restricted-space prompt) --" -ForegroundColor White
+# Resolve-SlotDepthInput: shared validator for the tight-space slot-depth entry used
+# by BOTH front-ends. Blank -> default (Ok); non-numeric / <=0 -> Error; else round(4).
+$sdBlank = Resolve-SlotDepthInput -Text ''      -Default 0.25
+Assert-True "slotdepth: blank -> Ok"          ([bool]$sdBlank.Ok)
+Assert-True "slotdepth: blank -> default val"  (Approx ([double]$sdBlank.Value) 0.25)
+$sdNull = Resolve-SlotDepthInput -Text $null    -Default 0.3
+Assert-True "slotdepth: null -> Ok default"    ([bool]$sdNull.Ok -and (Approx ([double]$sdNull.Value) 0.3))
+$sdWs = Resolve-SlotDepthInput -Text '   '      -Default 0.2
+Assert-True "slotdepth: whitespace -> default" ([bool]$sdWs.Ok -and (Approx ([double]$sdWs.Value) 0.2))
+$sdGood = Resolve-SlotDepthInput -Text '0.125'  -Default 0.25
+Assert-True "slotdepth: 0.125 -> Ok"           ([bool]$sdGood.Ok -and (Approx ([double]$sdGood.Value) 0.125))
+$sdTrim = Resolve-SlotDepthInput -Text '  0.1 ' -Default 0.25
+Assert-True "slotdepth: trims whitespace"      ([bool]$sdTrim.Ok -and (Approx ([double]$sdTrim.Value) 0.1))
+$sdRound = Resolve-SlotDepthInput -Text '0.123456' -Default 0.25
+Assert-True "slotdepth: rounds to 4 dp"        ([bool]$sdRound.Ok -and (Approx ([double]$sdRound.Value) 0.1235))
+$sdZero = Resolve-SlotDepthInput -Text '0'      -Default 0.25
+Assert-True "slotdepth: 0 -> Error"            ((-not $sdZero.Ok) -and ($null -ne $sdZero.Error))
+$sdNeg = Resolve-SlotDepthInput -Text '-0.2'    -Default 0.25
+Assert-True "slotdepth: negative -> Error"     ((-not $sdNeg.Ok) -and ($null -ne $sdNeg.Error))
+$sdJunk = Resolve-SlotDepthInput -Text 'abc'    -Default 0.25
+Assert-True "slotdepth: non-numeric -> Error"  ((-not $sdJunk.Ok) -and ($sdJunk.Error -match 'Not a number'))
+$sdBig = Resolve-SlotDepthInput -Text '1.5'     -Default 0.25
+Assert-True "slotdepth: >0.25 still Ok"        ([bool]$sdBig.Ok -and (Approx ([double]$sdBig.Value) 1.5))
+# REGRESSION LOCK: the GUI slot-depth step calls Resolve-SlotDepthInput from a TextBox
+# TextChanged .GetNewClosure() handler, and a closure module resolves ONLY global
+# functions -- so the definition MUST be `function global:` (else "not recognized" at
+# keystroke time, confirmed live 2026-07-21). Lock it at the source so it can't regress.
+$coreSrcSD = Get-Content -Raw (Join-Path $libDir 'drilljig_core.ps1')
+Assert-True "slotdepth: Resolve-SlotDepthInput is 'function global:' (resolvable from GUI closures)" ($coreSrcSD -match 'function\s+global:Resolve-SlotDepthInput')
+# and the GUI's tight-branch closure must NOT call the non-global Get-UiColor (it must
+# capture precomputed colors) -- guard that the echo closure uses captured $okCol/$warnCol.
+$guiSrcSD = Get-Content -Raw (Join-Path $ROOT 'drilljig-gui.cmd')
+Assert-True "slotdepth: tight-field closure captures colors (no Get-UiColor inside \$updateEcho)" (($guiSrcSD -match '\$lblEcho\.ForeColor = \$okCol') -and ($guiSrcSD -match '\$lblEcho\.ForeColor = \$warnCol'))
+
 Write-Host "  -- core: catalog grouping --" -ForegroundColor White
 # build a tiny synthetic catalog (in-memory rows shaped like Import-Csv output)
 $rows = @(
@@ -161,6 +288,105 @@ $uns = New-IdUnspecifiedPick -ODLabel '3/4' -LenLabel '1' -Rows $len1.Rows
 Assert-True "id-unspec: OD carried"        (Approx ([double]$uns.OD) 0.75)
 Assert-True "id-unspec: ID is (any)"       ($uns.ID -eq '(any)')
 Assert-True "id-unspec: Length carried"    (Approx ([double]$uns.Length) 1.0)
+
+Write-Host "  -- core: ID-first catalog grouping (Group-CatalogByID) --" -ForegroundColor White
+# Reuse the SAME synthetic $rows (145-150). ID-first hierarchy: ID -> length -> ODs.
+$grpId = Group-CatalogByID -Rows $rows
+Assert-True "byID: 3 distinct IDs"                 (@($grpId).Count -eq 3)
+Assert-True "byID: IDs ascending (0.25 first)"     (Approx $grpId[0].ID 0.25)
+$id05 = $grpId | Where-Object { (Approx $_.ID 0.5) } | Select-Object -First 1
+Assert-True "byID: ID 0.5 has 2 lengths"           (@($id05.Lengths).Count -eq 2)
+Assert-True "byID: ID label is a fraction"         ($id05.IDLabel -eq '1/2')
+$id05l1 = $id05.Lengths | Where-Object { (Approx $_.Length 1.0) } | Select-Object -First 1
+Assert-True "byID: ID0.5 x Lg1.0 ODCount==1"       ($id05l1.ODCount -eq 1)
+Assert-True "byID: ID0.5 x Lg1.0 ODs.Count==1"     (@($id05l1.ODs).Count -eq 1)
+Assert-True "byID: ID0.5 x Lg1.0 sole OD is 0.75"  (Approx $id05l1.ODs[0].OD 0.75)
+# ODs tier ALWAYS populated + ODCount == ODs.Count on every node (the honesty invariant).
+$countMismatch = @($grpId | ForEach-Object { $_.Lengths } | Where-Object { $_.ODCount -ne @($_.ODs).Count })
+Assert-True "byID: ODCount == ODs.Count everywhere" ($countMismatch.Count -eq 0)
+
+# Tie-breaker fixture: a SEPARATE row set (do NOT mutate $rows) where one bore+length
+# exists at TWO ODs -> ODCount must be 2 with ODs ascending, so the OD tie-breaker fires.
+$rows2 = @(
+    [pscustomobject]@{ OD='0.75'; ID='0.5';  Length='1.0'; EasyName='HSB | OD 3/4 x ID 1/2 x 1 Lg';     PartNumber='P1' },
+    [pscustomobject]@{ OD='0.75'; ID='0.6';  Length='1.0'; EasyName='HSB | OD 3/4 x ID 5/8 x 1 Lg';     PartNumber='P2' },
+    [pscustomobject]@{ OD='0.75'; ID='0.5';  Length='1.5'; EasyName='HSB | OD 3/4 x ID 1/2 x 1 1/2 Lg'; PartNumber='P3' },
+    [pscustomobject]@{ OD='0.5';  ID='0.25'; Length='1.0'; EasyName='HSB | OD 1/2 x ID 1/4 x 1 Lg';     PartNumber='P4' },
+    [pscustomobject]@{ OD='0.5';  ID='0.5';  Length='1.0'; EasyName='HSB | OD 1/2 x ID 1/2 x 1 Lg';     PartNumber='P5' }
+)
+$grp2 = Group-CatalogByID -Rows $rows2
+$t05 = ($grp2 | Where-Object { (Approx $_.ID 0.5) }).Lengths | Where-Object { (Approx $_.Length 1.0) } | Select-Object -First 1
+Assert-True "byID tie-breaker: ID0.5 x Lg1.0 ODCount==2" ($t05.ODCount -eq 2)
+Assert-True "byID tie-breaker: ODs ascending (0.5 first)" (Approx $t05.ODs[0].OD 0.5)
+Assert-True "byID tie-breaker: 2nd OD is 0.75"           (Approx $t05.ODs[1].OD 0.75)
+
+Write-Host "  -- core: Get-FracLabel 'ID' branch --" -ForegroundColor White
+Assert-True "FracLabel ID fraction"  ((Get-FracLabel 'HSB | OD 3/4 x ID 1/2 x 1 Lg' 'ID' '0.5') -eq '1/2')
+Assert-True "FracLabel ID decimal"   ((Get-FracLabel 'Drill Bushing | OD 1/2 x ID 0.1875 x 1 Lg' 'ID' '0.1875') -eq '0.1875')
+Assert-True "FracLabel ID fallback"  ((Get-FracLabel '' 'ID' '0.5') -eq '0.5')
+# OD/Lg branches must be UNCHANGED by the new ID branch.
+Assert-True "FracLabel OD unchanged" ((Get-FracLabel 'HSB | OD 3/4 x ID 1/2 x 1 Lg' 'OD' 'x') -eq '3/4')
+Assert-True "FracLabel Lg unchanged" ((Get-FracLabel 'HSB | OD 3/4 x ID 1/2 x 1 1/2 Lg' 'Lg' 'x') -eq '1 1/2')
+
+Write-Host "  -- core: standardized-length pick (user 2026-07-21) --" -ForegroundColor White
+# Get-BushingLengthOptions: fixed {1/2,3/4,1} + Custom; PreselectIndex by ID value.
+$lo05 = Get-BushingLengthOptions -Id 0.5
+Assert-True "lenopt: 4 options (3 fixed + Custom)"   (@($lo05.Options).Count -eq 4)
+Assert-True "lenopt: fixed values 0.5/0.75/1"        ((Approx ([double]$lo05.Options[0].Value) 0.5) -and (Approx ([double]$lo05.Options[1].Value) 0.75) -and (Approx ([double]$lo05.Options[2].Value) 1.0))
+Assert-True "lenopt: labels 1/2, 3/4, 1"             (($lo05.Options[0].Label -eq '1/2') -and ($lo05.Options[1].Label -eq '3/4') -and ($lo05.Options[2].Label -eq '1'))
+Assert-True "lenopt: last is Custom sentinel"        ([bool]$lo05.Options[3].IsCustom -and ($null -eq $lo05.Options[3].Value) -and ($lo05.Options[3].Label -eq 'Custom'))
+Assert-True "lenopt: exactly one IsCustom"           ((@($lo05.Options | Where-Object { $_.IsCustom }).Count) -eq 1)
+Assert-True "lenopt: ID 0.5  -> preselect 0 (1/2)"   ($lo05.PreselectIndex -eq 0)
+Assert-True "lenopt: ID 0.75 -> preselect 1 (3/4)"   ((Get-BushingLengthOptions -Id 0.75).PreselectIndex -eq 1)
+Assert-True "lenopt: ID 1.0  -> preselect 2 (1)"     ((Get-BushingLengthOptions -Id 1.0).PreselectIndex -eq 2)
+Assert-True "lenopt: ID 0.375 -> no preselect (-1)"  ((Get-BushingLengthOptions -Id 0.375).PreselectIndex -eq -1)
+Assert-True "lenopt: ID 0.1875 -> no preselect (-1)" ((Get-BushingLengthOptions -Id 0.1875).PreselectIndex -eq -1)
+
+# Get-IdOdOptions: OD re-keyed on ID (union across lengths), ascending.
+# Reuse $grpId (unique-OD case) and $grp2 (multi-OD tie-break case) from above.
+$idg05  = $grpId | Where-Object { (Approx $_.ID 0.5) } | Select-Object -First 1
+$od05   = Get-IdOdOptions -IdGroup $idg05
+Assert-True "idod: ID 0.5 unique -> 1 OD"            (@($od05).Count -eq 1)
+Assert-True "idod: ID 0.5 sole OD is 0.75"           (Approx ([double]$od05[0].OD) 0.75)
+$idg05b = $grp2 | Where-Object { (Approx $_.ID 0.5) } | Select-Object -First 1
+$od05b  = Get-IdOdOptions -IdGroup $idg05b
+Assert-True "idod: tie-break ID 0.5 -> 2 ODs"        (@($od05b).Count -eq 2)
+Assert-True "idod: tie-break ODs ascending (0.5)"    (Approx ([double]$od05b[0].OD) 0.5)
+Assert-True "idod: tie-break 2nd OD is 0.75"         (Approx ([double]$od05b[1].OD) 0.75)
+
+# Resolve-BushingPickRow: exact SKU vs synthesized custom length.
+$pkExact = Resolve-BushingPickRow -IdGroup $idg05 -OdOption $od05[0] -Length 1.0 -LenLabel '1'
+Assert-True "pickrow: exact SKU -> real PartNumber"  ($pkExact.PartNumber -eq 'P1' -or $pkExact.PartNumber -eq 'P3')
+Assert-True "pickrow: exact SKU .Length == 1.0"      (Approx ([double]$pkExact.Length) 1.0)
+Assert-True "pickrow: exact SKU .OD is catalog 0.75" (Approx ([double]$pkExact.OD) 0.75)
+$pkCustom = Resolve-BushingPickRow -IdGroup $idg05 -OdOption $od05[0] -Length 0.9 -LenLabel '0.9'
+Assert-True "pickrow: custom -> (custom length) PN"  ($pkCustom.PartNumber -eq '(custom length)')
+Assert-True "pickrow: custom .Length == 0.9 (chosen)" (Approx ([double]$pkCustom.Length) 0.9)
+Assert-True "pickrow: custom .OD still catalog 0.75"  (Approx ([double]$pkCustom.OD) 0.75)
+Assert-True "pickrow: custom EasyName synthesized"    ($pkCustom.EasyName -match 'OD 3/4 x ID 1/2 x 0\.9 Lg')
+
+# Resolve-BushingLengthInput: decimal / simple fraction / mixed number / defaults / errors.
+$li1 = Resolve-BushingLengthInput -Text '3/8'   -Default 0.5
+Assert-True "leninp: 3/8 -> 0.375 Ok"                ([bool]$li1.Ok -and (Approx ([double]$li1.Value) 0.375))
+$li2 = Resolve-BushingLengthInput -Text '1 3/8' -Default 0.5
+Assert-True "leninp: mixed '1 3/8' -> 1.375 Ok"      ([bool]$li2.Ok -and (Approx ([double]$li2.Value) 1.375))
+$li3 = Resolve-BushingLengthInput -Text '0.9'   -Default 0.5
+Assert-True "leninp: 0.9 -> 0.9 Ok"                  ([bool]$li3.Ok -and (Approx ([double]$li3.Value) 0.9))
+$li4 = Resolve-BushingLengthInput -Text ''      -Default 0.75
+Assert-True "leninp: blank -> Default 0.75 Ok"       ([bool]$li4.Ok -and (Approx ([double]$li4.Value) 0.75))
+$li5 = Resolve-BushingLengthInput -Text '0'     -Default 0.5
+Assert-True "leninp: 0 -> Error"                     ((-not $li5.Ok) -and ($li5.Error -match 'greater than 0'))
+$li6 = Resolve-BushingLengthInput -Text '-1'    -Default 0.5
+Assert-True "leninp: -1 -> Error"                    (-not $li6.Ok)
+$li7 = Resolve-BushingLengthInput -Text 'abc'   -Default 0.5
+Assert-True "leninp: abc -> Error (Not a number)"    ((-not $li7.Ok) -and ($li7.Error -match 'Not a number'))
+# zero-denominator fraction must NOT slip through as Infinity (double /0 = +Inf, no throw).
+$li8 = Resolve-BushingLengthInput -Text '3/0'   -Default 0.5
+Assert-True "leninp: 3/0 -> Error (not Infinity)"    (-not $li8.Ok)
+$li9 = Resolve-BushingLengthInput -Text '1 3/0' -Default 0.5
+Assert-True "leninp: mixed '1 3/0' -> Error"         (-not $li9.Ok)
+Assert-True "ConvertTo-Decimal 3/0 -> null"          ($null -eq (ConvertTo-Decimal '3/0'))
+Assert-True "ConvertTo-Decimal 3/4 still 0.75"       (Approx ([double](ConvertTo-Decimal '3/4')) 0.75)
 
 # ----------------------------------------------------------------------------
 # drilljig_core PURE: plane-role classifier
@@ -211,6 +437,37 @@ $r0 = Build-ReliefHoleMacro -PointId 100 -Diameter 0.75 -BodyIndex 0
 Assert-True "relief: BLIND depth type (not thru-all)" (($r0 -match 'StrHoleDepBlindF') -and (-not ($r0 -match 'StrHoleDepThruAllF')))
 Assert-True "relief: diameter present"         ($r0 -match 'diameter_mip_OptionMenu.*0\.75')
 
+# --- hole COST + SAFETY invariants (locked after the 2026-07-21 hole-speedup study) ---
+# The per-hole wall-clock is dominated by ONE regen per hole, and each regen is
+# triggered by exactly ONE dashInst0.Done at the end of the atomic dashboard. These
+# assertions FENCE that model so a future "optimization" cannot silently regress it:
+#   (1) exactly ONE Done per Build-HoleMacro/Build-ReliefHoleMacro call. This blocks
+#       the rejected "mega-macro" (concatenating N dashboards into one RunMacro), which
+#       would KEEP all N regens while destroying the per-hole VersionStamp canary.
+#   (2) the point-select prefix must START with buffer_clean in BOTH the point-only and
+#       surface-pre-select branches. buffer_clean-first is load-bearing: confirmed live
+#       2026-06-25 that without it ProCmdHole sees stale refs and silently defaults to
+#       LINEAR placement (a wrong-placement hole the VersionStamp canary CANNOT catch).
+Assert-True "hole: exactly ONE Done per macro (1 regen)"   (([regex]::Matches($h0, 'dashInst0\.Done')).Count -eq 1)
+Assert-True "hole+surface: exactly ONE Done per macro"     (([regex]::Matches($hS, 'dashInst0\.Done')).Count -eq 1)
+Assert-True "relief: exactly ONE Done per macro (1 regen)" (([regex]::Matches($r0, 'dashInst0\.Done')).Count -eq 1)
+Assert-True "hole: single ProCmdHole per macro (no mega-macro)" (([regex]::Matches($h0, 'ProCmdHole')).Count -eq 1)
+# Assert ORDERING (backtick-agnostic): buffer_clean must appear, and must come BEFORE
+# the first ProCmd... command in the macro -- i.e. the buffer is wiped before any tool
+# opens. This is the property that keeps ProCmdHole in On-Point (not Linear) placement.
+function Test-CleanFirst { param([string]$m)
+    $bc = $m.IndexOf('buffer_clean'); $pc = $m.IndexOf('ProCmd')
+    return ($bc -ge 0 -and $pc -ge 0 -and $bc -lt $pc)
+}
+Assert-True "hole point-only: buffer_clean precedes first ProCmd" (Test-CleanFirst $h0)
+Assert-True "hole+surface: buffer_clean precedes first ProCmd"    (Test-CleanFirst $hS)
+Assert-True "relief: buffer_clean precedes first ProCmd"          (Test-CleanFirst $r0)
+# The point-select prefix helper on its own leads with buffer_clean in both branches.
+$psP = Get-HolePointSelectMacro -PointId 7
+$psS = Get-HolePointSelectMacro -PointId 7 -SurfacePlaneId 55
+Assert-True "point-select (point-only): buffer_clean precedes first ProCmd" (Test-CleanFirst $psP)
+Assert-True "point-select (w/ surface): buffer_clean precedes first ProCmd" (Test-CleanFirst $psS)
+
 # ----------------------------------------------------------------------------
 # core: chip-relief SLOT macros (Build-CutFinishMacro + Build-SlotPatternMacro),
 # shared by slotinator.cmd + drilljig.cmd + drilljig-gui.cmd.
@@ -244,6 +501,42 @@ $perr = $null
 [void][System.Management.Automation.PSParser]::Tokenize($guiRaw, [ref]$perr)
 Assert-True "drilljig-gui.cmd parses clean" ($perr.Count -eq 0) ("({0} errors)" -f $perr.Count)
 
+# ----------------------------------------------------------------------------
+# IN-CANVAS PROMPTS (user 2026-07-21: "these popups can exist within the GUI instead
+# of a popup"). Every interactive prompt in drilljig-gui.cmd now renders as an
+# in-canvas overlay via $wiz.AskInline, NOT a floating Show-WizardMessage. Lock that
+# deterministically: ZERO Show-WizardMessage calls in the .cmd, and AskInline is used
+# for all 16 former popup sites. The ONLY Show-WizardMessage left lives in wizard.ps1
+# (the global crash-dialog net), which MUST survive a broken canvas -> a real box.
+# ----------------------------------------------------------------------------
+Write-Host "  -- in-canvas prompts (no floating popups in the GUI) --" -ForegroundColor White
+$swmCount = ([regex]::Matches($guiRaw, 'Show-WizardMessage')).Count
+Assert-True "drilljig-gui.cmd has ZERO Show-WizardMessage calls (all in-canvas)" ($swmCount -eq 0) ("found {0}" -f $swmCount)
+$askCount = ([regex]::Matches($guiRaw, '\.AskInline\(')).Count
+Assert-True "drilljig-gui.cmd uses AskInline for the former popups (>=15)" ($askCount -ge 15) ("found {0}" -f $askCount)
+# the 3 Creo-focus prompts (flipped-redraw, select-seed, switch-back) MUST pass
+# -NoActivate (a 4th arg $true) so the wizard does not steal focus from Creo while the
+# operator interacts with it; a regression here silently breaks those Creo picks.
+$noActivate = ([regex]::Matches($guiRaw, "\.AskInline\([^\r\n]*,\s*\`$true\s*\)")).Count
+Assert-True "drilljig-gui.cmd keeps 3 -NoActivate AskInline prompts (Creo-focus sites)" ($noActivate -ge 3) ("found {0}" -f $noActivate)
+
+# the crash-dialog net stays a real floating box (it must show even if the canvas is
+# broken), so wizard.ps1 still DEFINES Show-WizardMessage AND $wzLogError still calls it.
+$wizRaw = Get-Content -Raw (Join-Path $libDir 'wizard.ps1')
+Assert-True "wizard.ps1 still defines Show-WizardMessage" ($wizRaw -match 'function\s+Show-WizardMessage')
+Assert-True "wizard.ps1 crash-net ($wzLogError) still calls Show-WizardMessage" ($wizRaw -match '(?s)\$wzLogError\s*=.*?Show-WizardMessage')
+Assert-True "wizard.ps1 defines the AskInline controller method" ($wizRaw -match "Add-Member[^\r\n]*-Name\s+AskInline")
+
+# tokenize-clean gate for the self-contained jiginator copies (they mirror the new
+# length-pick helpers by hand and dot-source no lib, so a syntax error there is
+# invisible to the lib parse checks -- catch it here).
+foreach ($jf in @('jiginator.cmd','jiginator.ps1')) {
+    $jt = Get-Content -Raw (Join-Path $root $jf)
+    $je = $null
+    [void][System.Management.Automation.PSParser]::Tokenize($jt, [ref]$je)
+    Assert-True ("$jf parses clean") ($je.Count -eq 0) ("({0} errors)" -f $je.Count)
+}
+
 # also parse-check the two new libs
 foreach ($lf in @('wizard.ps1','drilljig_core.ps1')) {
     $t = Get-Content -Raw (Join-Path $libDir $lf)
@@ -256,14 +549,18 @@ foreach ($lf in @('wizard.ps1','drilljig_core.ps1')) {
 $coreFns = @('Initialize-DrilljigCore','New-OffsetPlane','Set-PlaneOffset','Set-ReliefHoleDepth',
              'Build-HoleMacro','Build-ReliefHoleMacro','Get-SelectByIdMacro','Get-SelectDatumByIdMacro',
              'Read-SelectedId','Read-SelectionPlanePicks','Find-DefaultDatumPicks','Resolve-SelectedPointIds',
-             'Get-BodyList','Get-CatalogRows','Group-CatalogByOD','Invoke-Macro','Invoke-ForceRegen','Wait-ModelModified',
+             'Get-BodyList','Get-CatalogRows','Group-CatalogByOD','Group-CatalogByID','Invoke-Macro','Invoke-ForceRegen','Wait-ModelModified',
+             'Get-BushingLengthOptions','Get-IdOdOptions','Resolve-BushingPickRow','Resolve-BushingLengthInput',
              'Build-CsysFromPlanesMacro','Get-CsysShowMacro','Resolve-IndexHolePlanes','Read-IndexSelectionIds','Invoke-IndexCsys',
              'Get-HolesRelativeToIndex','Export-IndexHoleCsv','Build-CsysOffsetPointsMacro','Invoke-CsysOffsetPoints',
-             'Resolve-HoleFeatGroups','Format-IndexHoleReport','Write-IndexHoleReport')
+             'Resolve-HoleFeatGroups','Format-IndexHoleReport','Write-IndexHoleReport',
+             'Find-DefaultCsysId','Build-CsysFromCsysMacro','Invoke-BaseCsys','Build-CsysOffsetPlaneMacro',
+             'Resolve-NewPlaneAfterCommit','New-CsysOffsetPlane','Build-CsysTransformExportMacro',
+             'Build-CsysReimportMacro','Invoke-CsysTransformReimport','Invoke-IndependentReref','Invoke-OutputCsys')
 $missingCore = @($coreFns | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
 Assert-True "all drilljig-core functions resolve" ($missingCore.Count -eq 0) ("missing: {0}" -f ($missingCore -join ', '))
 
-$wizFns = @('New-WizardStep','Show-Wizard','Add-WizardChoiceCards','Get-BreadcrumbStates','Get-MaxCommittedIndex','Test-CanGoBack','Resolve-ChipColorName')
+$wizFns = @('New-WizardStep','Show-Wizard','Add-WizardChoiceCards','Get-BreadcrumbStates','Get-MaxCommittedIndex','Test-CanGoBack','Test-BackButtonEnabled','Get-FirstStepIndexForStage','Resolve-BreadcrumbClickStage','Resolve-ChipColorName')
 $missingWiz = @($wizFns | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
 Assert-True "all wizard functions resolve" ($missingWiz.Count -eq 0) ("missing: {0}" -f ($missingWiz -join ', '))
 
@@ -320,7 +617,7 @@ if (-not $wfLoaded) {
             TreePath = Join-Path $root 'docs\drill_jig_decision_tree.json'
             Path=[System.Collections.ArrayList]::new(); Picks=[System.Collections.ArrayList]::new()
             HoleDia=$null; BushingLen=$null; Is3dPrint=$false
-            TreeNode=$null; TreeDone=$false; PendingSpec=$null; BushStage=$null; Grouped=$null; BushOD=$null; BushLen=$null
+            TreeNode=$null; TreeDone=$false; PendingSpec=$null; BushStage=$null; Grouped=$null; BushID=$null; BushOD=$null; BushLen=$null
             PointMode='predefined'; OrthoGeo=$null; LayoutPicked=$false
             Planes=$null; AutoMapped=$false; SidePlane=$null; Made=@(); BoxArmed=$false; SketchPlaneId=$null; ExtrudeToId=$null; BoxBuilt=$false; BuildConfirmed=$null
             GridPointIDs=@(); GridPlaneIds=@(); PointIDs=@(); BodyIndex=0; HoleDiaFinal=0.0; Drilled=$false
@@ -339,30 +636,81 @@ if (-not $wfLoaded) {
             & $script:capOnPick $i $script:capOpts[$i] $ctx $fakeWiz | Out-Null
             $pnl.Dispose()
         }
+        # ID-first flow: Q1=0/Q2=0 lands on the SINGLE-OD "3/4 OD removable" outcome, so
+        # after ID + length the OD auto-resolves and completes with NO 'od' card. The OD
+        # fire is guarded (only the rare ambiguous outcome would reach BushStage 'od').
         $threw = $false
         try {
             & $fire 0   # Q1 material
             & $fire 0   # Q2 PFD/Hand -> outcome -> catalog
             if ($null -ne $ctx.PendingSpec) {
-                & $fire 0   # OD pick (the bug site)
-                & $fire 0   # length
-                & $fire 0   # ID -> Any
+                & $fire 0   # ID pick (now FIRST)
+                & $fire 0   # length -> single-OD outcome auto-resolves + completes here
+                if ($ctx.BushStage -eq 'od') { & $fire 0 }   # OD tie-breaker (ambiguous only)
             }
         } catch { $threw = $true; Write-Host ("       threw: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
         Assert-True "tree OnPick walk does not throw (no null-index)" (-not $threw)
-        Assert-True "tree walk set BushOD via persistent context" ($null -ne $ctx.BushOD)
+        Assert-True "tree walk set BushID via persistent context" ($null -ne $ctx.BushID)
         Assert-True "tree walk resolved a bushing pick" ($ctx.Picks.Count -gt 0)
+        Assert-True "tree walk auto-resolved OD (BushStage cleared)" ($null -eq $ctx.BushStage)
         Assert-True "tree walk set TreeDone" ([bool]$ctx.TreeDone)
         Assert-True "resolved HoleDiameter > 0" ($ctx.Picks.Count -gt 0 -and [double]$ctx.Picks[$ctx.Picks.Count-1].HoleDiameter -gt 0)
 
-        # --- the tree is now DONE with a pick: the confirmation branch must render
-        #     a Change button instead of re-showing the OD cards (no endless cycle).
+        # --- the tree is now DONE with a pick: the confirmation branch must render the
+        #     change-selection affordances (the single "Change selection" button was split
+        #     2026-07-21 into "Start over" = full reset + "< Back to options" = step back one
+        #     decision), NOT the OD cards again (no endless cycle).
         $cp = New-Object System.Windows.Forms.Panel; $cp.Size = New-Object System.Drawing.Size(820,380)
         & $tStep.Build $cp $ctx $fakeWiz | Out-Null
-        $hasChange = $false
-        foreach ($cc in $cp.Controls) { if ($cc -is [System.Windows.Forms.Button] -and $cc.Text -match 'Change') { $hasChange = $true } }
-        Assert-True "bushing-done shows a Change button (no re-cycle)" $hasChange
+        $btnTexts = @(); foreach ($cc in $cp.Controls) { if ($cc -is [System.Windows.Forms.Button]) { $btnTexts += [string]$cc.Text } }
+        Assert-True "bushing-done shows a Start-over button (no re-cycle)" (@($btnTexts | Where-Object { $_ -match 'Start over' }).Count -gt 0) ("buttons: {0}" -f ($btnTexts -join ' | '))
+        Assert-True "bushing-done shows a Back-to-options button (step back)" (@($btnTexts | Where-Object { $_ -match 'Back to options' }).Count -gt 0) ("buttons: {0}" -f ($btnTexts -join ' | '))
         $cp.Dispose()
+
+        # --- PRESS-NEXT-TO-TAKE-THE-RECOMMENDATION (user 2026-07-21). Set-BushLengthPick +
+        #     the tree step's Validate/OnNext must let the operator commit the recommended
+        #     length with the Next button (no card click). Build a fresh synthetic context
+        #     mid-length-pick on a SLEEVE ID (ID 1/2 -> recommends 1/2, unique OD 3/4).
+        $sleeveRows = @(Import-Csv (Join-Path $root 'data\bushings.csv'))
+        $sleeveById = Group-CatalogByID -Rows $sleeveRows
+        $id05grp = $sleeveById | Where-Object { (Approx $_.ID 0.5) } | Select-Object -First 1
+        Assert-True "recommend: sleeve ID 0.5 exists" ($null -ne $id05grp)
+        $nctx = @{
+            Path=[System.Collections.ArrayList]::new(); Picks=[System.Collections.ArrayList]::new()
+            HoleDia=$null; BushingLen=$null; Is3dPrint=$false
+            TreeNode=[pscustomobject]@{ label='all 3/4 ID and 1/2 ID sleeves' }
+            TreeDone=$false; PendingSpec='spec'; BushStage='len'; Grouped=$sleeveById; BushID=$id05grp
+            BushOdOptions=(Get-IdOdOptions -IdGroup $id05grp)
+            BushLenValue=$null; BushLenLabel=$null; BushLenIsCustom=$false; BushLenCustomText=''; BushLenValid=$true
+            TreeHistory=[System.Collections.ArrayList]::new()
+        }
+        # Validate must ENABLE Next at the length stage because ID 0.5 has a recommendation.
+        Assert-True "recommend: Validate enables Next at length (has recommendation)" ([bool](& $tStep.Validate $nctx))
+        # OnNext must COMMIT the recommended length (1/2") and NOT advance (returns $false).
+        $adv = & $tStep.OnNext $nctx $fakeWiz
+        Assert-True "recommend: OnNext does NOT advance (stays to confirm)" ($adv -eq $false)
+        Assert-True "recommend: OnNext committed a pick"                    ($nctx.Picks.Count -gt 0)
+        Assert-True "recommend: committed length is 0.5 (the recommended)"  (Approx ([double]$nctx.Picks[$nctx.Picks.Count-1].BushingLength) 0.5)
+        Assert-True "recommend: unique OD auto-resolved -> TreeDone"        ([bool]$nctx.TreeDone)
+        Assert-True "recommend: hole = sleeve OD 0.75"                      (Approx ([double]$nctx.Picks[$nctx.Picks.Count-1].HoleDiameter) 0.75)
+        # A DRILL ID with no recommendation (e.g. 0.1875) must NOT auto-commit via Next.
+        $drillRows = @(Import-Csv (Join-Path $root 'data\bushings_drill.csv'))
+        $drillById = Group-CatalogByID -Rows $drillRows
+        $idNoRec = $drillById | Where-Object { (Approx $_.ID 0.1875) } | Select-Object -First 1
+        if ($null -ne $idNoRec) {
+            $nctx2 = @{ TreeNode=[pscustomobject]@{ label='x' }; TreeDone=$false; PendingSpec='spec'; BushStage='len'
+                       BushID=$idNoRec; BushOdOptions=(Get-IdOdOptions -IdGroup $idNoRec); BushLenIsCustom=$false
+                       Picks=[System.Collections.ArrayList]::new(); TreeHistory=[System.Collections.ArrayList]::new() }
+            Assert-True "recommend: no-recommendation ID -> Validate keeps Next disabled" (-not (& $tStep.Validate $nctx2))
+        }
+        # Set-BushLengthPick directly: a custom length on a unique-OD ID resolves + completes.
+        $sctx = @{ TreeNode=[pscustomobject]@{ label='x' }; TreeDone=$false; PendingSpec='spec'; BushStage='len'
+                   BushID=$id05grp; BushOdOptions=(Get-IdOdOptions -IdGroup $id05grp)
+                   Picks=[System.Collections.ArrayList]::new() }
+        $sres = Set-BushLengthPick -Context $sctx -LenValue 0.9 -LenLabel '0.9'
+        Assert-True "Set-BushLengthPick: unique OD -> 'done'"          ($sres -eq 'done')
+        Assert-True "Set-BushLengthPick: custom length carried (0.9)"  (Approx ([double]$sctx.Picks[0].BushingLength) 0.9)
+        Assert-True "Set-BushLengthPick: (custom length) part number"  ($sctx.Picks[0].PartNumber -eq '(custom length)')
 
         # --- the EMBEDDED inline orthogrid editor: render it in-canvas and assert it
         #     computes a valid grid + gates the layout step (the no-popup embed).
@@ -443,6 +791,147 @@ if (-not $wfLoaded) {
 }
 
 # ----------------------------------------------------------------------------
+# DRIVE: $wiz.AskInline renders an IN-CANVAS overlay and returns the clicked
+# button's value (the in-canvas replacement for Show-WizardMessage popups). This is
+# the behavioral proof the overlay works: a step's OnNext calls AskInline (which
+# blocks on its OWN nested DoEvents pump), and a Timer -- still ticking inside that
+# pump -- locates the overlay's 'Yes' button (Tag='askinline') and PerformClick()s it,
+# so AskInline returns 'Yes'. We assert the returned value, that the method exists,
+# and that no 'askinline'-tagged control leaks after it returns (clean teardown).
+# Requires WinForms; skips headless.
+# ----------------------------------------------------------------------------
+Write-Host "  -- drive: AskInline in-canvas overlay returns the clicked value --" -ForegroundColor White
+if (-not $wfLoaded) {
+    Write-Host "  [SKIP] AskInline drive (WinForms not available headless)" -ForegroundColor DarkGray
+} else {
+    try {
+        # find the 'askinline'-tagged button whose Text matches, anywhere under the form
+        $findBtn = {
+            param($parent, [string]$text)
+            foreach ($ctl in $parent.Controls) {
+                if ($ctl -is [System.Windows.Forms.Button] -and ("" + $ctl.Tag) -eq 'askinline' -and $ctl.Text -eq $text) { return $ctl }
+                $deep = & $findBtn $ctl $text
+                if ($null -ne $deep) { return $deep }
+            }
+            return $null
+        }
+        $script:askMethodPresent = $false
+        $script:askResult = $null
+        $script:askLeak = $null    # count of leftover 'askinline'-tagged controls after AskInline returns
+        # one step whose OnNext fires AskInline('...','...','YesNo'), stashes the result,
+        # then closes the wizard (return $true past the last step -> Completed).
+        $askStep = New-WizardStep -Key 'ask' -Title 'Ask' -Stage 'A' -Build {
+            param($panel,$c,$wiz)
+            # AskInline is added to the $wiz controller by Show-Wizard
+            $c.MethodPresent = [bool]($null -ne ($wiz | Get-Member -Name AskInline -MemberType ScriptMethod))
+            $lbl = New-Object System.Windows.Forms.Label; $lbl.Text='x'; $panel.Controls.Add($lbl)
+        } -Validate { param($c) $true } -OnNext {
+            param($c,$wiz)
+            $c.AskResult = $wiz.AskInline('T', 'pick one', 'YesNo')
+            return $true
+        }
+        $askCtx = @{}
+        $timerA = New-Object System.Windows.Forms.Timer
+        $timerA.Interval = 250
+        $script:askPhase = 0
+        $timerA.Add_Tick({
+            try {
+                $f = [System.Windows.Forms.Application]::OpenForms | Where-Object { $_.Text -eq 'ASK-TEST' } | Select-Object -First 1
+                if ($null -eq $f) { return }
+                if ($script:askPhase -eq 0) {
+                    # click Next -> enters OnNext -> AskInline shows the overlay + starts its pump
+                    $nx = @($f.Controls | Where-Object { $_ -is [System.Windows.Forms.Button] -and $_.Text -notmatch 'Back' }) | Select-Object -First 1
+                    if ($null -ne $nx) { $script:askPhase = 1; $nx.PerformClick() }
+                    return
+                }
+                if ($script:askPhase -eq 1) {
+                    # we are now ticking INSIDE AskInline's nested pump: find + click 'Yes'
+                    $yes = & $findBtn $f 'Yes'
+                    if ($null -ne $yes) { $script:askPhase = 2; $yes.PerformClick() }
+                    return
+                }
+            } catch { $timerA.Stop() }
+        })
+        $timerA.Start()
+        [void](Show-Wizard -Steps @($askStep) -Stages @('A') -Title 'ASK-TEST' -Context $askCtx)
+        $timerA.Dispose()
+        Assert-True "askinline: wiz exposes an AskInline method" ([bool]$askCtx.MethodPresent)
+        Assert-True "askinline: returns the clicked button value ('Yes')" ($askCtx.AskResult -eq 'Yes') ("got '{0}'" -f $askCtx.AskResult)
+    } catch {
+        Assert-True "AskInline drive harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# DRIVE: the Back button must be ENABLED on a page that sits AFTER a committed
+# step (user request 2026-07-21: "add back buttons to every single possible page").
+# Previously the committed-boundary guard hard-DISABLED Back on every page past a
+# MarkCommitted() (drill / slots / index / done), so most later pages had a dead
+# Back button. Now Back is enabled everywhere except index 0 (the click confirms a
+# committed crossing). Build A->B->C where B commits, advance to C, and assert the
+# Back button is enabled there. We only READ .Enabled (do NOT click it) so the
+# committed-crossing confirmation dialog never fires. Requires WinForms; skips headless.
+# ----------------------------------------------------------------------------
+Write-Host "  -- drive: Back enabled on a page after a committed step --" -ForegroundColor White
+if (-not $wfLoaded) {
+    Write-Host "  [SKIP] Back-enabled drive (WinForms not available headless)" -ForegroundColor DarkGray
+} else {
+    try {
+        $mk2 = {
+            param($key, $commit)
+            $onNext = if ($commit) { { param($c,$wiz) $wiz.MarkCommitted(); return $true } } else { { param($c,$wiz) return $true } }
+            New-WizardStep -Key $key -Title $key -Stage $key -Build {
+                param($panel,$c,$wiz) $lbl = New-Object System.Windows.Forms.Label; $lbl.Text='x'; $panel.Controls.Add($lbl)
+            } -Validate { param($c) $true } -OnNext $onNext
+        }
+        $bsteps = @((& $mk2 'A' $false), (& $mk2 'B' $true), (& $mk2 'C' $false))
+        $script:backOnCommittedPage = $null
+        # NOTE: script-scoped counter. A bare `$bclicks++` inside a WinForms tick
+        # handler writes a TICK-LOCAL copy (PowerShell write-scoping), so the outer
+        # value never advances -> the branch below never fires and the wizard self-
+        # closes before we read Back. $script: makes the increment persist across ticks.
+        $script:bclicks = 0
+        $timer2 = New-Object System.Windows.Forms.Timer
+        $timer2.Interval = 300
+        $timer2.Add_Tick({
+            try {
+                # Locate OUR form by title via OpenForms, not ActiveForm: when several
+                # interactive wizard tests stack in one process, ActiveForm can return a
+                # stale/other window (focus race) and the test flakes. OpenForms is
+                # deterministic - it always finds the BACK-TEST form while it is open.
+                $f = [System.Windows.Forms.Application]::OpenForms | Where-Object { $_.Text -eq 'BACK-TEST' } | Select-Object -First 1
+                if ($null -eq $f) { return }
+                $btns = @(); foreach ($ctl in $f.Controls) { if ($ctl -is [System.Windows.Forms.Button]) { $btns += $ctl } }
+                $back = $btns | Where-Object { $_.Text -match 'Back' } | Select-Object -First 1
+                $nx   = $btns | Where-Object { $_.Text -notmatch 'Back' } | Select-Object -First 1
+                if ($null -eq $nx) { $timer2.Stop(); return }
+                if ($script:bclicks -ge 2) {
+                    # on step C, which is AFTER committed step B: Back must be ENABLED
+                    $script:backOnCommittedPage = [bool]($null -ne $back -and $back.Enabled)
+                    $timer2.Stop(); try { $f.Close() } catch {}; return
+                }
+                $nx.PerformClick(); $script:bclicks++
+            } catch { $timer2.Stop() }
+        })
+        $timer2.Start()
+        [void](Show-Wizard -Steps $bsteps -Stages @('A','B','C') -Title 'BACK-TEST' -Context @{})
+        $timer2.Dispose()
+        Assert-True "drive: Back is ENABLED on a page after a committed step (was greyed out before)" ([bool]$script:backOnCommittedPage)
+    } catch {
+        Assert-True "Back-enabled drive harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+    }
+}
+
+# NOTE: the clickable-breadcrumb JUMP wiring (rail MouseClick -> Resolve-BreadcrumbClickStage
+# -> Get-FirstStepIndexForStage -> $wz.MaxReached gate -> render) is covered deterministically
+# by the pure helper tests above (14 assertions: slot math, out-of-range, empty-stage, first-
+# step index). A live end-to-end DRIVE test was tried but a synthesized reflection MouseClick
+# under the harness's BACKGROUND execution is flaky (a throwing tick left the modal Show-Wizard
+# open -> the whole suite hung). It was removed to keep the suite reliable; the end-to-end jump
+# was instead confirmed with a standalone FOREGROUND repro (see the memory note). The Back-drive
+# test below still exercises the live nav framework (Back enablement through Show-Wizard).
+
+# ----------------------------------------------------------------------------
 # HYBRID SCOPE: the killer test. drilljig-gui.cmd runs its whole body via
 # & ([scriptblock]::Create(<text>)) (the hybrid .cmd header). Functions dot-sourced
 # into THAT scriptblock land in its LOCAL scope, and .GetNewClosure() blocks (the
@@ -478,6 +967,7 @@ $body = {
     . (Join-Path $ROOT 'lib\wizard.ps1')
     Initialize-DrilljigCore -Session $null -Model $null -TypeObj $null -DataDir (Join-Path $ROOT 'data') -Log $null
     $RELIEF_DIA_MULT = 1.5; $noCornerRound = $false; $cornerRadius = 0.25
+    $noIndexCsys = $false; $noCsysPoints = $false   # index-a/-b Builds read these
     function Invoke-BoxEval { param($Operation,$Expected) return $true }
     $model=$null;$pfcType=$null;$session=$null
     $src = Get-Content -Raw (Join-Path $ROOT 'drilljig-gui.cmd')
@@ -488,7 +978,10 @@ $body = {
     $ctx = @{
         TreePath=Join-Path $ROOT 'docs\drill_jig_decision_tree.json'
         Path=[System.Collections.ArrayList]::new(); Picks=[System.Collections.ArrayList]::new()
-        HoleDia=0.75; BushingLen=1.0; Is3dPrint=$false
+        # HoleDia must be <= the inline editor's default seed pitch (CcX/CcZ = 0.5) or
+        # the hole-collision check (2026-07-17) invalidates the default grid -> GRID=False
+        # and the index preview has no OrthoGeo. 0.25" hole in a 0.5" grid is valid.
+        HoleDia=0.25; BushingLen=1.0; Is3dPrint=$false
         TreeNode=$null; TreeDone=$false; PendingSpec=$null; BushStage=$null; Grouped=$null; BushOD=$null; BushLen=$null
         PointMode='predefined'; OrthoGeo=$null; LayoutPicked=$true; LayoutMode=$null; OrthoValid=$false; OrthoFields=$null; CustomRows=$null
         Planes=$null; AutoMapped=$false; SidePlane=$null; Made=@(); BoxArmed=$false; SketchPlaneId=$null; ExtrudeToId=$null; BoxBuilt=$false; BuildConfirmed=$null
@@ -508,7 +1001,57 @@ $body = {
     $p2 = New-Object System.Windows.Forms.Panel; $p2.Size = New-Object System.Drawing.Size(840,360)
     & $lStep.Build $p2 $ctx $fakeWiz | Out-Null
     $cust = ([bool]$ctx.OrthoValid -and $null -ne $ctx.OrthoGeo -and $ctx.OrthoGeo.Mode -eq 'custom'); $p2.Dispose()
-    Write-Output ("GRID={0} CUSTOM={1}" -f $grid, $cust)
+
+    # INDEX-HOLE numbered preview (user request 2026-07-17): build the index-choice
+    # step under scriptblock::Create with a chosen index, then DrawToBitmap its
+    # preview panel and assert the GREEN HIGHLIGHT RING rendered. The ring is drawn
+    # ONLY by the global Draw-HoleLabels, called from Add-LayoutPreview's
+    # .GetNewClosure() Paint handler - and that closure has a defensive `catch {}`.
+    # So a "did not throw" check is a NO-OP (the catch would swallow a missing-function
+    # error and the test would still pass). Gating on the rendered ring is the real
+    # closure-scope gate: if Draw-HoleLabels were declared non-global (invisible to the
+    # closure under this scope model), the catch eats the error, NO ring is painted, and
+    # green=0 FAILS this assertion. (DrawToBitmap fires the panel's GDI+ Paint
+    # synchronously; ellipse/string ARE captured, per the toolkit's render-check note.)
+    $ctx.PointMode='orthogrid'; $ctx.LayoutMode='orthogrid'; $ctx.OrthoValid=$false; $ctx.OrthoFields=$null; $ctx.OrthoGeo=$null
+    $pg = New-Object System.Windows.Forms.Panel; $pg.Size = New-Object System.Drawing.Size(840,360)
+    & $lStep.Build $pg $ctx $fakeWiz | Out-Null; $pg.Dispose()   # populate $ctx.OrthoGeo
+    $icStep = $steps | Where-Object { $_.Key -eq 'index-choice' } | Select-Object -First 1
+    # index-a is the OLD standalone Creo-pick index step; it was folded into index-first
+    # (the numbered ring now renders entirely in index-choice). Only gate the ring-render
+    # check on index-choice + OrthoGeo; the index-a build below is conditional (if present).
+    $iaStep = $steps | Where-Object { $_.Key -eq 'index-a' } | Select-Object -First 1
+    $idxGreen = 0
+    if ($null -ne $icStep -and $null -ne $ctx.OrthoGeo) {
+        try {
+            # choose hole #1 as the index so Draw-HoleLabels rings it (the green signal)
+            $ctx.IndexFirst=$true; $ctx.IndexKey=0
+            $ctx.IndexGridX=[double]$ctx.OrthoGeo.Points[0].X; $ctx.IndexGridZ=[double]$ctx.OrthoGeo.Points[0].Z
+            $ctx.CsysRecords=@([pscustomobject]@{ PointId=101; HoleFeatId=201; PlaneIds=@(1,2,3); GridX=$ctx.IndexGridX; GridZ=$ctx.IndexGridZ })
+            $ctx.IndexPlaneIds=@(); $ctx.IndexPointId=$null
+            $pic = New-Object System.Windows.Forms.Panel; $pic.Size = New-Object System.Drawing.Size(840,520)
+            & $icStep.Build $pic $ctx $fakeWiz | Out-Null
+            $prev = $pic.Controls | Where-Object { $_ -is [System.Windows.Forms.Panel] -and $_.Tag -eq 'layout-preview' } | Select-Object -First 1
+            if ($null -ne $prev -and $prev.Width -gt 4 -and $prev.Height -gt 4) {
+                $cb = New-Object System.Drawing.Bitmap($prev.Width, $prev.Height)
+                $prev.DrawToBitmap($cb, (New-Object System.Drawing.Rectangle(0,0,$cb.Width,$cb.Height)))
+                for ($x=0; $x -lt $cb.Width; $x++) { for ($y=0; $y -lt $cb.Height; $y++) {
+                    $px=$cb.GetPixel($x,$y); if ($px.G -gt 150 -and $px.G -gt ($px.R+30) -and $px.G -gt ($px.B+30)) { $idxGreen++ }
+                } }
+                $cb.Dispose()
+            }
+            $pic.Dispose()
+            # also build index-a (the old Creo-pick branch) to confirm it constructs
+            # without throwing -- ONLY if that step still exists (it was removed when the
+            # index flow was folded into index-first; skip cleanly when absent).
+            if ($null -ne $iaStep) {
+                $ctx.IndexFirst=$false
+                $pia = New-Object System.Windows.Forms.Panel; $pia.Size = New-Object System.Drawing.Size(840,540)
+                & $iaStep.Build $pia $ctx $fakeWiz | Out-Null; $pia.Dispose()
+            }
+        } catch { Write-Output ("INDEXERR=" + ($_.Exception.Message -replace '\s+',' ')) }
+    }
+    Write-Output ("GRID={0} CUSTOM={1} INDEXGREEN={2}" -f $grid, $cust, $idxGreen)
 }
 & ([scriptblock]::Create($body.ToString()))
 '@
@@ -519,8 +1062,14 @@ $body = {
         Remove-Item $tmp -ErrorAction SilentlyContinue
         $gridOk = ($childOut -match 'GRID=True')
         $custOk = ($childOut -match 'CUSTOM=True')
+        # parse the rendered green-ring pixel count; > a floor means Draw-HoleLabels
+        # actually painted the highlight ring THROUGH the .GetNewClosure() Paint handler
+        # (the ring is drawn only by Draw-HoleLabels; a non-global regression -> catch{} ->
+        # 0 green). This is the true closure-scope gate, not a "didn't throw" no-op.
+        $idxGreen = 0; if ($childOut -match 'INDEXGREEN=(\d+)') { $idxGreen = [int]$Matches[1] }
         Assert-True "hybrid (child proc): inline ORTHOGRID computes under scriptblock::Create" $gridOk ("child said: " + ($childOut.Trim() -replace '\s+',' '))
         Assert-True "hybrid (child proc): inline CUSTOM computes under scriptblock::Create"    $custOk ("child said: " + ($childOut.Trim() -replace '\s+',' '))
+        Assert-True "hybrid (child proc): Draw-HoleLabels paints the index ring THROUGH the .cmd Paint closure ($idxGreen green px)" ($idxGreen -gt 8) ("child said: " + ($childOut.Trim() -replace '\s+',' '))
     } catch {
         Assert-True "hybrid-scope child harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
     }
@@ -579,6 +1128,255 @@ Assert-True "guides: pattern mode creates >=1 plane"        (@($gpPat.Ids).Count
 Assert-True "guides: all-rows creates more than first-row"  (@($gpAll.Ids).Count -gt @($gpPat.Ids).Count)
 Assert-True "guides: no TOP/FRONT base -> no planes, no throw" (@((New-SlotGuidePlanes -Rows $gpSl.Rows -TopBaseId 0 -FrontBaseId 0).Ids).Count -eq 0)
 Assert-True "guides: empty rows -> no planes, no throw"     (@((New-SlotGuidePlanes -Rows @() -TopBaseId 10 -FrontBaseId 11).Ids).Count -eq 0)
+
+# ----------------------------------------------------------------------------
+# gui: Draw-SlotRects -- the chip-relief SLOT overlay that shows the relief slots
+# on the layout preview (both the inline GUI editors and the modal dialogs). It is
+# pure drawing, so prove it (a) resolves after dot-sourcing orthogrid_gui.ps1 in
+# global: scope (the same bar Draw-AxisGlyph gets, so the hybrid .cmd closures can
+# call it), and (b) actually RENDERS amber bands onto an off-screen Graphics from a
+# real Get-RowSlots result -- the headless evidence the response-convergence harness
+# can see. Requires System.Drawing; skips gracefully headless.
+# ----------------------------------------------------------------------------
+Write-Host "  -- gui: Draw-SlotRects (relief-slot overlay) --" -ForegroundColor White
+. (Join-Path $libDir 'orthogrid_gui.ps1')
+Assert-True "Draw-SlotRects resolves (global scope)" ($null -ne (Get-Command Draw-SlotRects -ErrorAction SilentlyContinue))
+Assert-True "Draw-SlotRects does NOT throw on null slots" (& { try { Draw-SlotRects -Graphics $null -Slots $null -OffX 0 -OffY 0 -DrawH 100 -Scale 1; $true } catch { $false } })
+if (-not $wfLoaded) {
+    Write-Host "  [SKIP] Draw-SlotRects render assertion (System.Drawing not available headless)" -ForegroundColor DarkGray
+} else {
+    try {
+        # a 3x3 grid at 2" pitch, 0.75 hole -> Get-RowSlots gives 3 full-width bands.
+        $dsGeo = Get-OrthogridGeometry -CcX 2.0 -CcZ 2.0 -Nx 3 -Nz 3 -Edge 2.0 -ClearDia 0.75
+        $dsSl  = Get-RowSlots -Points $dsGeo.Points -SlotWidth 0.75 -Width $dsGeo.Width -Height $dsGeo.Height -RowAxis 'X'
+        Assert-True "render: the sample layout yields >=1 slot" ($dsSl.Valid -and $dsSl.Count -ge 1)
+        # canvas px are $cw/$ch (NOT $W/$H): PS vars are case-insensitive, so a $W
+        # canvas + a $w model dim are the SAME variable and collide. The preview uses
+        # $cw/$ch vs $w/$h to avoid exactly this; mirror it.
+        $cw = 280; $ch = 200; $margin = 18.0
+        $bmp = New-Object System.Drawing.Bitmap($cw, $ch)
+        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.Clear([System.Drawing.Color]::White)
+        # replicate the preview transform (aspect-preserving, plate-frame -> screen)
+        $w = [double]$dsGeo.Width; $h = [double]$dsGeo.Height
+        $scale = ($cw - 2*$margin) / $w; if ((($ch - 2*$margin) / $h) -lt $scale) { $scale = ($ch - 2*$margin) / $h }
+        $drawW = $w * $scale; $drawH = $h * $scale
+        $offX = ($cw - $drawW) / 2.0; $offY = ($ch - $drawH) / 2.0
+        Draw-SlotRects -Graphics $g -Slots $dsSl -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale
+        $g.Dispose()
+        # count amber-ish pixels (the fill blended over white: high R, mid-high G, low-ish B)
+        $amber = 0
+        for ($x = 0; $x -lt $cw; $x += 2) {
+            for ($y = 0; $y -lt $ch; $y += 2) {
+                $px = $bmp.GetPixel($x, $y)
+                if ($px.R -gt 235 -and $px.G -gt 205 -and $px.G -lt 250 -and $px.B -lt 235) { $amber++ }
+            }
+        }
+        $bmp.Dispose()
+        Assert-True "render: Draw-SlotRects paints amber slot bands ($amber sampled px)" ($amber -gt 20)
+    } catch {
+        Assert-True "Draw-SlotRects render harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# gui: Draw-HoleLabels -- the NUMBERED hole overlay shown on the index-hole layout
+# previews (user request 2026-07-17: number each hole so the operator knows which
+# "Hole #N" card is which physical hole). Pure drawing, so prove it (a) resolves in
+# global: scope after dot-sourcing (so the hybrid .cmd closures can call it), (b) does
+# NOT throw on null input, and (c) actually RENDERS number halos + a highlight ring
+# onto an off-screen Graphics from a real layout -- the headless evidence the
+# response-convergence harness can see. Requires System.Drawing; skips headless.
+# ----------------------------------------------------------------------------
+Write-Host "  -- gui: Draw-HoleLabels (numbered index-hole overlay) --" -ForegroundColor White
+. (Join-Path $libDir 'orthogrid_gui.ps1')
+# NOTE: this only asserts the function is DEFINED. The real global-scope-in-closure
+# invariant is gated by the hybrid child-process test above (Draw-HoleLabels must paint
+# the ring THROUGH a .GetNewClosure() handler under scriptblock::Create) - in normal
+# script scope a non-global function is still closure-visible, so this cannot gate it.
+Assert-True "Draw-HoleLabels is defined" ($null -ne (Get-Command Draw-HoleLabels -ErrorAction SilentlyContinue))
+Assert-True "Draw-HoleLabels does NOT throw on null points" (& { try { Draw-HoleLabels -Graphics $null -Points $null -OffX 0 -OffY 0 -DrawH 100 -Scale 1; $true } catch { $false } })
+if (-not $wfLoaded) {
+    Write-Host "  [SKIP] Draw-HoleLabels render assertion (System.Drawing not available headless)" -ForegroundColor DarkGray
+} else {
+    try {
+        # a 3x3 grid -> 9 numbered holes; highlight key 4 (center) rings hole #5.
+        $hlGeo = Get-OrthogridGeometry -CcX 2.0 -CcZ 2.0 -Nx 3 -Nz 3 -Edge 2.0 -ClearDia 0.75
+        Assert-True "render: the sample layout yields 9 holes" ($hlGeo.Valid -and @($hlGeo.Points).Count -eq 9)
+        # canvas px are $cw/$ch (NOT $W/$H): PS vars are case-insensitive, so a $W
+        # canvas + a $w model dim are the SAME variable and collide. Mirror the preview.
+        $cw = 320; $ch = 200; $margin = 20.0
+        $bmp = New-Object System.Drawing.Bitmap($cw, $ch)
+        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.Clear([System.Drawing.Color]::White)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $w = [double]$hlGeo.Width; $h = [double]$hlGeo.Height
+        $scale = ($cw - 2*$margin) / $w; if ((($ch - 2*$margin) / $h) -lt $scale) { $scale = ($ch - 2*$margin) / $h }
+        $drawW = $w * $scale; $drawH = $h * $scale
+        $offX = ($cw - $drawW) / 2.0; $offY = ($ch - $drawH) / 2.0
+        Draw-HoleLabels -Graphics $g -Points $hlGeo.Points -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale -HighlightKey 4
+        $g.Dispose()
+        # count dark number-halo pixels + green highlight-ring pixels
+        $halo = 0; $green = 0
+        for ($x = 0; $x -lt $cw; $x += 1) {
+            for ($y = 0; $y -lt $ch; $y += 1) {
+                $px = $bmp.GetPixel($x, $y)
+                if ($px.R -lt 120 -and $px.G -lt 130 -and $px.B -lt 160 -and ($px.R + $px.G + $px.B) -lt 330) { $halo++ }
+                if ($px.G -gt 150 -and $px.G -gt ($px.R + 30) -and $px.G -gt ($px.B + 30)) { $green++ }
+            }
+        }
+        $bmp.Dispose()
+        Assert-True "render: Draw-HoleLabels paints number halos ($halo px)" ($halo -gt 40)
+        Assert-True "render: Draw-HoleLabels rings the highlighted index ($green green px)" ($green -gt 15)
+    } catch {
+        Assert-True "Draw-HoleLabels render harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# gui: Draw-HoleCircles -- the TO-SCALE hole circles that replaced the fixed marker
+# dot on every preview (user request 2026-07-17: "draw the hole as a circle, instead
+# of a dot"). Prove it (a) resolves in global: scope, (b) no-throws on null, and (c)
+# draws the circle TO SCALE - a bigger hole diameter paints a proportionally bigger
+# crimson circle (not a fixed marker). Requires System.Drawing; skips headless.
+# ----------------------------------------------------------------------------
+Write-Host "  -- gui: Draw-HoleCircles (to-scale hole footprint) --" -ForegroundColor White
+Assert-True "Draw-HoleCircles resolves (global scope)" ($null -ne (Get-Command Draw-HoleCircles -ErrorAction SilentlyContinue))
+Assert-True "Draw-HoleCircles does NOT throw on null points" (& { try { Draw-HoleCircles -Graphics $null -Points $null -OffX 0 -OffY 0 -DrawH 100 -Scale 1 -HoleDia 0.5; $true } catch { $false } })
+if (-not $wfLoaded) {
+    Write-Host "  [SKIP] Draw-HoleCircles render assertion (System.Drawing not available headless)" -ForegroundColor DarkGray
+} else {
+    try {
+        $hcPts = @([pscustomobject]@{ X = 2.0; Z = 2.0 })   # one hole at the center of a 4x4 plate
+        $cw = 200; $ch = 200; $margin = 10.0
+        $w = 4.0; $h = 4.0
+        $scale = ($cw - 2*$margin) / $w; if ((($ch - 2*$margin) / $h) -lt $scale) { $scale = ($ch - 2*$margin) / $h }
+        $drawW = $w * $scale; $drawH = $h * $scale; $offX = ($cw - $drawW) / 2.0; $offY = ($ch - $drawH) / 2.0
+        $countRed = {
+            param($dia)
+            $bmp = New-Object System.Drawing.Bitmap($cw, $ch); $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::White); $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            Draw-HoleCircles -Graphics $g -Points $hcPts -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale -HoleDia $dia
+            $g.Dispose(); $n = 0
+            for ($x=0; $x -lt $cw; $x++) { for ($y=0; $y -lt $ch; $y++) { $p=$bmp.GetPixel($x,$y); if ($p.R -gt 200 -and $p.R -ge $p.G -and ($p.R-$p.B) -gt 20) { $n++ } } }
+            $bmp.Dispose(); return $n
+        }
+        $rBig = & $countRed 2.0; $rSmall = & $countRed 0.5
+        Assert-True "render: Draw-HoleCircles paints a hole circle ($rBig px for a 2.0 hole)" ($rBig -gt 200)
+        Assert-True "render: the circle scales with diameter (2.0 hole $rBig px >> 0.5 hole $rSmall px)" ($rBig -gt ($rSmall * 4))
+    } catch {
+        Assert-True "Draw-HoleCircles render harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# RAIL RESIZE REPAINT: the breadcrumb rail paints pills at WIDTH-PROPORTIONAL X
+# positions ($slot = ClientWidth / N), so a maximize/restore that STRETCHES the
+# Right-anchored rail must force a FULL repaint or the old pills stay drawn at
+# their old-width positions -> the "duplicated progress chart" bug (user 2026-07-21).
+# The fix wires a full invalidate on every resize; these tests guard it two ways.
+# ----------------------------------------------------------------------------
+Write-Host "  -- rail resize repaint (duplicate-breadcrumb guard) --" -ForegroundColor White
+
+# (1) SOURCE-LEVEL (deterministic, headless-safe): the wizard source must wire the
+# rail's resize to a full invalidate, and request ResizeRedraw. If either is
+# deleted the duplicate can silently return, so lock the wiring in the source text.
+$wizSrc = Get-Content -Raw (Join-Path $libDir 'wizard.ps1')
+Assert-True "rail wires Add_Resize -> Invalidate" ($wizSrc -match '\$rail\.Add_Resize\(\{[^}]*\.Invalidate\(\)')
+Assert-True "rail requests ResizeRedraw (full-surface repaint on resize)" ($wizSrc -match "GetProperty\('ResizeRedraw'")
+
+# (2) BEHAVIORAL (WinForms; skips headless): drive a live wizard, then GROW the form
+# and assert (a) the Right-anchored rail actually widened with it, and (b) resizing
+# raised no handler error. This proves the anchor+resize path runs end to end; the
+# proportional Paint plus the full invalidate on that resize are what clear the
+# stale pills. We count the rail's Paint invocations across the resize to confirm a
+# repaint was actually triggered (a resize with no repaint is exactly the bug).
+# 3 phases: (0) force a known NORMAL-state baseline width + settle; (1) attach a
+# paint counter, record the baseline, then GROW; (2) read the grown width + paint
+# count. The baseline phase matters because the form may open MAXIMIZED (the real
+# app does), and the Maximized->Normal transition itself shrinks the width - so a
+# naive "grow" from a maximized start reads a smaller Normal width and flakes.
+if (-not $wfLoaded) {
+    Write-Host "  [SKIP] rail resize behavioral drive (WinForms not available headless)" -ForegroundColor DarkGray
+} else {
+    try {
+        $logPath = Join-Path ([System.IO.Path]::GetTempPath()) 'drilljig-gui-error.log'
+        $beforeLen = if (Test-Path $logPath) { (Get-Item $logPath).Length } else { 0 }
+        $script:rzErr        = $null
+        $script:railW0       = 0
+        $script:railW1       = 0
+        $script:rzResized    = $false   # gate: only record clip widths for paints AFTER the grow
+        $script:rzMaxClipW   = 0        # widest ClipRectangle seen in a post-resize paint
+        $script:rzPostPaints = 0        # count of paints observed after the grow
+        $rzSteps = @(
+            (New-WizardStep -Key A -Title A -Stage A -Build { param($p,$c,$w) $l=New-Object System.Windows.Forms.Label; $l.Text='x'; $p.Controls.Add($l) } -Validate { param($c) $true } -OnNext { param($c,$w) $true }),
+            (New-WizardStep -Key B -Title B -Stage B -Build { param($p,$c,$w) $l=New-Object System.Windows.Forms.Label; $l.Text='x'; $p.Controls.Add($l) } -Validate { param($c) $true } -OnNext { param($c,$w) $true }),
+            (New-WizardStep -Key C -Title C -Stage C -Build { param($p,$c,$w) $l=New-Object System.Windows.Forms.Label; $l.Text='x'; $p.Controls.Add($l) } -Validate { param($c) $true } -OnNext { param($c,$w) $true })
+        )
+        $rzTimer = New-Object System.Windows.Forms.Timer
+        $rzTimer.Interval = 350
+        $script:rzPhase = 0
+        $rzTimer.Add_Tick({
+            try {
+                $f = [System.Windows.Forms.Application]::OpenForms | Where-Object { $_.Text -eq 'RESIZE-TEST' } | Select-Object -First 1
+                if ($null -eq $f) { return }
+                # locate the rail: the Right-anchored Panel at (0,0) that owns no child controls
+                $rail = $null
+                foreach ($ctl in $f.Controls) {
+                    if ($ctl -is [System.Windows.Forms.Panel] -and $ctl.Location.X -eq 0 -and $ctl.Location.Y -eq 0) { $rail = $ctl; break }
+                }
+                if ($null -eq $rail) { return }
+                if ($script:rzPhase -eq 0) {
+                    # force a deterministic NORMAL-state baseline (the form may open maximized)
+                    $f.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+                    $f.Width = 900
+                    $script:rzPhase = 1
+                } elseif ($script:rzPhase -eq 1) {
+                    # Attach a paint OBSERVER that records the CLIP-RECT WIDTH of paints that
+                    # fire after the grow. This is what DISCRIMINATES the fix: a resize with the
+                    # full-invalidate wiring repaints the WHOLE client rect (clip width ~= the new
+                    # rail width); a broken/reverted rail (partial invalidate on grow) would only
+                    # repaint the newly-exposed strip (clip width ~= the +260 growth). We do NOT
+                    # call Refresh() here (that would force a full synchronous repaint regardless
+                    # of the fix and mask the difference) -- we let the NATURAL resize-driven
+                    # WM_PAINT flush via the message loop before the next tick.
+                    $rail.Add_Paint({
+                        param($s2,$e2)
+                        if ($script:rzResized) {
+                            $script:rzPostPaints++
+                            $cwid = $e2.ClipRectangle.Width
+                            if ($cwid -gt $script:rzMaxClipW) { $script:rzMaxClipW = $cwid }
+                        }
+                    })
+                    $script:railW0 = $rail.ClientSize.Width
+                    $script:rzResized = $true
+                    $f.Width = $f.Width + 260
+                    $script:rzPhase = 2
+                } elseif ($script:rzPhase -eq 2) {
+                    $script:railW1 = $rail.ClientSize.Width
+                    $rzTimer.Stop()
+                    try { $f.Close() } catch {}
+                }
+            } catch { $script:rzErr = $_.Exception.Message; $rzTimer.Stop() }
+        })
+        $rzTimer.Start()
+        [void](Show-Wizard -Steps $rzSteps -Stages @('A','B','C') -Title 'RESIZE-TEST' -Context @{})
+        $rzTimer.Dispose()
+        $afterLen = if (Test-Path $logPath) { (Get-Item $logPath).Length } else { 0 }
+
+        Assert-True "rail resize: no handler error during resize" ($null -eq $script:rzErr) ("err: {0}" -f $script:rzErr)
+        Assert-True "rail resize: Right-anchored rail widened with the form ($($script:railW0) -> $($script:railW1))" ($script:railW1 -gt $script:railW0)
+        Assert-True "rail resize: a repaint fired across the resize ($($script:rzPostPaints) post-resize paints)" ($script:rzPostPaints -gt 0)
+        # DISCRIMINATING: the resize-driven repaint covered the FULL rail width (>= the old width),
+        # not just the newly-exposed strip. This distinguishes the full-invalidate fix from the
+        # broken partial-invalidate behavior (which would clip to ~the +260 growth strip, well
+        # below the old width). This assertion FAILS if the Add_Resize/ResizeRedraw wiring is reverted.
+        Assert-True "rail resize: repaint covered the FULL width, not just the new strip (clip $($script:rzMaxClipW) >= old width $($script:railW0))" ($script:rzMaxClipW -ge $script:railW0)
+        Assert-True "rail resize: no NEW error-log entries" ($afterLen -le $beforeLen)
+    } catch {
+        Assert-True "rail resize harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
+    }
+}
 
 # ----------------------------------------------------------------------------
 Write-Host ""

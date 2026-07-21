@@ -103,6 +103,119 @@ $gcBad = Get-OrthogridGeometry -CcX 2.0 -CcZ 1.5 -Nx 4 -Nz 3 -Edge 0.5 -ClearDia
 Assert-True "ClearDia<0 -> Valid false" (-not $gcBad.Valid)
 
 # ----------------------------------------------------------------------------
+# HoleDia: hole-collision (intersection) check. A center-to-center spacing < the
+# hole diameter means adjacent bores overlap; == is tangent (allowed). Default 0
+# is OFF (backwards-compatible).
+# ----------------------------------------------------------------------------
+Write-Host "  -- orthogrid: HoleDia (hole-collision check) --" -ForegroundColor White
+
+# baseline: no HoleDia passed -> check OFF, echoes 0, valid.
+$hdOff = Get-OrthogridGeometry -CcX 0.2 -CcZ 0.2 -Nx 4 -Nz 3 -Edge 0.5
+Assert-True "HoleDia omitted -> check OFF (tight ccX still Valid)" ($hdOff.Valid)
+Assert-True "HoleDia defaults to 0 (echoed)" (Approx $hdOff.HoleDia 0.0)
+
+# ccX (0.4) < hole dia (0.5) with Nx>=2 -> overlap along X -> Valid false.
+$hdX = Get-OrthogridGeometry -CcX 0.4 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.5 -HoleDia 0.5
+Assert-True "ccX < HoleDia (Nx>=2) -> Valid false" (-not $hdX.Valid)
+Assert-True "ccX collision -> Errors non-empty" ($hdX.Errors.Count -ge 1)
+Assert-True "ccX collision -> message names X overlap" (@($hdX.Errors | Where-Object { $_ -match 'along X' }).Count -ge 1)
+Assert-True "HoleDia echoed on result" (Approx $hdX.HoleDia 0.5)
+
+# ccZ (0.3) < hole dia (0.5) with Nz>=2 -> overlap along Z -> Valid false.
+$hdZ = Get-OrthogridGeometry -CcX 1.0 -CcZ 0.3 -Nx 4 -Nz 3 -Edge 0.5 -HoleDia 0.5
+Assert-True "ccZ < HoleDia (Nz>=2) -> Valid false" (-not $hdZ.Valid)
+Assert-True "ccZ collision -> message names Z overlap" (@($hdZ.Errors | Where-Object { $_ -match 'along Z' }).Count -ge 1)
+
+# both axes too tight -> both errors collected (does not short-circuit).
+$hdBoth = Get-OrthogridGeometry -CcX 0.4 -CcZ 0.3 -Nx 4 -Nz 3 -Edge 0.5 -HoleDia 0.5
+Assert-True "both axes tight -> 2 collision errors" ($hdBoth.Errors.Count -ge 2)
+
+# TANGENT: spacing exactly == hole dia is allowed (edges touch, no overlap).
+$hdTan = Get-OrthogridGeometry -CcX 0.5 -CcZ 0.5 -Nx 4 -Nz 3 -Edge 0.5 -HoleDia 0.5
+Assert-True "ccX == ccZ == HoleDia (tangent) -> Valid" ($hdTan.Valid)
+
+# spacing comfortably above the hole dia -> Valid.
+$hdOk = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.5 -HoleDia 0.5
+Assert-True "spacing > HoleDia -> Valid" ($hdOk.Valid)
+
+# single column (Nx=1): no same-axis neighbour along X, so a tiny ccX does NOT
+# collide (there is only one hole per row along X). ccZ still governs.
+$hdNx1 = Get-OrthogridGeometry -CcX 0.1 -CcZ 1.0 -Nx 1 -Nz 3 -Edge 0.5 -HoleDia 0.5
+Assert-True "Nx=1 -> tiny ccX does NOT collide (no X neighbour)" ($hdNx1.Valid)
+# single row (Nz=1): tiny ccZ does not collide.
+$hdNz1 = Get-OrthogridGeometry -CcX 1.0 -CcZ 0.1 -Nx 4 -Nz 1 -Edge 0.5 -HoleDia 0.5
+Assert-True "Nz=1 -> tiny ccZ does NOT collide (no Z neighbour)" ($hdNz1.Valid)
+# 1x1 with any spacing -> no neighbours at all -> Valid.
+$hd1x1 = Get-OrthogridGeometry -CcX 0.1 -CcZ 0.1 -Nx 1 -Nz 1 -Edge 0.5 -HoleDia 0.5
+Assert-True "1x1 -> no neighbours -> collision check trivially passes" ($hd1x1.Valid)
+
+# negative HoleDia is invalid (never throws).
+$hdNeg = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.5 -HoleDia -0.5
+Assert-True "HoleDia<0 -> Valid false" (-not $hdNeg.Valid)
+# collision check never throws on all-bad input.
+$threwHd = $false
+try { $null = Get-OrthogridGeometry -CcX 0.1 -CcZ 0.1 -Nx 3 -Nz 3 -Edge 0.5 -HoleDia 0.9 } catch { $threwHd = $true }
+Assert-True "HoleDia collision path does NOT throw" (-not $threwHd)
+
+# ----------------------------------------------------------------------------
+# HoleDia edge-margin check: the edge margin (wall from a border hole to the part
+# edge) must be at least the hole RADIUS. Edge < HoleDia/2 -> a hole sits less than
+# one radius from the part edge -> Error. == radius is tangent (allowed). OFF at
+# HoleDia 0.
+# ----------------------------------------------------------------------------
+Write-Host "  -- orthogrid: HoleDia edge-margin (Edge >= hole radius) --" -ForegroundColor White
+
+# Edge 0.2 < hole radius 0.25 -> Valid false. CcX/CcZ = 1 >= HoleDia so the edge
+# margin is the SOLE fault. (ClearDia 0.5 mirrors the GUI; it does not change this.)
+$emSmall = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.2 -ClearDia 0.5 -HoleDia 0.5
+Assert-True "Edge < hole radius -> Valid false" (-not $emSmall.Valid)
+Assert-True "edge-margin fault -> message names the edge margin" (@($emSmall.Errors | Where-Object { $_ -match 'edge margin' }).Count -ge 1)
+# tangent: Edge exactly == hole radius is allowed.
+$emTan = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.25 -ClearDia 0.5 -HoleDia 0.5
+Assert-True "Edge == hole radius (tangent) -> Valid" ($emTan.Valid)
+# Edge comfortably above the radius -> Valid.
+$emOk = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.5 -ClearDia 0.5 -HoleDia 0.5
+Assert-True "Edge > hole radius -> Valid" ($emOk.Valid)
+# HoleDia OFF -> a tiny edge margin is NOT flagged (backwards-compatible).
+$emOff = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.01
+Assert-True "HoleDia omitted -> tiny edge margin still Valid" ($emOff.Valid)
+# single hole (Nx=1,Nz=1) is STILL edge-checked (it too must clear the part edge).
+$em1 = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 1 -Nz 1 -Edge 0.1 -ClearDia 0.5 -HoleDia 0.5
+Assert-True "Nx=1,Nz=1 with Edge < radius -> Valid false" (-not $em1.Valid)
+# collision AND a too-small edge margin -> at least 2 distinct errors collected.
+$emBoth = Get-OrthogridGeometry -CcX 0.3 -CcZ 0.3 -Nx 4 -Nz 3 -Edge 0.1 -ClearDia 0.5 -HoleDia 0.5
+Assert-True "collision + edge margin both fail -> >= 2 errors" ($emBoth.Errors.Count -ge 2)
+
+# --- EdgeMargin knob (user 2026-07-21): wall = HoleDia, shared with the custom fn ----
+# The editors lock Edge = holeDia AND pass -EdgeMargin = holeDia so the orthogrid check
+# + echoed .EdgeMargin agree with the custom family. Default (-1) stays byte-identical.
+Write-Host "  -- orthogrid: EdgeMargin (wall = hole diameter) --" -ForegroundColor White
+# omitted -> echo is one radius (legacy), and the check is the one-radius rule.
+$ogLegacy = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.25 -ClearDia 0.5 -HoleDia 0.5
+Assert-True "orthogrid EdgeMargin omitted -> echo = one radius (HoleDia/2)" (Approx $ogLegacy.EdgeMargin 0.25)
+Assert-True "orthogrid EdgeMargin omitted -> Edge==radius still Valid (legacy)" ($ogLegacy.Valid)
+# GIVEN EdgeMargin = dia (0.5): Edge = radius (0.25) now FAILS (< required 0.5).
+$ogTight = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 4 -Nz 3 -Edge 0.25 -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "orthogrid EdgeMargin=dia -> Edge==radius now Valid false" (-not $ogTight.Valid)
+Assert-True "orthogrid EdgeMargin=dia -> message names the required edge margin" (@($ogTight.Errors | Where-Object { $_ -match 'required edge margin' }).Count -ge 1)
+# Edge = dia (the locked-field value) -> tangent, Valid, and .EdgeMargin echoes the dia.
+$ogLocked = Get-OrthogridGeometry -CcX 2.0 -CcZ 1.5 -Nx 4 -Nz 3 -Edge 0.5 -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "orthogrid EdgeMargin=dia + Edge=dia -> Valid (tangent)" ($ogLocked.Valid)
+Assert-True "orthogrid EdgeMargin=dia -> echoed on result" (Approx $ogLocked.EdgeMargin 0.5)
+# the locked orthogrid geometry's border wall (near + far) is one full diameter.
+$ins = $ogLocked.Points[0].X   # inset = Edge + ClearDia/2 = 0.5 + 0.25 = 0.75
+Assert-True "orthogrid EdgeMargin=dia -> near border wall = one diameter" (Approx ($ins - 0.5/2.0) 0.5)
+$lastOg = ($ogLocked.Points | ForEach-Object { $_.X } | Measure-Object -Maximum).Maximum
+Assert-True "orthogrid EdgeMargin=dia -> far border wall = one diameter" (Approx ($ogLocked.Width - $lastOg - 0.5/2.0) 0.5)
+# .EdgeMargin is present on BOTH result families (shape parity).
+$ogShape = Get-OrthogridGeometry -CcX 1.0 -CcZ 1.0 -Nx 2 -Nz 2 -Edge 0.25
+Assert-True "orthogrid result carries .EdgeMargin (shape parity with custom)" (($ogShape.PSObject.Properties.Name) -contains 'EdgeMargin')
+# never throws with EdgeMargin.
+$threwOgEm = $false
+try { $null = Get-OrthogridGeometry -CcX 0 -CcZ 0 -Nx 0 -Nz 0 -Edge -1 -HoleDia 0.5 -EdgeMargin 0.5 } catch { $threwOgEm = $true }
+Assert-True "orthogrid EdgeMargin path does NOT throw on bad input" (-not $threwOgEm)
+
+# ----------------------------------------------------------------------------
 # Single-column / single-row edge cases (Nx=1, Nz=1)
 # ----------------------------------------------------------------------------
 Write-Host "  -- orthogrid: Nx=1 / Nz=1 edge cases --" -ForegroundColor White
@@ -545,6 +658,157 @@ $cp1 = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 2.0; Z = 3.0 })
 Assert-True "custom: single point is valid" ($cp1.Valid -and $cp1.Count -eq 1)
 Assert-True "custom: single-point derived Width = X" (Approx $cp1.Width 2.0)
 
+# --- HoleDia pairwise hole-collision check (custom layout) ------------------
+# NOTE: these pass -ClearDia 0.5 alongside -HoleDia 0.5 to mirror the GUI (which
+# always sets ClearDia = the hole dia), so the DERIVED plate includes the bore
+# clearance and the outermost hole's far-edge wall is exactly one radius (tangent,
+# allowed by the edge-margin check below). Without ClearDia the derived plate would
+# be maxX (no clearance) and the far bore would overhang -- an unrealistic setup.
+Write-Host "  -- custom points: HoleDia (pairwise collision) --" -ForegroundColor White
+# two holes 0.3 apart along X, hole dia 0.5 -> bores overlap -> Valid false.
+$cpCol = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 1.3; Z = 1.0 }
+) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: two holes < HoleDia apart -> Valid false" (-not $cpCol.Valid)
+Assert-True "custom: collision -> Errors non-empty" ($cpCol.Errors.Count -ge 1)
+Assert-True "custom: collision message names both holes' coords" (@($cpCol.Errors | Where-Object { $_ -match 'overlap' }).Count -ge 1)
+Assert-True "custom: HoleDia echoed on result" (Approx $cpCol.HoleDia 0.5)
+# diagonal distance: (0,0)&(0.3,0.3) -> dist ~0.424 < 0.5 -> overlap.
+$cpDiag = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 1.3; Z = 1.3 }
+) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: diagonal spacing < HoleDia -> Valid false" (-not $cpDiag.Valid)
+# spacing >= HoleDia in every pair -> Valid.
+$cpOk = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 2.0; Z = 1.0 }
+    [pscustomobject]@{ X = 1.0; Z = 2.0 }
+) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: all pairs >= HoleDia -> Valid" ($cpOk.Valid)
+# tangent: exactly one hole dia apart -> allowed.
+$cpTan = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 1.5; Z = 1.0 }
+) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: exactly HoleDia apart (tangent) -> Valid" ($cpTan.Valid)
+# HoleDia omitted -> check OFF even for tightly packed points.
+$cpOff = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 1.05; Z = 1.0 }
+)
+Assert-True "custom: HoleDia omitted -> collision check OFF (Valid)" ($cpOff.Valid)
+Assert-True "custom: HoleDia defaults to 0 (echoed)" (Approx $cpOff.HoleDia 0.0)
+# only ONE hole -> nothing to collide with, check trivially passes.
+$cp1hd = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 2.0; Z = 3.0 }) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: single hole + HoleDia -> Valid (no pair)" ($cp1hd.Valid)
+# many-collision cap: 6 coincident-ish holes all overlap; report is capped but Valid stays false.
+$cpMany = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.00; Z = 1.0 }
+    [pscustomobject]@{ X = 1.05; Z = 1.0 }
+    [pscustomobject]@{ X = 1.10; Z = 1.0 }
+    [pscustomobject]@{ X = 1.15; Z = 1.0 }
+    [pscustomobject]@{ X = 1.20; Z = 1.0 }
+) -HoleDia 0.5 -WidthOverride 10.0 -HeightOverride 10.0
+Assert-True "custom: many collisions -> Valid false" (-not $cpMany.Valid)
+Assert-True "custom: many collisions -> summary line present" (@($cpMany.Errors | Where-Object { $_ -match 'more overlapping' }).Count -ge 1)
+# negative HoleDia -> Valid false (never throws).
+$cpHdNeg = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 1.0; Z = 1.0 }, [pscustomobject]@{ X = 3.0; Z = 3.0 }) -HoleDia -0.5
+Assert-True "custom: negative HoleDia -> Valid false" (-not $cpHdNeg.Valid)
+$threwCpHd = $false
+try { $null = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 1.0; Z = 1.0 }, [pscustomobject]@{ X = 1.01; Z = 1.0 }) -HoleDia 0.9 } catch { $threwCpHd = $true }
+Assert-True "custom: HoleDia collision path does NOT throw" (-not $threwCpHd)
+
+# --- HoleDia edge-margin check (custom): each hole keeps >= radius wall to edge --
+Write-Host "  -- custom points: HoleDia edge-margin (hole vs part edge) --" -ForegroundColor White
+# a hole typed 0.1 from the near datum edge with a 0.5 hole runs OFF the edge
+# (wall = 0.1 - 0.25 = -0.15 < radius) -> Valid false.
+$emNear = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.1; Z = 2.0 }) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: hole within a radius of the near edge -> Valid false" (-not $emNear.Valid)
+Assert-True "custom: edge fault -> message names the part edge" (@($emNear.Errors | Where-Object { $_ -match 'part edge' }).Count -ge 1)
+# a hole well inside an explicit part -> Valid.
+$emFar = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 1.0; Z = 1.0 }) -HoleDia 0.5 -ClearDia 0.5 -WidthOverride 3.0 -HeightOverride 3.0
+Assert-True "custom: hole >= radius from every edge -> Valid" ($emFar.Valid)
+# tangent: a hole with exactly one radius of wall on every side (center a full
+# diameter from the near edges; derived far wall == radius) -> allowed.
+$emTanC = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.5; Z = 0.5 }) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "custom: exactly one radius of wall (tangent) -> Valid" ($emTanC.Valid)
+# HoleDia OFF -> a near-edge hole is NOT edge-checked (backwards-compatible).
+$emOffC = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.1; Z = 2.0 })
+Assert-True "custom: HoleDia omitted -> near-edge hole still Valid" ($emOffC.Valid)
+# cap: 6 holes all hugging the near X edge, spaced in Z so they do NOT collide ->
+# capped edge messages + summary, Valid stays false.
+$emMany = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 0.1; Z = 1.0 }
+    [pscustomobject]@{ X = 0.1; Z = 1.7 }
+    [pscustomobject]@{ X = 0.1; Z = 2.4 }
+    [pscustomobject]@{ X = 0.1; Z = 3.1 }
+    [pscustomobject]@{ X = 0.1; Z = 3.8 }
+    [pscustomobject]@{ X = 0.1; Z = 4.5 }
+) -HoleDia 0.5 -ClearDia 0.5 -WidthOverride 5.0 -HeightOverride 6.0
+Assert-True "custom: many near-edge holes -> Valid false" (-not $emMany.Valid)
+Assert-True "custom: many near-edge holes -> summary line present" (@($emMany.Errors | Where-Object { $_ -match 'more hole' }).Count -ge 1)
+
+# --- EdgeMargin: wall = HoleDia (user 2026-07-21) -------------------------------
+# The drilljig flow passes -EdgeMargin = the hole dia so EVERY border wall is one full
+# hole diameter (not just one radius). The legacy default (-1, unspecified) must stay
+# byte-identical, so these tests explicitly pass -EdgeMargin to exercise the new rule.
+Write-Host "  -- custom points: EdgeMargin (wall = hole diameter) --" -ForegroundColor White
+
+# DEFAULT (EdgeMargin omitted / -1) is the legacy one-radius rule: derived Width still
+# = maxX + ClearDia, and EdgeMargin is echoed as the resolved one-radius wall.
+$emLegacy = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 2.0; Z = 1.0 }
+) -ClearDia 0.5 -HoleDia 0.5
+Assert-True "EdgeMargin omitted -> derived Width = maxX + ClearDia (legacy)" (Approx $emLegacy.Width 2.5)
+Assert-True "EdgeMargin omitted -> echoed as one radius (HoleDia/2)" (Approx $emLegacy.EdgeMargin 0.25)
+
+# GIVEN EdgeMargin = HoleDia (0.5): DERIVED far clearance = ClearDia/2 + EdgeMargin =
+# 0.25 + 0.5 = 0.75, so Width = maxX(2.0) + 0.75 = 2.75 (= maxX + 1.5*HoleDia).
+$emDia = Get-CustomPointsGeometry -Points @(
+    [pscustomobject]@{ X = 1.0; Z = 1.0 }
+    [pscustomobject]@{ X = 2.0; Z = 1.0 }
+) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "EdgeMargin=dia -> derived Width = maxX + 1.5*HoleDia" (Approx $emDia.Width 2.75)
+Assert-True "EdgeMargin=dia -> Valid (derived far wall = one diameter, tangent)" ($emDia.Valid)
+Assert-True "EdgeMargin=dia -> echoed on result" (Approx $emDia.EdgeMargin 0.5)
+# the FAR hole's actual wall = Width - maxX - HoleDia/2 = 2.75 - 2.0 - 0.25 = 0.5 = dia.
+Assert-True "EdgeMargin=dia -> far wall equals one full diameter" (Approx ($emDia.Width - 2.0 - 0.25) 0.5)
+
+# a hole with only one RADIUS of wall (tangent under the LEGACY rule) is now REJECTED
+# under EdgeMargin = dia. Derived plate {0.5,0.5} single point: near wall = 0.5 - 0.25
+# = 0.25 = radius < required 0.5.
+$emTight = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.5; Z = 0.5 }) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "EdgeMargin=dia -> a one-radius wall is now Valid false" (-not $emTight.Valid)
+Assert-True "EdgeMargin=dia -> the SAME layout is Valid under the legacy rule" `
+    ((Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.5; Z = 0.5 }) -ClearDia 0.5 -HoleDia 0.5).Valid)
+# a hole placed one full diameter in (center at 1.5*dia = 0.75) is a clean tangent -> Valid.
+$emJustOk = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.75; Z = 0.75 }) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "EdgeMargin=dia -> hole one diameter in (tangent) -> Valid" ($emJustOk.Valid)
+
+# EdgeMargin also tightens an EXPLICIT plate: a plate that satisfied the radius rule but
+# not the diameter rule now fails. Hole at X=0.4 in a 3x3 plate: near wall = 0.4-0.25 =
+# 0.15 < 0.5 -> fail; message names the required edge margin.
+$emExpl = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.4; Z = 1.5 }) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5 -WidthOverride 3.0 -HeightOverride 3.0
+Assert-True "EdgeMargin=dia -> explicit plate wall < dia -> Valid false" (-not $emExpl.Valid)
+Assert-True "EdgeMargin=dia -> message names the required edge margin" (@($emExpl.Errors | Where-Object { $_ -match 'required edge margin' }).Count -ge 1)
+# EdgeMargin = 0 is a legal explicit value (require only that the bore not cross the edge).
+$em0 = Get-CustomPointsGeometry -Points @([pscustomobject]@{ X = 0.25; Z = 0.25 }) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.0
+Assert-True "EdgeMargin=0 -> bore tangent to the edge is allowed (Valid)" ($em0.Valid)
+# never throws with EdgeMargin on all-bad input.
+$threwEm = $false
+try { $null = Get-CustomPointsGeometry -Points $null -ClearDia -1 -HoleDia 0.5 -EdgeMargin 0.5 } catch { $threwEm = $true }
+Assert-True "EdgeMargin path does NOT throw on bad input" (-not $threwEm)
+
+# INDEX-RELATIVE wrapper threads EdgeMargin through to the inner geometry.
+$emIdx = Get-IndexRelativeCustomGeometry -IndexX 0.75 -IndexZ 0.75 -OtherPoints @([pscustomobject]@{ X = 1.0; Z = 0.0 }) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "index-relative: EdgeMargin threaded -> resolved echo = 0.5" (Approx $emIdx.EdgeMargin 0.5)
+Assert-True "index-relative: index one diameter in -> Valid (tangent)" ($emIdx.Valid)
+$emIdxTight = Get-IndexRelativeCustomGeometry -IndexX 0.25 -IndexZ 0.25 -OtherPoints @() -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5
+Assert-True "index-relative: index only a radius in -> Valid false under EdgeMargin=dia" (-not $emIdxTight.Valid)
+
 # bad input: empty list, negative coord, negative ClearDia -> Valid false, no throw.
 $cpEmpty = Get-CustomPointsGeometry -Points @()
 Assert-True "custom: empty list -> Valid false" (-not $cpEmpty.Valid)
@@ -568,6 +832,99 @@ Assert-True "custom: malformed point -> Valid false (reported)" ($null -ne $cpMa
 $threwCp2 = $false
 try { $null = Get-CustomPointsGeometry -Points $null -ClearDia -9.0 -WidthOverride "bad" } catch { $threwCp2 = $true }
 Assert-True "custom: Get-CustomPointsGeometry does NOT throw on bad input" (-not $threwCp2)
+
+# ----------------------------------------------------------------------------
+# Get-IndexRelativeCustomGeometry -- INDEX-CENTRIC custom layout (user 2026-07-21).
+# The operator enters the INDEX hole as an offset from the plate corner, then every
+# OTHER hole as an offset FROM the index. Wrapper over Get-CustomPointsGeometry: builds
+# the absolute list (index FIRST at Points[0]) and tags IndexRelative/IndexGridX/Z.
+# ----------------------------------------------------------------------------
+Write-Host "  -- custom points: Get-IndexRelativeCustomGeometry --" -ForegroundColor White
+
+# basic: index (2,3) + others (1,0),(0,2) FROM the index -> abs (2,3),(3,3),(2,5)
+$ir = Get-IndexRelativeCustomGeometry -IndexX 2 -IndexZ 3 -OtherPoints @(
+    [pscustomobject]@{ X = 1.0; Z = 0.0 }
+    [pscustomobject]@{ X = 0.0; Z = 2.0 }
+)
+Assert-True "idxrel: Valid on good input"          ($ir.Valid)
+Assert-True "idxrel: Mode = 'custom'"              ($ir.Mode -eq 'custom')
+Assert-True "idxrel: IndexRelative = true"         ($ir.IndexRelative -eq $true)
+Assert-True "idxrel: IndexGridX/Z = index coords"  ((Approx $ir.IndexGridX 2.0) -and (Approx $ir.IndexGridZ 3.0))
+Assert-True "idxrel: Count = index + others"       ($ir.Count -eq 3)
+# index is FIRST at Points[0] (IndexKey=0 downstream), others are index + offset.
+Assert-True "idxrel: Points[0] IS the index (2,3)" ((Approx $ir.Points[0].X 2.0) -and (Approx $ir.Points[0].Z 3.0))
+Assert-True "idxrel: Points[1] = index + (1,0)"    ((Approx $ir.Points[1].X 3.0) -and (Approx $ir.Points[1].Z 3.0))
+Assert-True "idxrel: Points[2] = index + (0,2)"    ((Approx $ir.Points[2].X 2.0) -and (Approx $ir.Points[2].Z 5.0))
+# shape-compatible with the orthogrid result (same members every $orthoGeo consumer reads)
+$irMembers = @('Valid','Errors','Mode','CcX','CcZ','Nx','Nz','Edge','ClearDia','Width','Height','Count','Points')
+$irNames = @($ir.PSObject.Properties.Name)
+$irMissing = @($irMembers | Where-Object { $irNames -notcontains $_ })
+Assert-True "idxrel: shape-compatible with orthogrid result" ($irMissing.Count -eq 0) ("missing: " + ($irMissing -join ','))
+Assert-True "idxrel: carries the 3 index members" `
+    (($irNames -contains 'IndexRelative') -and ($irNames -contains 'IndexGridX') -and ($irNames -contains 'IndexGridZ'))
+
+# DOWNSTREAM RECOVERY: Get-SharedPlanePlan on the absolute points, minus the index,
+# recovers exactly the typed RELATIVE offsets (and the index column/row shifts to 0 --
+# the anchor plane STAGE 2.5 reuses). This is the load-bearing round-trip.
+$irPlan = Get-SharedPlanePlan -Points $ir.Points
+$irRelX = @($irPlan.XCoords | ForEach-Object { [math]::Round([double]$_ - $ir.IndexGridX, 6) })
+$irRelZ = @($irPlan.ZCoords | ForEach-Object { [math]::Round([double]$_ - $ir.IndexGridZ, 6) })
+Assert-True "idxrel: recovered X offsets = {0,1} (index col -> 0)" `
+    ((@($irRelX | Where-Object { [math]::Abs($_) -le 1e-6 }).Count -eq 1) -and (@($irRelX | Where-Object { (Approx $_ 1.0) }).Count -eq 1))
+Assert-True "idxrel: recovered Z offsets = {0,2} (index row -> 0)" `
+    ((@($irRelZ | Where-Object { [math]::Abs($_) -le 1e-6 }).Count -eq 1) -and (@($irRelZ | Where-Object { (Approx $_ 2.0) }).Count -eq 1))
+
+# index-ONLY (no others) -> single point at the index, Valid.
+$irOnly = Get-IndexRelativeCustomGeometry -IndexX 1.5 -IndexZ 1.5
+Assert-True "idxrel: index-only -> 1 point, Valid" ($irOnly.Valid -and $irOnly.Count -eq 1 -and (Approx $irOnly.Points[0].X 1.5) -and (Approx $irOnly.Points[0].Z 1.5))
+
+# $null / @() OtherPoints -> just the index (no throw).
+$irNullOth = Get-IndexRelativeCustomGeometry -IndexX 1.0 -IndexZ 1.0 -OtherPoints $null
+Assert-True "idxrel: null OtherPoints -> index only, Valid" ($irNullOth.Valid -and $irNullOth.Count -eq 1)
+$irEmptyOth = Get-IndexRelativeCustomGeometry -IndexX 1.0 -IndexZ 1.0 -OtherPoints @()
+Assert-True "idxrel: empty OtherPoints -> index only, Valid" ($irEmptyOth.Valid -and $irEmptyOth.Count -eq 1)
+
+# index KEPT even at the corner (0,0): KeepOrigin forces it to survive (Points[0] identity).
+$irZero = Get-IndexRelativeCustomGeometry -IndexX 0.0 -IndexZ 0.0 -OtherPoints @([pscustomobject]@{ X = 1.0; Z = 1.0 })
+Assert-True "idxrel: index at corner (0,0) is KEPT (not dropped)" `
+    ($irZero.Count -eq 2 -and (Approx $irZero.Points[0].X 0.0) -and (Approx $irZero.Points[0].Z 0.0))
+
+# negative INDEX offset (index measured from the corner must be >= 0).
+$irNegIdx = Get-IndexRelativeCustomGeometry -IndexX -1.0 -IndexZ 2.0
+Assert-True "idxrel: negative index X -> Valid false" (-not $irNegIdx.Valid)
+Assert-True "idxrel: negative index X -> Errors non-empty" ($irNegIdx.Errors.Count -ge 1)
+
+# other-hole offset that pushes the ABSOLUTE coord off the near edge (< 0): ONE clear
+# error, and NOT the duplicate "X must be >= 0" from Get-CustomPointsGeometry.
+$irOff = Get-IndexRelativeCustomGeometry -IndexX 1.0 -IndexZ 1.0 -OtherPoints @([pscustomobject]@{ X = -3.0; Z = 0.0 })
+Assert-True "idxrel: other-hole off the near edge -> Valid false" (-not $irOff.Valid)
+Assert-True "idxrel: off-edge other -> EXACTLY one error (no duplicate)" ($irOff.Errors.Count -eq 1)
+Assert-True "idxrel: off-edge other -> message names the near edge" ($irOff.Errors[0] -match 'near edge')
+# and the offending point is DROPPED from the list (only the index survives)
+Assert-True "idxrel: off-edge other dropped -> only index remains" ($irOff.Count -eq 1)
+
+# malformed other point -> per-point error, no throw.
+$threwIr = $false
+$irMal = $null
+try { $irMal = Get-IndexRelativeCustomGeometry -IndexX 1.0 -IndexZ 1.0 -OtherPoints @([pscustomobject]@{ Foo = 1 }) } catch { $threwIr = $true }
+Assert-True "idxrel: malformed other does NOT throw" (-not $threwIr)
+Assert-True "idxrel: malformed other -> Valid false, reported" ($null -ne $irMal -and -not $irMal.Valid -and $irMal.Errors.Count -ge 1)
+
+# never-throws hard guard (fully bad input).
+$threwIr2 = $false
+try { $null = Get-IndexRelativeCustomGeometry -IndexX -5 -IndexZ -5 -OtherPoints $null -ClearDia -9.0 -WidthOverride "bad" } catch { $threwIr2 = $true }
+Assert-True "idxrel: does NOT throw on bad input" (-not $threwIr2)
+
+# HoleDia collision: an other-hole coincident with the index (offset 0,0) with HoleDia>0
+# -> two bores at the same point overlap -> flagged by the inherited collision check.
+$irColl = Get-IndexRelativeCustomGeometry -IndexX 2.0 -IndexZ 2.0 -OtherPoints @([pscustomobject]@{ X = 0.0; Z = 0.0 }) -HoleDia 0.5 -ClearDia 0.5
+Assert-True "idxrel: coincident other w/ HoleDia -> Valid false (collision)" (-not $irColl.Valid)
+
+# ClearDia flows through to the derived far-side plate size (index + others).
+$irClear = Get-IndexRelativeCustomGeometry -IndexX 1.0 -IndexZ 1.0 -OtherPoints @([pscustomobject]@{ X = 2.0; Z = 3.0 }) -ClearDia 0.5
+# farthest abs X = 1+2 = 3, +ClearDia 0.5 -> Width 3.5 ; farthest abs Z = 1+3 = 4, +0.5 -> 4.5
+Assert-True "idxrel: derived Width = maxAbsX + ClearDia" (Approx $irClear.Width 3.5)
+Assert-True "idxrel: derived Height = maxAbsZ + ClearDia" (Approx $irClear.Height 4.5)
 
 # ----------------------------------------------------------------------------
 # Get-SharedPlanePlan -- distinct X/Z dedup + per-point indices. Must (a) dedup
@@ -639,6 +996,83 @@ try { $spMal = Get-SharedPlanePlan -Points @([pscustomobject]@{ Foo = 1 }, [pscu
 Assert-True "shared: malformed point does NOT throw" (-not $threwSp2)
 Assert-True "shared: malformed point skipped, clean point kept" `
     ($null -ne $spMal -and @($spMal.Triples).Count -eq 1 -and (Approx $spMal.Triples[0].X 1.0))
+
+# ----------------------------------------------------------------------------
+# Get-IndexDirectionalPlanePlan -- the user's N-indexed directional check (the fix
+# for the scattered-hole / non-corner-index bug). Per distinct X column / Z row it
+# must report N (1..count), the index's N, RelN, Direction (sign), AbsCoord, and
+# IsIndex -- and sign(RelOffset) must equal Direction. Drives building pitch planes
+# off CSYS_PAT_DEF at the ABSOLUTE coord (reliable axes) instead of off the
+# intersected index csys at a signed offset (null-normal axes -> the bug).
+# ----------------------------------------------------------------------------
+Write-Host "  -- index directional: Get-IndexDirectionalPlanePlan --" -ForegroundColor White
+
+# A 3x3 grid, index at the CENTER hole (the reported failing case). Grid offsets
+# {0.5, 2.5, 4.5} per axis (Edge 0.5, cc 2.0); center index at (2.5, 2.5).
+$idgGeo = Get-OrthogridGeometry -CcX 2.0 -CcZ 2.0 -Nx 3 -Nz 3 -Edge 0.5   # 9 points
+$idgCtr = Get-IndexDirectionalPlanePlan -Points $idgGeo.Points -IndexGridX 2.5 -IndexGridZ 2.5
+Assert-True "idxdir: Nx == 3, Nz == 3"            ($idgCtr.Nx -eq 3 -and $idgCtr.Nz -eq 3)
+Assert-True "idxdir: center index -> IndexNX == 2 (middle column)" ($idgCtr.IndexNX -eq 2)
+Assert-True "idxdir: center index -> IndexNZ == 2 (middle row)"    ($idgCtr.IndexNZ -eq 2)
+# X columns N = 1,2,3 -> RelN = -1,0,+1 -> Direction = -1,0,+1
+Assert-True "idxdir: center X N sequence = 1,2,3" `
+    ($idgCtr.XPlanes[0].N -eq 1 -and $idgCtr.XPlanes[1].N -eq 2 -and $idgCtr.XPlanes[2].N -eq 3)
+Assert-True "idxdir: center X RelN = -1,0,+1" `
+    ($idgCtr.XPlanes[0].RelN -eq -1 -and $idgCtr.XPlanes[1].RelN -eq 0 -and $idgCtr.XPlanes[2].RelN -eq 1)
+Assert-True "idxdir: center X Direction = -1,0,+1 (the user's negative/zero/positive rule)" `
+    ($idgCtr.XPlanes[0].Direction -eq -1 -and $idgCtr.XPlanes[1].Direction -eq 0 -and $idgCtr.XPlanes[2].Direction -eq 1)
+# the MIDDLE column IS the index -> IsIndex, and its AbsCoord is the index coord
+Assert-True "idxdir: middle column flagged IsIndex" ($idgCtr.XPlanes[1].IsIndex -and (Approx $idgCtr.XPlanes[1].AbsCoord 2.5))
+Assert-True "idxdir: non-index columns NOT IsIndex" ((-not $idgCtr.XPlanes[0].IsIndex) -and (-not $idgCtr.XPlanes[2].IsIndex))
+# AbsCoord is the raw distinct coord (what a CSYS_PAT_DEF-referenced plane offsets to)
+Assert-True "idxdir: AbsCoord = distinct offsets {0.5,2.5,4.5}" `
+    ((Approx $idgCtr.XPlanes[0].AbsCoord 0.5) -and (Approx $idgCtr.XPlanes[1].AbsCoord 2.5) -and (Approx $idgCtr.XPlanes[2].AbsCoord 4.5))
+# CROSS-CHECK: sign(RelOffset) == Direction for every column (both directions agree)
+$idgSignOk = $true
+foreach ($e in @($idgCtr.XPlanes) + @($idgCtr.ZPlanes)) {
+    $s = if ($e.RelOffset -lt -1e-9) { -1 } elseif ($e.RelOffset -gt 1e-9) { 1 } else { 0 }
+    if ($s -ne $e.Direction) { $idgSignOk = $false }
+}
+Assert-True "idxdir: sign(RelOffset) == Direction for all columns/rows" $idgSignOk
+# RelOffset at the index column is ~0 (its own plane), and matches the OLD (coord-index)
+Assert-True "idxdir: index column RelOffset ~ 0" (Approx $idgCtr.XPlanes[1].RelOffset 0.0)
+Assert-True "idxdir: left column RelOffset = -2.0, right = +2.0" `
+    ((Approx $idgCtr.XPlanes[0].RelOffset -2.0) -and (Approx $idgCtr.XPlanes[2].RelOffset 2.0))
+
+# CORNER index (hole 1): every RelN >= 0, Direction in {0,+1}, no negatives (why the
+# corner case always worked). Index at the min corner (0.5, 0.5) -> IndexN = 1 both axes.
+$idgCorner = Get-IndexDirectionalPlanePlan -Points $idgGeo.Points -IndexGridX 0.5 -IndexGridZ 0.5
+Assert-True "idxdir: corner index -> IndexNX == 1, IndexNZ == 1" ($idgCorner.IndexNX -eq 1 -and $idgCorner.IndexNZ -eq 1)
+Assert-True "idxdir: corner index -> RelN = 0,1,2 (all >= 0)" `
+    ($idgCorner.XPlanes[0].RelN -eq 0 -and $idgCorner.XPlanes[1].RelN -eq 1 -and $idgCorner.XPlanes[2].RelN -eq 2)
+Assert-True "idxdir: corner index -> Direction has NO -1 (all offsets non-negative)" `
+    (@($idgCorner.XPlanes | Where-Object { $_.Direction -eq -1 }).Count -eq 0)
+Assert-True "idxdir: corner index -> first column IS the index" ($idgCorner.XPlanes[0].IsIndex)
+
+# Triples pass through (Xi/Zi index into XPlanes/ZPlanes, ascending) -- so the build
+# loop can iterate XPlanes[Xi] exactly as it iterated XCoords[Xi].
+Assert-True "idxdir: Triples count == point count" (@($idgCtr.Triples).Count -eq 9)
+$idgTriOk = $true
+foreach ($tr in @($idgCtr.Triples)) {
+    if ($tr.Xi -lt 0 -or $tr.Xi -ge $idgCtr.Nx -or $tr.Zi -lt 0 -or $tr.Zi -ge $idgCtr.Nz) { $idgTriOk = $false }
+}
+Assert-True "idxdir: every Triple Xi/Zi indexes within XPlanes/ZPlanes" $idgTriOk
+
+# No index chosen (IndexGridX/Z not matching any coord) -> IndexN = 0, all Direction 0,
+# nothing flagged IsIndex (caller then uses absolute coords with no index reference).
+$idgNone = Get-IndexDirectionalPlanePlan -Points $idgGeo.Points -IndexGridX 99.0 -IndexGridZ 99.0
+Assert-True "idxdir: unmatched index -> IndexNX == 0" ($idgNone.IndexNX -eq 0)
+Assert-True "idxdir: unmatched index -> no column IsIndex" (@($idgNone.XPlanes | Where-Object { $_.IsIndex }).Count -eq 0)
+Assert-True "idxdir: unmatched index -> all Direction 0" (@($idgNone.XPlanes | Where-Object { $_.Direction -ne 0 }).Count -eq 0)
+
+# never throws on empty / malformed input.
+$threwIdg = $false; $idgEmpty = $null
+try { $idgEmpty = Get-IndexDirectionalPlanePlan -Points @() -IndexGridX 0 -IndexGridZ 0 } catch { $threwIdg = $true }
+Assert-True "idxdir: empty input does NOT throw" (-not $threwIdg)
+Assert-True "idxdir: empty input -> Nx == 0, Nz == 0" ($null -ne $idgEmpty -and $idgEmpty.Nx -eq 0 -and $idgEmpty.Nz -eq 0)
+$threwIdg2 = $false
+try { $null = Get-IndexDirectionalPlanePlan -Points @([pscustomobject]@{ Foo = 1 }) -IndexGridX 0 -IndexGridZ 0 } catch { $threwIdg2 = $true }
+Assert-True "idxdir: malformed point does NOT throw" (-not $threwIdg2)
 
 # ----------------------------------------------------------------------------
 # Show-OrthogridTable -- custom-mode header smoke (Nx/Nz are 0 -> count-only line).
@@ -1014,6 +1448,133 @@ $pr5First = Script:Count-OffsetPlanes @($pr5Slots.Rows[0].Corner0, $pr5Slots.Row
 Assert-True "planes: first-row-only is constant (3) regardless of row count" ($pr5First -eq 3)
 Assert-True "planes: saving grows with rows (5-row saves > 3-row saves)" `
     (($pr5All - $pr5First) -gt ($prAll - $prFirst))
+
+# ----------------------------------------------------------------------------
+# INDEX-FIRST MODE: Get-IndexHolePlan + Get-RelativeSharedPlanePlan (geometry-preserving)
+# ----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "  -- Get-IndexHolePlan (index-hole candidates + chosen coords) --" -ForegroundColor White
+# a small custom-ish layout (I/J present); use a 2x2-ish set with known coords
+$ifPts = @(
+    [pscustomobject]@{ I=0; J=0; X=2.5; Z=2.5 },
+    [pscustomobject]@{ I=0; J=1; X=2.5; Z=5.5 },
+    [pscustomobject]@{ I=1; J=0; X=5.5; Z=2.5 },
+    [pscustomobject]@{ I=1; J=1; X=5.5; Z=5.5 }
+)
+$ihNone = Get-IndexHolePlan -Points $ifPts
+Assert-True "indexplan: 4 candidates"                 (@($ihNone.Candidates).Count -eq 4)
+Assert-True "indexplan: no key -> HasIndex false"     (-not $ihNone.HasIndex)
+Assert-True "indexplan: no key -> IndexGridX null"    ($null -eq $ihNone.IndexGridX)
+Assert-True "indexplan: Keys are 0..3 in order"       ((@($ihNone.Candidates | ForEach-Object { $_.Key }) -join ',') -eq '0,1,2,3')
+$ih0 = Get-IndexHolePlan -Points $ifPts -IndexKey 0
+Assert-True "indexplan: key 0 -> HasIndex"            ($ih0.HasIndex)
+Assert-True "indexplan: key 0 -> grid (2.5,2.5)"      ((Approx $ih0.IndexGridX 2.5) -and (Approx $ih0.IndexGridZ 2.5))
+$ih3 = Get-IndexHolePlan -Points $ifPts -IndexKey 3
+Assert-True "indexplan: key 3 -> grid (5.5,5.5)"      ((Approx $ih3.IndexGridX 5.5) -and (Approx $ih3.IndexGridZ 5.5))
+# out-of-range key -> no index (never throws)
+$ihBad = Get-IndexHolePlan -Points $ifPts -IndexKey 99
+Assert-True "indexplan: bad key -> HasIndex false"    (-not $ihBad.HasIndex)
+# never throws on null / malformed
+$thrownIH = $false
+try { $ihNull = Get-IndexHolePlan -Points $null -IndexKey 0 } catch { $thrownIH = $true }
+Assert-True "indexplan: null points no throw"         (-not $thrownIH -and -not $ihNull.HasIndex -and (@($ihNull.Candidates).Count -eq 0))
+$ihMal = Get-IndexHolePlan -Points @([pscustomobject]@{ X=1.0; Z=2.0 }, [pscustomobject]@{ Foo=1 }, [pscustomobject]@{ X=3.0; Z=4.0 })
+Assert-True "indexplan: malformed point skipped"      (@($ihMal.Candidates).Count -eq 2)
+# Key stays aligned to the INPUT ordinal (the malformed point at ordinal 1 is skipped,
+# so the second valid point keeps Key=2, not Key=1) -> selecting Key=2 gets (3,4).
+$ihMal2 = Get-IndexHolePlan -Points @([pscustomobject]@{ X=1.0; Z=2.0 }, [pscustomobject]@{ Foo=1 }, [pscustomobject]@{ X=3.0; Z=4.0 }) -IndexKey 2
+Assert-True "indexplan: Key aligned to input ordinal" ($ihMal2.HasIndex -and (Approx $ihMal2.IndexGridX 3.0) -and (Approx $ihMal2.IndexGridZ 4.0))
+
+Write-Host "  -- Get-RelativeSharedPlanePlan (geometry-preserving shift) --" -ForegroundColor White
+$absPlan = Get-SharedPlanePlan -Points $ifPts
+# index at hole 0 (2.5, 2.5)
+$relPlan = Get-RelativeSharedPlanePlan -Points $ifPts -IndexGridX 2.5 -IndexGridZ 2.5
+# geometry preserved: indexGrid + relativeCoord == absoluteCoord, coord by coord
+$geoOk = $true
+for ($k = 0; $k -lt @($absPlan.XCoords).Count; $k++) {
+    if (-not (Approx (2.5 + [double]$relPlan.XCoords[$k]) ([double]$absPlan.XCoords[$k]))) { $geoOk = $false }
+}
+for ($k = 0; $k -lt @($absPlan.ZCoords).Count; $k++) {
+    if (-not (Approx (2.5 + [double]$relPlan.ZCoords[$k]) ([double]$absPlan.ZCoords[$k]))) { $geoOk = $false }
+}
+Assert-True "relplan: index + relative == absolute (X and Z)" $geoOk
+# the index hole's own coord becomes ~0 in the relative plan (2.5 - 2.5)
+Assert-True "relplan: index X coord -> ~0" (@($relPlan.XCoords | Where-Object { [math]::Abs([double]$_) -le 1e-6 }).Count -eq 1)
+Assert-True "relplan: index Z coord -> ~0" (@($relPlan.ZCoords | Where-Object { [math]::Abs([double]$_) -le 1e-6 }).Count -eq 1)
+# Triples are byte-identical to the unshifted plan (Xi/Zi indexing unchanged)
+$absTrip = (@($absPlan.Triples | ForEach-Object { "$($_.Xi),$($_.Zi)" }) -join '|')
+$relTrip = (@($relPlan.Triples | ForEach-Object { "$($_.Xi),$($_.Zi)" }) -join '|')
+Assert-True "relplan: Triples Xi/Zi identical to unshifted plan" ($absTrip -eq $relTrip)
+Assert-True "relplan: same distinct-coord counts" ((@($relPlan.XCoords).Count -eq @($absPlan.XCoords).Count) -and (@($relPlan.ZCoords).Count -eq @($absPlan.ZCoords).Count))
+# index at (0,0) -> relative == absolute (no shift)
+$relZero = Get-RelativeSharedPlanePlan -Points $ifPts -IndexGridX 0.0 -IndexGridZ 0.0
+Assert-True "relplan: index (0,0) -> no shift" (((@($relZero.XCoords) -join ',') -eq (@($absPlan.XCoords) -join ',')) -and ((@($relZero.ZCoords) -join ',') -eq (@($absPlan.ZCoords) -join ',')))
+# index at a far corner (5.5,5.5) -> that corner's coords become ~0
+$relFar = Get-RelativeSharedPlanePlan -Points $ifPts -IndexGridX 5.5 -IndexGridZ 5.5
+Assert-True "relplan: far-corner index -> its coords ~0" ((@($relFar.XCoords | Where-Object { [math]::Abs([double]$_) -le 1e-6 }).Count -eq 1) -and (@($relFar.ZCoords | Where-Object { [math]::Abs([double]$_) -le 1e-6 }).Count -eq 1))
+# never throws on null
+$thrownRel = $false
+try { $relNull = Get-RelativeSharedPlanePlan -Points $null -IndexGridX 1.0 -IndexGridZ 1.0 } catch { $thrownRel = $true }
+Assert-True "relplan: null points no throw" (-not $thrownRel -and (@($relNull.XCoords).Count -eq 0))
+
+# ----------------------------------------------------------------------------
+# INDEX-FIRST PLANE COUNT + OFFSETS -- mirrors the front-end STAGE 2.5 logic
+# (drilljig.cmd / drilljig-gui.cmd): each distinct RELATIVE coord becomes a plane
+# offset from the index csys, EXCEPT the one that shifts to ~0 (the index hole's own
+# column/row), which REUSES the csys anchor plane and creates NO new plane. So a row
+# of N holes with the index at one end produces N-1 NEW offset planes at the cc
+# multiples (user's "+2,+4,+6" example). This encodes the confirmed-live behavior.
+# ----------------------------------------------------------------------------
+Write-Host "  -- index-first plane count + relative offsets (front-end STAGE 2.5) --" -ForegroundColor White
+# a ROW of 4 holes along X at cc=2, index at the first hole (X=0), single Z row (Z=0)
+$rowPts = @(
+    [pscustomobject]@{ I=0; J=0; X=0.0; Z=0.0 },
+    [pscustomobject]@{ I=1; J=0; X=2.0; Z=0.0 },
+    [pscustomobject]@{ I=2; J=0; X=4.0; Z=0.0 },
+    [pscustomobject]@{ I=3; J=0; X=6.0; Z=0.0 }
+)
+# index at hole 0 (X=0, Z=0) -- exactly the user's row-of-4-at-cc-2 example
+$rowIdx = Get-IndexHolePlan -Points $rowPts -IndexKey 0
+Assert-True "row: index key 0 -> grid (0,0)" ((Approx $rowIdx.IndexGridX 0.0) -and (Approx $rowIdx.IndexGridZ 0.0))
+$rowPlan = Get-SharedPlanePlan -Points $rowPts
+# effective (relative) offsets the front-ends compute: gridCoord - indexCoord
+$tolT = 1e-6
+$xEff = @($rowPlan.XCoords | ForEach-Object { [double]$_ - [double]$rowIdx.IndexGridX })
+$zEff = @($rowPlan.ZCoords | ForEach-Object { [double]$_ - [double]$rowIdx.IndexGridZ })
+# distinct X coords for the row = {0,2,4,6}; relative = {0,2,4,6}
+Assert-True "row: 4 distinct X coords" (@($rowPlan.XCoords).Count -eq 4)
+Assert-True "row: relative X offsets are the cc multiples 0,2,4,6" (((@($xEff | ForEach-Object { [math]::Round($_,3) })) -join ',') -eq '0,2,4,6')
+# NEW planes actually created = distinct coords whose relative offset is NOT ~0
+# (the ~0 one reuses the index anchor). Row of 4 => 3 new X planes (+2,+4,+6).
+$newXplanes = @($xEff | Where-Object { [math]::Abs($_) -gt $tolT })
+Assert-True "row: N-1 = 3 NEW X planes created (index column reuses anchor)" (@($newXplanes).Count -eq 3)
+Assert-True "row: the new X planes are +2,+4,+6" (((@($newXplanes | ForEach-Object { [math]::Round($_,3) })) -join ',') -eq '2,4,6')
+# single Z row at the index Z -> relative Z = {0} -> ZERO new Z planes (all reuse the Z anchor)
+$newZplanes = @($zEff | Where-Object { [math]::Abs($_) -gt $tolT })
+Assert-True "row: 0 NEW Z planes (single row on the index Z reuses the anchor)" (@($newZplanes).Count -eq 0)
+
+# 2x2 grid, index at a CORNER (2.5,2.5): each axis has 2 distinct coords {2.5,5.5} ->
+# relative {0,3} -> exactly 1 NEW plane per axis (the +3), the 0 reuses the anchor.
+$gridIdx = Get-IndexHolePlan -Points $ifPts -IndexKey 0    # $ifPts index 0 = (2.5,2.5)
+$gridPlan = Get-SharedPlanePlan -Points $ifPts
+$gxEff = @($gridPlan.XCoords | ForEach-Object { [double]$_ - [double]$gridIdx.IndexGridX })
+$gzEff = @($gridPlan.ZCoords | ForEach-Object { [double]$_ - [double]$gridIdx.IndexGridZ })
+Assert-True "2x2: 1 NEW X plane at +3 (index col reuses anchor)" ((@($gxEff | Where-Object { [math]::Abs($_) -gt $tolT }).Count -eq 1) -and (Approx (@($gxEff | Where-Object { [math]::Abs($_) -gt $tolT })[0]) 3.0))
+Assert-True "2x2: 1 NEW Z plane at +3 (index row reuses anchor)" ((@($gzEff | Where-Object { [math]::Abs($_) -gt $tolT }).Count -eq 1) -and (Approx (@($gzEff | Where-Object { [math]::Abs($_) -gt $tolT })[0]) 3.0))
+# index at the MIDDLE of a row -> relative offsets straddle 0 (negative + positive),
+# still exactly one ~0 (reused) and the rest new. Row {0,2,4,6}, index at X=4:
+$midIdx = Get-IndexHolePlan -Points $rowPts -IndexKey 2    # X=4
+$midEff = @($rowPlan.XCoords | ForEach-Object { [double]$_ - [double]$midIdx.IndexGridX })
+Assert-True "row mid-index: relative offsets -4,-2,0,+2" (((@($midEff | ForEach-Object { [math]::Round($_,3) })) -join ',') -eq '-4,-2,0,2')
+Assert-True "row mid-index: exactly one ~0 (reused), 3 new planes" ((@($midEff | Where-Object { [math]::Abs($_) -le $tolT }).Count -eq 1) -and (@($midEff | Where-Object { [math]::Abs($_) -gt $tolT }).Count -eq 3))
+# SIGN LOGIC LOCK: the front-ends compute (gridCoord - indexCoord) * flip. A mid-index
+# straddles 0, so the sign per hole depends on which side of the index it is on -- this is
+# exactly "when negative vs positive". --index-flip-x negates the whole axis (csys axis
+# orientation), which MUST flip every sign: [-4,-2,0,+2] -> [+4,+2,0,-2]. (The negative
+# OFFSET's live execution is verified separately by csys-negoffset-probe.cmd.)
+$midEffFlip = @($rowPlan.XCoords | ForEach-Object { ([double]$_ - [double]$midIdx.IndexGridX) * -1.0 })
+Assert-True "row mid-index + flip: signs negate to +4,+2,0,-2" (((@($midEffFlip | ForEach-Object { [math]::Round($_,3) })) -join ',') -eq '4,2,0,-2')
+Assert-True "row mid-index + flip: still one ~0 (reused), 3 new planes" ((@($midEffFlip | Where-Object { [math]::Abs($_) -le $tolT }).Count -eq 1) -and (@($midEffFlip | Where-Object { [math]::Abs($_) -gt $tolT }).Count -eq 3))
 
 # ----------------------------------------------------------------------------
 # SUMMARY

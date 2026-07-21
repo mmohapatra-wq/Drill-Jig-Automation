@@ -30,9 +30,17 @@
 #   Nz   - number of points along Z (>=1)
 #   Edge - edge margin: distance from the plate corner to the first point, and
 #          from the last point to the far edge (added on BOTH sides per axis)
+#   HoleDia - (optional, default 0 = OFF) the DRILLED hole diameter. When > 0 two
+#          geometric-safety checks run: (a) hole-collision -- flags CcX < HoleDia
+#          (when Nx>=2) or CcZ < HoleDia (when Nz>=2), neighbouring bores would
+#          overlap; (b) edge-margin -- flags Edge < HoleDia/2 (a hole would sit less
+#          than one radius from the part edge). Tangent (spacing == HoleDia, or
+#          Edge == HoleDia/2) is allowed. Passing 0 keeps the original behaviour.
 #
 # Returns a [pscustomobject]:
 #   Valid   [bool]      $true iff CcX>0 AND CcZ>0 AND Nx>=1 AND Nz>=1 AND Edge>=0
+#                       AND (HoleDia<=0 OR (no same-axis spacing < HoleDia AND
+#                       Edge >= HoleDia/2))
 #   Errors  [string[]]  human-readable reasons when -not Valid (empty when Valid)
 #   CcX,CcZ,Edge [double]; Nx,Nz [int]   (echo of the inputs)
 #   Width   [double] = (Nx-1)*CcX + 2*Edge   (plate extent along X)
@@ -67,7 +75,27 @@ function global:Get-OrthogridGeometry {
         # EDGE to the plate edge: Width/Height gain ClearDia (a radius on each side)
         # and the points inset by ClearDia/2 to stay centred. Default 0 reproduces
         # the original center-to-edge behaviour (and keeps existing tests green).
-        [double]$ClearDia = 0.0
+        [double]$ClearDia = 0.0,
+        # HoleDia = the DRILLED hole diameter, used ONLY for the hole-collision
+        # (intersection) check: two adjacent holes overlap when their center-to-
+        # center spacing is LESS than one hole diameter (edges just touch at exactly
+        # HoleDia -- tangent is allowed, not an error). On a regular grid the closest
+        # neighbours are one CcX apart along X and one CcZ apart along Z, so a spacing
+        # too small on either axis is caught directly from CcX/CcZ (no O(n^2) scan).
+        # Default 0 DISABLES the check (backwards-compatible: existing callers that
+        # do not pass it behave exactly as before). This is INTENT validation -- it
+        # stops the operator entering a spacing that would drill overlapping holes.
+        [double]$HoleDia = 0.0,
+        # EdgeMargin = the REQUIRED hole-edge -> part-edge wall (the same knob as on
+        # Get-CustomPointsGeometry, so the two layout families share ONE rule). Because
+        # the orthogrid plate is sized with ClearDia = the hole dia, the Edge field IS
+        # that wall, so this does NOT resize anything -- it only sets the CHECK
+        # THRESHOLD (Edge must be >= EdgeMargin, not just >= one radius) and is echoed
+        # on the result so a consumer sees the SAME EdgeMargin member the custom result
+        # carries. Default -1 = LEGACY (threshold = HoleDia/2, echo = HoleDia/2), so
+        # callers that omit it behave byte-identically. drilljig's editors lock Edge =
+        # HoleDia AND pass EdgeMargin = HoleDia so the wall is one full diameter.
+        [double]$EdgeMargin = -1.0
     )
 
     # -- validate (collect ALL reasons, do not throw) ------------------------
@@ -78,6 +106,44 @@ function global:Get-OrthogridGeometry {
     if ($Nz -lt 1)       { $errors += "Nz must be >= 1 (got $Nz)" }
     if ($Edge -lt 0)     { $errors += "Edge must be >= 0 (got $Edge)" }
     if ($ClearDia -lt 0) { $errors += "ClearDia must be >= 0 (got $ClearDia)" }
+    if ($HoleDia -lt 0)  { $errors += "HoleDia must be >= 0 (got $HoleDia)" }
+
+    # resolve the edge-margin rule (same sentinel logic as Get-CustomPointsGeometry):
+    # a non-negative EdgeMargin is the required wall; the -1 default means "use the
+    # legacy one-radius rule". Resolved outside the HoleDia gate so the echo is always
+    # meaningful.
+    $emGiven = ($EdgeMargin -ge 0)
+
+    # -- hole-collision (intersection) check ---------------------------------
+    # Only when a positive HoleDia is supplied AND there is more than one hole along
+    # that axis (a single column/row has no same-axis neighbour to collide with). A
+    # spacing < HoleDia means neighbouring bores overlap; == HoleDia is tangent (OK).
+    # A tiny tolerance keeps exact-tangent entries (CcX == HoleDia) from tripping on
+    # float noise. Rounded values in the message so the operator sees clean numbers.
+    if ($HoleDia -gt 0) {
+        $collideTol = 1e-9
+        if ($Nx -ge 2 -and $CcX -lt ($HoleDia - $collideTol)) {
+            $errors += ("center-to-center X {0} is less than the hole diameter {1} -- adjacent holes along X would overlap (use >= {1})" -f ([math]::Round($CcX,4)), ([math]::Round($HoleDia,4)))
+        }
+        if ($Nz -ge 2 -and $CcZ -lt ($HoleDia - $collideTol)) {
+            $errors += ("center-to-center Z {0} is less than the hole diameter {1} -- adjacent holes along Z would overlap (use >= {1})" -f ([math]::Round($CcZ,4)), ([math]::Round($HoleDia,4)))
+        }
+        # edge-margin vs part edge: Edge (with ClearDia sizing) IS the wall from each
+        # border hole's EDGE to the part edge. It must be at least the REQUIRED wall:
+        #   * legacy (EdgeMargin not given): one hole RADIUS (user 2026-07-17);
+        #   * EdgeMargin given: EdgeMargin (user 2026-07-21: the edge margin should
+        #     equal the hole diameter -- drilljig locks Edge = HoleDia AND passes
+        #     EdgeMargin = HoleDia, so Edge == the required wall exactly, tangent).
+        # Uniform on all four sides (the grid is centered), so a single check on Edge
+        # covers every border. == the required wall is tangent (OK); only checked when
+        # there is at least one hole (Nx>=1 and Nz>=1).
+        $holeRadius = $HoleDia / 2.0
+        $reqWall    = if ($emGiven) { $EdgeMargin } else { $holeRadius }
+        if ($Nx -ge 1 -and $Nz -ge 1 -and $Edge -lt ($reqWall - $collideTol)) {
+            $errors += ("edge margin {0} is less than the required edge margin {1} -- a border hole would sit closer than that to the part edge (use >= {1})" -f ([math]::Round($Edge,4)), ([math]::Round($reqWall,4)))
+        }
+    }
+
     $valid = ($errors.Count -eq 0)
 
     # -- plate extent (best-effort even on bad input) ------------------------
@@ -124,6 +190,11 @@ function global:Get-OrthogridGeometry {
         Nz       = [int]$Nz
         Edge     = [double]$Edge
         ClearDia = [double]$ClearDia
+        HoleDia  = [double]$HoleDia
+        # resolved required edge-margin wall: EdgeMargin when given, else one hole
+        # radius (the legacy rule) -- the SAME member the custom result carries, so a
+        # consumer reads .EdgeMargin uniformly across both layout families.
+        EdgeMargin = [double]$(if ($emGiven) { $EdgeMargin } else { $HoleDia / 2.0 })
         Width    = [double]$width
         Height   = [double]$height
         Count    = [int]$count
@@ -156,11 +227,40 @@ function global:Get-OrthogridGeometry {
 #   KeepOrigin      - switch. By DEFAULT a point at the origin (0,0 within tol) is
 #                     DROPPED (no datum point + no hole is made at the part origin
 #                     corner - user 2026-06-25). Pass -KeepOrigin to keep it.
+#   HoleDia         - (optional, default 0 = OFF) the DRILLED hole diameter. When
+#                     > 0 two geometric-safety checks run: (a) pairwise hole-
+#                     collision -- flags any two kept holes closer than one hole
+#                     diameter (their bores overlap); (b) edge-margin -- flags any
+#                     hole whose wall to the nearest part edge (X=0/Z=0/Width/Height)
+#                     is less than the REQUIRED wall (see EdgeMargin). Tangent (wall
+#                     == the required wall) is allowed. Passing 0 keeps the original
+#                     behaviour.
+#   EdgeMargin      - (optional, default -1 = LEGACY) the REQUIRED wall from a border
+#                     hole's EDGE to the nearest part edge. This is the knob behind
+#                     "the edge margin should always equal the hole diameter" (user
+#                     2026-07-21): drilljig passes EdgeMargin = HoleDia so every border
+#                     wall is a full hole diameter, for CUSTOM and FASTENER layouts
+#                     (orthogrid enforces the same rule by locking its Edge field =
+#                     HoleDia in the editors). When given (>= 0) it drives BOTH:
+#                       * DERIVED plate sizing -- far clearance past the outermost hole
+#                         center becomes ClearDia/2 (the bore radius) + EdgeMargin, so
+#                         the far wall equals EdgeMargin exactly; and
+#                       * the edge-margin CHECK threshold -- each hole must keep >=
+#                         EdgeMargin of wall (not just >= one radius).
+#                     A NEGATIVE default (-1) means "not specified" -> the LEGACY rule
+#                     is used unchanged: derived far clearance = ClearDia (far wall =
+#                     one radius) and the check threshold = HoleDia/2 (one radius). So
+#                     callers that do not pass EdgeMargin behave EXACTLY as before
+#                     (every pre-existing test stays byte-identical). 0 is a legal
+#                     explicit value (require only that the bore does not cross the edge).
 #
 # Returns a [pscustomobject] (NEVER throws):
 #   Valid       [bool]   $true iff ClearDia>=0 AND >=1 kept point AND every point
 #                        has numeric X>=0 / Z>=0 AND (if explicit) the overall
-#                        dim is large enough to contain the farthest hole.
+#                        dim is large enough to contain the farthest hole AND
+#                        (HoleDia<=0 OR (no two kept holes closer than HoleDia AND
+#                        every hole keeps >= the required wall to each part edge --
+#                        one radius by default, EdgeMargin when given)).
 #   Errors      [string[]] reasons when -not Valid (empty when Valid)
 #   Mode        'custom'
 #   WidthMode   'derived' | 'explicit'
@@ -186,12 +286,32 @@ function global:Get-CustomPointsGeometry {
         [double]$ClearDia = 0.0,
         $WidthOverride    = $null,
         $HeightOverride   = $null,
-        [switch]$KeepOrigin
+        [switch]$KeepOrigin,
+        # HoleDia = the DRILLED hole diameter, used ONLY for the hole-collision
+        # (intersection) check. Unlike the grid, custom points sit anywhere, so the
+        # only reliable test is a pairwise straight-line distance between every pair
+        # of KEPT holes: any pair whose center-to-center distance is LESS than one
+        # hole diameter would drill overlapping bores. Tangent (distance == HoleDia)
+        # is allowed. Default 0 DISABLES the check (backwards-compatible).
+        [double]$HoleDia = 0.0,
+        # EdgeMargin = the REQUIRED hole-edge -> part-edge wall (see the header). A
+        # NEGATIVE default (-1) = "not specified" -> the legacy one-radius rule. When
+        # >= 0 it drives derived plate sizing AND the edge-margin check threshold, so
+        # every border wall becomes exactly EdgeMargin (drilljig passes = HoleDia).
+        [double]$EdgeMargin = -1.0
     )
 
     $tol = 1e-6
     $errors = @()
     if ($ClearDia -lt 0) { $errors += "ClearDia must be >= 0 (got $ClearDia)" }
+    if ($HoleDia  -lt 0) { $errors += "HoleDia must be >= 0 (got $HoleDia)" }
+
+    # Resolve the edge-margin rule ONCE. $emGiven distinguishes an explicit wall
+    # (>= 0, including 0) from the sentinel default (< 0 -> legacy one-radius rule).
+    # $reqWall is the wall the edge-check enforces; $emGiven also switches the derived
+    # far-clearance formula below. Kept byte-identical to the old behaviour when the
+    # caller omits EdgeMargin.
+    $emGiven = ($EdgeMargin -ge 0)
 
     # resolve the optional explicit overrides (null/<=0 -> derive). Untyped params
     # so $null is distinguishable from 0; coerce defensively without throwing.
@@ -244,10 +364,17 @@ function global:Get-CustomPointsGeometry {
 
     if ($clean.Count -lt 1) { $errors += "need at least one point (origin-only layouts have nothing to drill)" }
 
-    # plate extent: explicit override if given, else derived = farthest hole +
-    # ClearDia far-side clearance. Best-effort even when invalid (GUI previews).
-    $width  = if ($null -ne $wOver) { $wOver } else { $maxX + $ClearDia }
-    $height = if ($null -ne $hOver) { $hOver } else { $maxZ + $ClearDia }
+    # plate extent: explicit override if given, else DERIVED. The far clearance past
+    # the outermost hole CENTER is:
+    #   * legacy (EdgeMargin not given): ClearDia -> far wall = ClearDia - HoleDia/2
+    #     (= one radius when ClearDia == HoleDia, the historical tangent);
+    #   * EdgeMargin given: ClearDia/2 (the bore radius) + EdgeMargin -> far wall =
+    #     EdgeMargin exactly (drilljig passes EdgeMargin = HoleDia -> a full-diameter
+    #     wall). When ClearDia == HoleDia this is maxX + 1.5*HoleDia.
+    # Best-effort even when invalid (GUI previews).
+    $derivedClear = if ($emGiven) { ($ClearDia / 2.0) + $EdgeMargin } else { $ClearDia }
+    $width  = if ($null -ne $wOver) { $wOver } else { $maxX + $derivedClear }
+    $height = if ($null -ne $hOver) { $hOver } else { $maxZ + $derivedClear }
 
     # an explicit dim must contain the farthest hole's FULL BORE, else the hole
     # would overhang the plate edge. The bore is centred on the datum point and
@@ -260,6 +387,82 @@ function global:Get-CustomPointsGeometry {
     }
     if ($null -ne $hOver -and $clean.Count -ge 1 -and $hOver -lt ($needZ - $tol)) {
         $errors += "part height $hOver is too small: the bore at Z=$maxZ (dia $ClearDia) needs height >= $needZ"
+    }
+
+    # -- hole-collision (intersection) check ---------------------------------
+    # Only when a positive HoleDia is supplied AND >= 2 kept holes exist. Custom
+    # points are arbitrary, so scan every unordered pair: a center-to-center
+    # straight-line distance LESS than one hole diameter means those two bores
+    # overlap. Tangent (distance == HoleDia) is allowed. The first few offending
+    # pairs are reported by their typed coordinates (capped so a badly-clustered
+    # layout can't emit hundreds of messages); a summary line covers the rest.
+    if ($HoleDia -gt 0 -and $clean.Count -ge 2) {
+        $collideTol = 1e-9
+        $minAllowed = $HoleDia - $collideTol
+        $collisions = 0
+        $maxReport  = 5
+        for ($a = 0; $a -lt $clean.Count; $a++) {
+            for ($b = $a + 1; $b -lt $clean.Count; $b++) {
+                $dx = [double]$clean[$a].X - [double]$clean[$b].X
+                $dz = [double]$clean[$a].Z - [double]$clean[$b].Z
+                $dist = [math]::Sqrt($dx * $dx + $dz * $dz)
+                if ($dist -lt $minAllowed) {
+                    $collisions++
+                    if ($collisions -le $maxReport) {
+                        $errors += ("holes at ({0},{1}) and ({2},{3}) are {4} apart, less than the hole diameter {5} -- their bores overlap" -f `
+                            ([math]::Round([double]$clean[$a].X,4)), ([math]::Round([double]$clean[$a].Z,4)), `
+                            ([math]::Round([double]$clean[$b].X,4)), ([math]::Round([double]$clean[$b].Z,4)), `
+                            ([math]::Round($dist,4)), ([math]::Round($HoleDia,4)))
+                    }
+                }
+            }
+        }
+        if ($collisions -gt $maxReport) {
+            $errors += ("... and {0} more overlapping hole pair(s) (spacing < hole diameter {1})" -f ($collisions - $maxReport), ([math]::Round($HoleDia,4)))
+        }
+    }
+
+    # -- edge-margin (hole-vs-part-edge) check --------------------------------
+    # Each hole must keep at least the REQUIRED wall to every part edge. The wall to
+    # an edge = (its distance to that edge) - HoleDia/2 (bore edge -> part edge), and
+    # the NEAREST of the four edges governs. Near edges sit at the datum corner
+    # (X=0 / Z=0) -- a hole typed closer than the wall there actually runs OFF / too
+    # near the part; far edges sit at the plate Width/Height.
+    #   * legacy (EdgeMargin not given): required wall = one hole RADIUS (user
+    #     2026-07-17). In DERIVED sizing the far wall of the outermost hole equals
+    #     exactly one radius (tangent, allowed).
+    #   * EdgeMargin given: required wall = EdgeMargin (user 2026-07-21: the edge
+    #     margin should equal the hole diameter). drilljig passes EdgeMargin = HoleDia,
+    #     and the DERIVED plate above is sized so the far wall equals EdgeMargin, so a
+    #     derived layout still passes (tangent at EdgeMargin).
+    # Only when a hole dia is supplied (>0). Messages capped like the collision check.
+    if ($HoleDia -gt 0 -and $clean.Count -ge 1) {
+        $edgeTol    = 1e-9
+        $holeRadius = $HoleDia / 2.0
+        # the wall the operator must keep: EdgeMargin when specified, else one radius.
+        $reqWall    = if ($emGiven) { $EdgeMargin } else { $holeRadius }
+        $edgeViol   = 0
+        $edgeMax    = 5
+        foreach ($p in $clean) {
+            $px = [double]$p.X; $pz = [double]$p.Z
+            # wall = distance from the bore EDGE to each part edge (negative = the
+            # bore crosses that edge). The nearest edge is the binding one.
+            $wLeft   = $px - $holeRadius
+            $wBottom = $pz - $holeRadius
+            $wRight  = $width  - $px - $holeRadius
+            $wTop    = $height - $pz - $holeRadius
+            $minWall = [math]::Min([math]::Min($wLeft, $wBottom), [math]::Min($wRight, $wTop))
+            if ($minWall -lt ($reqWall - $edgeTol)) {
+                $edgeViol++
+                if ($edgeViol -le $edgeMax) {
+                    $errors += ("hole at ({0},{1}) leaves only {2} of wall to the nearest part edge, less than the required edge margin {3} -- move it inward or grow the part" -f `
+                        ([math]::Round($px,4)), ([math]::Round($pz,4)), ([math]::Round($minWall,4)), ([math]::Round($reqWall,4)))
+                }
+            }
+        }
+        if ($edgeViol -gt $edgeMax) {
+            $errors += ("... and {0} more hole(s) closer than the required edge margin {1} to a part edge" -f ($edgeViol - $edgeMax), ([math]::Round($reqWall,4)))
+        }
     }
 
     $valid = ($errors.Count -eq 0)
@@ -277,11 +480,145 @@ function global:Get-CustomPointsGeometry {
         Nz       = 0
         Edge     = 0.0
         ClearDia = [double]$ClearDia
+        HoleDia  = [double]$HoleDia
+        # the resolved required edge-margin wall: EdgeMargin when specified, else one
+        # hole radius (the legacy rule). Echoed for the UI / provenance.
+        EdgeMargin = [double]$(if ($emGiven) { $EdgeMargin } else { $HoleDia / 2.0 })
         Width    = [double]$width
         Height   = [double]$height
         Count    = [int]$clean.Count
         Points   = $clean
     }
+}
+
+# ----------------------------------------------------------------------------
+# Get-IndexRelativeCustomGeometry - the INDEX-CENTRIC custom layout (user 2026-07-21).
+#
+# The operator enters ONE index hole as an offset from the plate (XZ) CORNER, then
+# enters every OTHER hole as an offset FROM THE INDEX HOLE. All entered holes drill
+# (index + others); the XZ corner itself is REFERENCE-ONLY (no hole there). The whole
+# jig is then modelled off the index hole (the existing index-first machinery: base
+# csys built AT the index, STAGE 2.5 offsets by (gridCoord - indexGrid)).
+#
+# This is a thin WRAPPER over Get-CustomPointsGeometry: it converts the index-relative
+# input into the ABSOLUTE corner-relative {X;Z} list that function (and every downstream
+# consumer: STAGE 2.5 plane sharing, slotinator, Get-RowSlots, Get-SharedPlanePlan)
+# already expects, with the index hole FIRST at Points[0] so the front-ends can set the
+# index-first vars with IndexKey = 0. The returned .Points stay ABSOLUTE - only the
+# INPUT model (how the operator types coords) is index-relative.
+#
+# Inputs:
+#   IndexX, IndexZ - the index hole's offset FROM THE PLATE CORNER (>= 0; the ONLY
+#                    coords measured from the corner). This becomes Points[0].
+#   OtherPoints    - array of objects each exposing .X/.Z = the offset of that hole
+#                    FROM THE INDEX HOLE (may be negative, as long as the resulting
+#                    absolute coord stays >= 0). Each becomes (IndexX+dX, IndexZ+dZ).
+#                    $null / @() is legal (index-only layout).
+#   ClearDia       - widest-feature dia (chip-relief), passed straight through to
+#                    Get-CustomPointsGeometry for derived-plate far-side clearance.
+#   HoleDia        - drilled hole dia, passed through for the collision + edge-margin
+#                    checks (0 = OFF, unchanged behaviour).
+#   EdgeMargin     - required hole-edge -> part-edge wall, passed straight through to
+#                    Get-CustomPointsGeometry (-1 = legacy one-radius rule; drilljig
+#                    passes = HoleDia so every border wall is one full diameter).
+#   WidthOverride / HeightOverride - explicit overall plate size (see Get-CustomPointsGeometry).
+#
+# Returns a [pscustomobject] SHAPE-COMPATIBLE with Get-CustomPointsGeometry, PLUS:
+#   IndexRelative [bool]   $true (marks this layout as index-centric)
+#   IndexGridX,IndexGridZ [double]  = IndexX, IndexZ (the index hole's absolute/corner
+#                          coord = its grid coord; the front-ends copy these into the
+#                          index-first vars so STAGE 2.5's (grid - index) subtraction
+#                          places the index hole at csys offset 0).
+# .Points[0] IS the index hole (KeepOrigin forces it to survive even at (0,0)).
+#
+# NEVER throws: index/offset validation collects reasons (never throws); each other-
+# hole coercion is guarded; an other-hole whose ABSOLUTE X or Z < 0 gets ONE clear
+# error AND is dropped from the list handed to Get-CustomPointsGeometry (so we do not
+# also emit its duplicate "X must be >= 0" message). Valid = (our errors empty) AND
+# (the inner Get-CustomPointsGeometry result is Valid).
+# global: scope (see Get-OrthogridGeometry note) so closures resolve it. Pure.
+# ----------------------------------------------------------------------------
+function global:Get-IndexRelativeCustomGeometry {
+    param(
+        [double]$IndexX = 0.0,
+        [double]$IndexZ = 0.0,
+        [array] $OtherPoints    = $null,
+        [double]$ClearDia       = 0.0,
+        $WidthOverride          = $null,
+        $HeightOverride         = $null,
+        [double]$HoleDia        = 0.0,
+        [double]$EdgeMargin     = -1.0
+    )
+
+    $tol = 1e-6
+    $errors = @()
+    if ($IndexX -lt 0) { $errors += "index hole X offset from the corner must be >= 0 (got $IndexX)" }
+    if ($IndexZ -lt 0) { $errors += "index hole Z offset from the corner must be >= 0 (got $IndexZ)" }
+
+    # -- build the ABSOLUTE point list: index FIRST, then each other = index + offset --
+    # Index is Points[0] so a front-end can set IndexKey = 0. Each other-hole coercion is
+    # guarded (a non-numeric relative offset -> per-point error, never a throw). An
+    # other-hole whose ABSOLUTE coord lands < 0 gets ONE clear error and is DROPPED from
+    # the list (so Get-CustomPointsGeometry never re-reports it as "X must be >= 0").
+    $abs = @()
+    $abs += [pscustomobject]@{ X = [double]$IndexX; Z = [double]$IndexZ }
+    $oi = 0
+    if ($null -ne $OtherPoints) {
+        foreach ($pt in $OtherPoints) {
+            $oi++
+            $dx = $null; $dz = $null
+            try { if ($null -ne $pt.X) { $dx = [double]$pt.X } } catch {}
+            try { if ($null -ne $pt.Z) { $dz = [double]$pt.Z } } catch {}
+            if ($null -eq $dx -or $null -eq $dz) {
+                $errors += "other hole $oi is missing a numeric X/Z offset"
+                continue
+            }
+            $ax = [double]$IndexX + $dx
+            $az = [double]$IndexZ + $dz
+            if ($ax -lt (-$tol) -or $az -lt (-$tol)) {
+                $errors += ("other hole {0} (offset {1},{2} from the index) lands off the near edge at ({3},{4}); move the index farther from the corner or adjust the offset" -f `
+                    $oi, ([math]::Round($dx,4)), ([math]::Round($dz,4)), ([math]::Round($ax,4)), ([math]::Round($az,4)))
+                continue
+            }
+            $abs += [pscustomobject]@{ X = [double]$ax; Z = [double]$az }
+        }
+    }
+
+    # -- delegate to the proven corner-relative math (KeepOrigin so the index survives) -
+    # -KeepOrigin keeps Points[0] (the index) even if it typed to the corner (0,0), and
+    # preserves the index's positional identity so IndexKey = 0 stays valid downstream.
+    $inner = $null
+    try {
+        $inner = Get-CustomPointsGeometry -Points $abs -ClearDia $ClearDia `
+            -WidthOverride $WidthOverride -HeightOverride $HeightOverride -HoleDia $HoleDia -EdgeMargin $EdgeMargin -KeepOrigin
+    } catch { $inner = $null }
+
+    if ($null -eq $inner) {
+        # Get-CustomPointsGeometry is contracted never to throw, but degrade safely.
+        $errors += "internal: could not compute the custom geometry from the index-relative points"
+        return [pscustomobject]@{
+            Valid=$false; Errors=[string[]]$errors; Mode='custom'; WidthMode='derived'; HeightMode='derived'
+            SkippedOrigin=0; CcX=0.0; CcZ=0.0; Nx=0; Nz=0; Edge=0.0; ClearDia=[double]$ClearDia; HoleDia=[double]$HoleDia
+            EdgeMargin=[double]$(if ($EdgeMargin -ge 0) { $EdgeMargin } else { $HoleDia / 2.0 })
+            Width=0.0; Height=0.0; Count=0; Points=@()
+            IndexRelative=$true; IndexGridX=[double]$IndexX; IndexGridZ=[double]$IndexZ
+        }
+    }
+
+    # -- merge our index/offset errors with the inner result's, recompute Valid --------
+    $merged = @()
+    $merged += $errors
+    if ($null -ne $inner.Errors) { $merged += @($inner.Errors) }
+    $valid = (($merged.Count -eq 0) -and [bool]$inner.Valid)
+
+    # augment the inner result IN PLACE (it is our own fresh object) with the merged
+    # errors, the recomputed Valid, and the 3 index-relative members.
+    $inner.Errors = [string[]]$merged
+    $inner.Valid  = $valid
+    try { $inner | Add-Member -NotePropertyName 'IndexRelative' -NotePropertyValue $true            -Force } catch {}
+    try { $inner | Add-Member -NotePropertyName 'IndexGridX'    -NotePropertyValue ([double]$IndexX) -Force } catch {}
+    try { $inner | Add-Member -NotePropertyName 'IndexGridZ'    -NotePropertyValue ([double]$IndexZ) -Force } catch {}
+    return $inner
 }
 
 # ----------------------------------------------------------------------------

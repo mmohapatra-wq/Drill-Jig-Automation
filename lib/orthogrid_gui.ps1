@@ -59,6 +59,181 @@ function global:Draw-AxisGlyph {
     }
 }
 
+# ----------------------------------------------------------------------------
+# Draw-SlotRects - overlay the chip-relief SLOTS on a layout preview. Given a
+# Get-RowSlots result (the SAME pure math slotinator / drilljig STAGE 4 use to
+# cut one blind rectangular slot per hole ROW) and the panel's plate-frame ->
+# screen transform (the offX/offY/drawH/scale a preview Paint already computes for
+# its dots), draw each row's slot as a translucent amber band with a solid outline.
+# So the operator SEES the relief cuts before they are made, in the SAME frame as
+# the hole dots (X right, Z up, origin bottom-left; a slot Corner0/Corner1 are
+# {X;Z} in that frame). Bands are drawn UNDER the dots (call before FillEllipse) so
+# the hole centers stay visible on top.
+#
+#   $Graphics       - System.Drawing.Graphics from the paint handler ($e.Graphics)
+#   $Slots          - a Get-RowSlots result (uses .Valid + .Rows[].Corner0/Corner1)
+#   $OffX,$OffY     - the plate rectangle's top-left in panel px (preview's $offX/$offY)
+#   $DrawH          - the plate rectangle's drawn height in px (preview's $drawH)
+#   $Scale          - model-units -> px scale (preview's $scale)
+#
+# Pure drawing; NEVER throws (a slot-overlay failure must not crash the preview).
+# global: scope so .GetNewClosure() Paint handlers resolve it under the hybrid
+# .cmd & ([scriptblock]::Create(...)) model (same reason as Draw-AxisGlyph).
+# ----------------------------------------------------------------------------
+function global:Draw-SlotRects {
+    param($Graphics, $Slots, [double]$OffX, [double]$OffY, [double]$DrawH, [double]$Scale)
+    try {
+        if ($null -eq $Slots -or -not $Slots.Valid -or $null -eq $Slots.Rows) { return }
+        $g = $Graphics
+        # translucent amber fill + a more-opaque amber outline (distinct from the
+        # SteelBlue plate outline and the Crimson hole dots).
+        $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(70, 245, 200, 90))
+        $pen  = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(210, 235, 170, 60), 1.0)
+        foreach ($row in $Slots.Rows) {
+            $c0 = $row.Corner0; $c1 = $row.Corner1
+            if ($null -eq $c0 -or $null -eq $c1) { continue }
+            # map both diagonal corners through the same transform the dots use
+            $x0 = $OffX + ([double]$c0.X) * $Scale
+            $x1 = $OffX + ([double]$c1.X) * $Scale
+            $y0 = $OffY + $DrawH - ([double]$c0.Z) * $Scale
+            $y1 = $OffY + $DrawH - ([double]$c1.Z) * $Scale
+            $rx = [Math]::Min($x0, $x1); $ry = [Math]::Min($y0, $y1)
+            $rw = [Math]::Abs($x1 - $x0); $rh = [Math]::Abs($y1 - $y0)
+            if ($rw -lt 1) { $rw = 1 }
+            if ($rh -lt 1) { $rh = 1 }   # a hair-thin band still shows as a line
+            $g.FillRectangle($fill, [single]$rx, [single]$ry, [single]$rw, [single]$rh)
+            $g.DrawRectangle($pen,  [single]$rx, [single]$ry, [single]$rw, [single]$rh)
+        }
+        $fill.Dispose(); $pen.Dispose()
+    } catch {
+        # a slot-overlay failure must never crash the preview
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Draw-HoleLabels - number each hole 1..N on a layout preview so the operator can
+# tell WHICH physical hole a "Hole #N" card / a picked datum point refers to (the
+# index-hole page's problem: the choice cards say "Hole #1..#N" but the dots were
+# anonymous). Numbers are drawn in the SAME plate-frame -> screen transform the
+# preview dots use (X right, Z up, origin bottom-left), so label #k sits on point
+# ordinal k-1 (Get-IndexHolePlan Keys are 0-based; the label is Key+1 to match the
+# 1-based "Hole #N" cards). $Points is any list of {X;Z} (an OrthoGeo.Points list).
+#
+#   $Graphics           - System.Drawing.Graphics from the paint handler ($e.Graphics)
+#   $Points             - the layout points ({X;Z}; malformed points are skipped but
+#                         still consume an ordinal, so numbering stays aligned to the
+#                         cards, which are also keyed by input ordinal)
+#   $OffX,$OffY,$DrawH  - the plate rectangle's top-left px + drawn height (preview's
+#                         $offX/$offY/$drawH)
+#   $Scale              - model-units -> px scale (preview's $scale)
+#   $HighlightKey       - optional 0-based ordinal to RING + colour (the chosen index
+#                         hole); $null = no highlight. Matches Get-IndexHolePlan Key.
+#
+# Draws OVER the hole dots (call AFTER FillEllipse) so the number reads on top; the
+# highlight ring is drawn under its own number. Pure drawing; NEVER throws. global:
+# scope for the hybrid .cmd .GetNewClosure() Paint handlers (same reason as the
+# sibling helpers above).
+# ----------------------------------------------------------------------------
+function global:Draw-HoleLabels {
+    param($Graphics, $Points, [double]$OffX, [double]$OffY, [double]$DrawH, [double]$Scale, $HighlightKey = $null, [double]$HoleDia = 0.0)
+    try {
+        if ($null -eq $Points) { return }
+        $g = $Graphics
+        $font  = New-Object System.Drawing.Font('Segoe UI', 8, [System.Drawing.FontStyle]::Bold)
+        $ink   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(245,245,250))
+        # a dark halo behind each number so it reads over the red hole + amber band
+        $halo  = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(190, 20, 26, 42))
+        $hiPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(120, 210, 150), 2.0)   # green ring = chosen index
+        $hiInk = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 235, 175))
+        $hk = $null
+        if ($null -ne $HighlightKey) { try { $hk = [int]$HighlightKey } catch { $hk = $null } }
+        # holes are drawn as to-scale circles (Draw-HoleCircles); place the ring + number
+        # OUTSIDE that circle so a big hole is not hidden by its own label. $HoleDia=0 ->
+        # the old fixed dot, so fall back to the fixed 7px ring / +4 number offset.
+        $rPx = 0.0
+        if ($HoleDia -gt 0 -and $Scale -gt 0) { $rPx = ($HoleDia * $Scale) / 2.0 }
+        $ringR = [Math]::Max(7.0, $rPx + 3.0)
+        $lblGap = [Math]::Max(4.0, $rPx + 2.0)
+        $ord = 0
+        foreach ($pt in $Points) {
+            $x = $null; $z = $null
+            try { if ($null -ne $pt.X) { $x = [double]$pt.X } } catch {}
+            try { if ($null -ne $pt.Z) { $z = [double]$pt.Z } } catch {}
+            if ($null -eq $x -or $null -eq $z) { $ord++; continue }   # keep ordinal aligned to the cards
+            $px = $OffX + $x * $Scale
+            $py = $OffY + $DrawH - $z * $Scale
+            $isHi = ($null -ne $hk -and $ord -eq $hk)
+            if ($isHi) {
+                # ring the chosen index hole (just outside its circle) so it stands out
+                $g.DrawEllipse($hiPen, [single]($px-$ringR), [single]($py-$ringR), [single]($ringR*2), [single]($ringR*2))
+            }
+            $txt = [string]($ord + 1)                    # 1-based, matches "Hole #N" cards
+            $sz  = $g.MeasureString($txt, $font)
+            # place the number just outside the hole circle so it does not hide the center
+            $lx = $px + $lblGap; $ly = $py - $sz.Height - 2
+            $g.FillRectangle($halo, [single]($lx-1), [single]($ly), [single]($sz.Width+2), [single]($sz.Height))
+            $g.DrawString($txt, $font, $(if ($isHi) { $hiInk } else { $ink }), [single]$lx, [single]$ly)
+            $ord++
+        }
+        $font.Dispose(); $ink.Dispose(); $halo.Dispose(); $hiPen.Dispose(); $hiInk.Dispose()
+    } catch {
+        # a label failure must never crash the preview paint
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Draw-HoleCircles - draw each hole as a TO-SCALE circle (its real drilled footprint)
+# instead of a fixed marker dot (user request 2026-07-17: "draw the hole as a circle,
+# instead of a dot"). The circle diameter is the hole diameter mapped through the SAME
+# plate-frame -> screen transform the preview uses ($HoleDia * $Scale), so the operator
+# sees the true hole size relative to the plate - and holes that would overlap (spacing
+# < diameter, the collision the HoleDia check flags) visibly overlap here too. A
+# translucent crimson fill + a crisp crimson edge. Falls back to the old 6px marker dot
+# when $HoleDia <= 0 (diameter unknown) or the circle would be sub-pixel, so a tiny hole
+# still shows. Drawn OVER the slot bands, UNDER the number labels (call after
+# Draw-SlotRects, before Draw-HoleLabels). Pure drawing; NEVER throws. global: scope for
+# the hybrid .cmd .GetNewClosure() Paint handlers (same reason as the sibling helpers).
+#
+#   $Graphics           - System.Drawing.Graphics from the paint handler ($e.Graphics)
+#   $Points             - the layout points ({X;Z}; malformed points skipped)
+#   $OffX,$OffY,$DrawH  - the plate rectangle's top-left px + drawn height (preview's
+#                         $offX/$offY/$drawH)
+#   $Scale              - model-units -> px scale (preview's $scale)
+#   $HoleDia            - hole diameter in MODEL units (0 = unknown -> fixed dot)
+# ----------------------------------------------------------------------------
+function global:Draw-HoleCircles {
+    param($Graphics, $Points, [double]$OffX, [double]$OffY, [double]$DrawH, [double]$Scale, [double]$HoleDia = 0.0)
+    try {
+        if ($null -eq $Points) { return }
+        $g = $Graphics
+        $edge = [System.Drawing.Color]::FromArgb(240, 120, 110)                 # crimson edge / dot
+        $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(90, 240, 120, 110))  # translucent crimson footprint
+        $pen  = New-Object System.Drawing.Pen($edge, 1.25)
+        $dotBr= New-Object System.Drawing.SolidBrush($edge)
+        $rPx = 0.0
+        if ($HoleDia -gt 0 -and $Scale -gt 0) { $rPx = ($HoleDia * $Scale) / 2.0 }
+        foreach ($pt in $Points) {
+            $x = $null; $z = $null
+            try { if ($null -ne $pt.X) { $x = [double]$pt.X } } catch {}
+            try { if ($null -ne $pt.Z) { $z = [double]$pt.Z } } catch {}
+            if ($null -eq $x -or $null -eq $z) { continue }
+            $px = $OffX + $x * $Scale
+            $py = $OffY + $DrawH - $z * $Scale
+            if ($rPx -ge 2.0) {
+                $d = [single]($rPx * 2)
+                $g.FillEllipse($fill, [single]($px - $rPx), [single]($py - $rPx), $d, $d)
+                $g.DrawEllipse($pen,  [single]($px - $rPx), [single]($py - $rPx), $d, $d)
+            } else {
+                # diameter unknown or sub-pixel -> the previous small marker dot
+                $g.FillEllipse($dotBr, [single]($px - 3), [single]($py - 3), 6, 6)
+            }
+        }
+        $fill.Dispose(); $pen.Dispose(); $dotBr.Dispose()
+    } catch {
+        # a circle-overlay failure must never crash the preview paint
+    }
+}
+
 function Show-OrthogridDialog {
     # ------------------------------------------------------------------------
     # Show-OrthogridDialog - modal WinForms editor for an orthogrid hole pattern.
@@ -115,11 +290,25 @@ function Show-OrthogridDialog {
     $clearDia = 0.0
     if ($hasHoleDia) { $clearDia = [double]$HoleDiameter }
 
+    # EDGE MARGIN = THE HOLE DIAMETER (user 2026-07-21: "the edge margin ... should
+    # always be the same as the diameter of the hole"). Because the plate is sized with
+    # ClearDia = the hole dia, the Edge field IS the wall from a border hole's EDGE to
+    # the part edge, so forcing Edge = hole dia makes that wall exactly one diameter.
+    # We LOCK the field (read-only, below) so the operator sees the value but cannot
+    # break the rule. Only when the hole dia is known; with no dia we keep the field
+    # editable at its normal default (a standalone orthogrid with no jig context).
+    $lockEdge = ($clearDia -gt 0)
+    if ($lockEdge) { $Edge = $clearDia }
+    # pass the SAME wall to Get-OrthogridGeometry so its check + echoed .EdgeMargin agree
+    # with the locked field (one diameter); -1 (legacy one-radius) when the dia is unknown.
+    $edgeMargin = if ($lockEdge) { $clearDia } else { -1.0 }
+
     # script-scoped live state shared by the event handlers (avoids loop-var /
     # closure-capture pitfalls - handlers read $script:* by reference, always
     # seeing the latest recompute).
     $script:ogResult   = $null      # last Get-OrthogridGeometry result
     $script:ogAccepted = $false     # set true only when OK is clicked
+    $script:ogSlotWidth = $clearDia # chip-relief slot width (= hole dia); 0 = none
 
     # --- Form ---------------------------------------------------------------
     $form = New-Object System.Windows.Forms.Form
@@ -163,7 +352,15 @@ function Show-OrthogridDialog {
     $r4     = $r3 + $rowStep
     $tbNz   = New-FieldBox $Nz   $r4;                      $lbNz   = New-FieldLabel 'Holes along Z (Nz):' $r4
     $r5     = $r4 + $rowStep
-    $tbEdge = New-FieldBox $Edge $r5;                      $lbEdge = New-FieldLabel 'Edge margin:' $r5
+    $tbEdge = New-FieldBox $Edge $r5
+    # locked to the hole dia when a jig hole dia is known (wall = one diameter); the
+    # label calls it out so the operator understands why it cannot be edited.
+    $lbEdge = New-FieldLabel $(if ($lockEdge) { 'Edge margin (= hole dia):' } else { 'Edge margin:' }) $r5
+    if ($lockEdge) {
+        $tbEdge.ReadOnly  = $true
+        $tbEdge.TabStop   = $false
+        $tbEdge.BackColor = [System.Drawing.SystemColors]::Control
+    }
 
     $form.Controls.AddRange(@($lbCcX,$tbCcX,$lbCcZ,$tbCcZ,$lbNx,$tbNx,$lbNz,$tbNz,$lbEdge,$tbEdge))
 
@@ -201,21 +398,24 @@ function Show-OrthogridDialog {
     }
 
     # --- Live readout + error labels ---------------------------------------
+    # readout is 2 lines (it can carry Part .. | N holes | K slots | hole | relief | depth,
+    # long enough to wrap); error is 3 lines. Both word-wrap so nothing is clipped, and
+    # the preview + form height below flow from $r6 so they can never overlap.
     $lblReadout = New-Object System.Windows.Forms.Label
     $lblReadout.Location  = New-Object System.Drawing.Point($labelX, $r6)
-    $lblReadout.Size      = New-Object System.Drawing.Size(536, 20)
+    $lblReadout.Size      = New-Object System.Drawing.Size(536, 40)
     $lblReadout.Font      = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($lblReadout)
 
     $lblError = New-Object System.Windows.Forms.Label
-    $lblError.Location  = New-Object System.Drawing.Point($labelX, ($r6 + 22))
-    $lblError.Size      = New-Object System.Drawing.Size(536, 36)
+    $lblError.Location  = New-Object System.Drawing.Point($labelX, ($r6 + 44))
+    $lblError.Size      = New-Object System.Drawing.Size(536, 54)
     $lblError.ForeColor = [System.Drawing.Color]::Firebrick
     $form.Controls.Add($lblError)
 
     # --- Preview panel (fixed height; everything below it flows from $r6 so the
     #     optional context rows never crush the preview) ----------------------
-    $panelTop    = $r6 + 62
+    $panelTop    = $r6 + 104
     $panelHeight = 150
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Location    = New-Object System.Drawing.Point($labelX, $panelTop)
@@ -267,7 +467,9 @@ function Show-OrthogridDialog {
         if ($parseErrors.Count -eq 0) {
             # ClearDia = the relief (or hole) dia so the plate Width/Height clears
             # the widest feature at the border -- the operator no longer hand-adds it.
-            try { $res = Get-OrthogridGeometry -CcX $cx -CcZ $cz -Nx $nxv -Nz $nzv -Edge $ed -ClearDia $clearDia }
+            # HoleDia = the hole dia so a too-small ccX/ccZ (adjacent bores overlap)
+            # is caught and surfaced in $lblError, gating OK.
+            try { $res = Get-OrthogridGeometry -CcX $cx -CcZ $cz -Nx $nxv -Nz $nzv -Edge $ed -ClearDia $clearDia -HoleDia $clearDia -EdgeMargin $edgeMargin }
             catch { $res = $null }
         }
         $script:ogResult = $res
@@ -278,6 +480,11 @@ function Show-OrthogridDialog {
         if ($valid) {
             # Width/Height already include the relief clearance -> this IS the overall part dimension.
             $txt = ('Part {0:0.00} x {1:0.00}  |  {2} holes' -f $res.Width, $res.Height, $res.Count)
+            if ($script:ogSlotWidth -gt 0) {
+                $slN = 0
+                try { $slRc = Get-RowSlots -Points $res.Points -SlotWidth $script:ogSlotWidth -Width $res.Width -Height $res.Height -RowAxis 'X'; if ($slRc.Valid) { $slN = $slRc.Count } } catch {}
+                $txt = $txt + ('  |  {0} relief slot(s)' -f $slN)
+            }
             if ($hasHoleDia)   { $txt = $txt + ('  |  hole {0:0.###}' -f [double]$HoleDiameter) }
             if ($hasReliefDia) { $txt = $txt + ('  |  relief {0:0.###}' -f [double]$ReliefDiameter) }
             if ($hasThickness) { $txt = $txt + ('  |  depth {0:0.00}' -f [double]$Thickness) }
@@ -342,18 +549,19 @@ function Show-OrthogridDialog {
             $g.DrawRectangle($penPlate, $rx, $ry, $rw, $rh)
             $penPlate.Dispose()
 
-            # grid points
-            $dot   = 3.5
-            $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Crimson)
-            foreach ($pt in $res.Points) {
-                $px = $offX + ([double]$pt.X) * $scale
-                # flip Z so larger Z is nearer the top of the panel
-                $py = $offY + $drawH - ([double]$pt.Z) * $scale
-                $ex = [single]($px - $dot)
-                $ey = [single]($py - $dot)
-                $g.FillEllipse($brush, $ex, $ey, [single]($dot * 2), [single]($dot * 2))
+            # chip-relief slot bands (drawn UNDER the dots) - the SAME Get-RowSlots
+            # math slotinator / drilljig STAGE 4 use, so the operator sees the relief
+            # cuts (one per hole row) before the geometry is made.
+            if ($script:ogSlotWidth -gt 0) {
+                try {
+                    $slR = Get-RowSlots -Points $res.Points -SlotWidth $script:ogSlotWidth -Width $w -Height $h -RowAxis 'X'
+                    Draw-SlotRects -Graphics $g -Slots $slR -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale
+                } catch {}
             }
-            $brush.Dispose()
+
+            # grid points as TO-SCALE hole circles (real drilled footprint; fixed dot
+            # when the hole diameter is unknown). $script:ogSlotWidth == the hole dia.
+            Draw-HoleCircles -Graphics $g -Points $res.Points -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale -HoleDia $script:ogSlotWidth
 
             # axis indicator (X -> right, Z ^ up) so the operator sees which way
             # each offset runs. Matches the field labels (X / Z) and the bottom-left
@@ -462,9 +670,15 @@ function Show-CustomPointsDialog {
     # Plate clearance = the HOLE diameter (same decision as the orthogrid dialog).
     $clearDia = 0.0
     if ($hasHoleDia) { $clearDia = [double]$HoleDiameter }
+    # EDGE MARGIN = THE HOLE DIAMETER (user 2026-07-21): each border hole keeps one
+    # full diameter of wall to the part edge. Passed to Get-CustomPointsGeometry so
+    # the DERIVED plate grows to give that wall AND the edge check enforces it. -1
+    # (legacy) when the hole dia is unknown (a standalone custom layout, no jig dia).
+    $edgeMargin = if ($clearDia -gt 0) { $clearDia } else { -1.0 }
 
     $script:cpResult   = $null
     $script:cpAccepted = $false
+    $script:cpSlotWidth = $clearDia  # chip-relief slot width (= hole dia); 0 = none
 
     # --- Form ---------------------------------------------------------------
     $form = New-Object System.Windows.Forms.Form
@@ -473,20 +687,48 @@ function Show-CustomPointsDialog {
     $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.MaximizeBox     = $false
     $form.MinimizeBox     = $false
-    $form.ClientSize      = New-Object System.Drawing.Size(620, 470)
+    $form.ClientSize      = New-Object System.Drawing.Size(620, 524)
 
     # --- Instructions -------------------------------------------------------
     $lblHelp = New-Object System.Windows.Forms.Label
     $lblHelp.Location = New-Object System.Drawing.Point(12, 10)
-    $lblHelp.Size     = New-Object System.Drawing.Size(596, 34)
-    $lblHelp.Text     = "Add each hole's X and Z offset from the plate corner (the SIDE datum)." + [Environment]::NewLine +
-                        "X runs along TOP, Z along FRONT - the same convention as the orthogrid."
+    $lblHelp.Size     = New-Object System.Drawing.Size(596, 30)
+    $lblHelp.Text     = "First set the INDEX hole's X/Z offset from the plate corner. Then add each" + [Environment]::NewLine +
+                        "OTHER hole as an offset FROM THE INDEX hole. X runs along TOP, Z along FRONT."
     $form.Controls.Add($lblHelp)
 
-    # --- Points grid (DataGridView: editable X / Z columns) -----------------
+    # --- Index-hole fields (offset from the plate corner) -------------------
+    # The index hole is the ONE hole measured from the plate corner; every other hole is
+    # measured from IT. This becomes Points[0] and the index-first origin the jig
+    # references. Default 1.5*holeDia so the seed clears the edge-margin rule out of the box
+    # (near wall = index - radius >= EdgeMargin = holeDia -> index >= 1.5*holeDia); 0.5 when
+    # the hole dia is unknown.
+    $ixDefault = if ($hasHoleDia) { 1.5 * [double]$HoleDiameter } else { 0.5 }
+    $lblIdx = New-Object System.Windows.Forms.Label
+    $lblIdx.Text      = 'Index hole (from corner):'
+    $lblIdx.Location  = New-Object System.Drawing.Point(12, 42)
+    $lblIdx.Size      = New-Object System.Drawing.Size(160, 20)
+    $lblIdx.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $form.Controls.Add($lblIdx)
+    $lblIdxX = New-Object System.Windows.Forms.Label
+    $lblIdxX.Text = 'X'; $lblIdxX.Location = New-Object System.Drawing.Point(176, 44); $lblIdxX.Size = New-Object System.Drawing.Size(14, 18)
+    $form.Controls.Add($lblIdxX)
+    $tbIdxX = New-Object System.Windows.Forms.TextBox
+    $tbIdxX.Location = New-Object System.Drawing.Point(192, 42); $tbIdxX.Size = New-Object System.Drawing.Size(58, 22)
+    $tbIdxX.Text = ('{0}' -f $ixDefault)
+    $form.Controls.Add($tbIdxX)
+    $lblIdxZ = New-Object System.Windows.Forms.Label
+    $lblIdxZ.Text = 'Z'; $lblIdxZ.Location = New-Object System.Drawing.Point(256, 44); $lblIdxZ.Size = New-Object System.Drawing.Size(14, 18)
+    $form.Controls.Add($lblIdxZ)
+    $tbIdxZ = New-Object System.Windows.Forms.TextBox
+    $tbIdxZ.Location = New-Object System.Drawing.Point(272, 42); $tbIdxZ.Size = New-Object System.Drawing.Size(58, 22)
+    $tbIdxZ.Text = ('{0}' -f $ixDefault)
+    $form.Controls.Add($tbIdxZ)
+
+    # --- Points grid (DataGridView: editable X / Z columns = offsets FROM the index) ---
     $grid = New-Object System.Windows.Forms.DataGridView
-    $grid.Location          = New-Object System.Drawing.Point(12, 50)
-    $grid.Size              = New-Object System.Drawing.Size(360, 250)
+    $grid.Location          = New-Object System.Drawing.Point(12, 72)
+    $grid.Size              = New-Object System.Drawing.Size(360, 228)
     $grid.AllowUserToAddRows = $true
     $grid.AllowUserToDeleteRows = $true
     $grid.RowHeadersVisible  = $true
@@ -495,10 +737,10 @@ function Show-CustomPointsDialog {
     $grid.EditMode           = [System.Windows.Forms.DataGridViewEditMode]::EditOnEnter
 
     $colX = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colX.HeaderText = 'X offset'
+    $colX.HeaderText = 'X from index'
     $colX.Name       = 'X'
     $colZ = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $colZ.HeaderText = 'Z offset'
+    $colZ.HeaderText = 'Z from index'
     $colZ.Name       = 'Z'
     $grid.Columns.Add($colX) | Out-Null
     $grid.Columns.Add($colZ) | Out-Null
@@ -597,15 +839,18 @@ function Show-CustomPointsDialog {
     $form.Controls.Add($panel)
 
     # --- Live readout + error labels ----------------------------------------
+    # 2 lines: the index-relative readout (Part .. | index @ (..) + N more = M | K slots)
+    # is long enough to wrap, so a 1-line box clipped its second line.
     $lblReadout = New-Object System.Windows.Forms.Label
-    $lblReadout.Location = New-Object System.Drawing.Point(12, 374)
-    $lblReadout.Size     = New-Object System.Drawing.Size(596, 20)
+    $lblReadout.Location = New-Object System.Drawing.Point(12, 372)
+    $lblReadout.Size     = New-Object System.Drawing.Size(596, 40)
     $lblReadout.Font     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($lblReadout)
 
+    # 3 lines + word-wrap so a long / combined validation message is shown in full.
     $lblError = New-Object System.Windows.Forms.Label
-    $lblError.Location  = New-Object System.Drawing.Point(12, 396)
-    $lblError.Size      = New-Object System.Drawing.Size(596, 32)
+    $lblError.Location  = New-Object System.Drawing.Point(12, 416)
+    $lblError.Size      = New-Object System.Drawing.Size(596, 48)
     $lblError.ForeColor = [System.Drawing.Color]::Firebrick
     $form.Controls.Add($lblError)
 
@@ -613,13 +858,13 @@ function Show-CustomPointsDialog {
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text     = 'OK'
     $btnOk.Size     = New-Object System.Drawing.Size(90, 28)
-    $btnOk.Location = New-Object System.Drawing.Point(420, 432)
+    $btnOk.Location = New-Object System.Drawing.Point(420, 484)
     $form.Controls.Add($btnOk)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text     = 'Cancel'
     $btnCancel.Size     = New-Object System.Drawing.Size(90, 28)
-    $btnCancel.Location = New-Object System.Drawing.Point(518, 432)
+    $btnCancel.Location = New-Object System.Drawing.Point(518, 484)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($btnCancel)
     $form.CancelButton = $btnCancel
@@ -654,7 +899,16 @@ function Show-CustomPointsDialog {
         $tbW.Enabled = $explicit
         $tbH.Enabled = $explicit
 
+        # grid rows are the OTHER holes' offsets FROM THE INDEX hole.
         $pts = & $readGridPoints
+
+        # index hole = the ONE hole measured from the plate corner. Parse both fields;
+        # a bad/blank index field is a parse error surfaced below (blocks OK).
+        $ixv = 0.0; $izv = 0.0
+        $idxErrs = @()
+        if (-not ([double]::TryParse($tbIdxX.Text, [ref]$ixv))) { $idxErrs += 'a numeric index X' }
+        if (-not ([double]::TryParse($tbIdxZ.Text, [ref]$izv))) { $idxErrs += 'a numeric index Z' }
+        $idxParseErr = if ($idxErrs.Count -gt 0) { 'Enter ' + ($idxErrs -join ' and ') + ' (offset from the corner)' } else { $null }
 
         # resolve the size overrides ($null -> derive). Only parse when explicit;
         # a blank/garbage box in explicit mode is a parse error surfaced below.
@@ -670,28 +924,43 @@ function Show-CustomPointsDialog {
         $sizeParseErr = if ($sizeErrs.Count -gt 0) { 'Enter ' + ($sizeErrs -join ' and ') } else { $null }
 
         $res = $null
-        try { $res = Get-CustomPointsGeometry -Points $pts -ClearDia $clearDia -WidthOverride $wOver -HeightOverride $hOver } catch { $res = $null }
+        # INDEX-RELATIVE: the index hole (ixv,izv) is measured from the corner; the grid
+        # rows are offsets FROM the index. Get-IndexRelativeCustomGeometry converts to the
+        # absolute {X;Z} list Get-CustomPointsGeometry consumes (index at Points[0]) and
+        # tags the result IndexRelative/IndexGridX/IndexGridZ. HoleDia = the hole dia so
+        # overlapping bores are caught and surfaced in $lblError, gating OK.
+        if ($null -eq $idxParseErr) {
+            try { $res = Get-IndexRelativeCustomGeometry -IndexX $ixv -IndexZ $izv -OtherPoints $pts -ClearDia $clearDia -WidthOverride $wOver -HeightOverride $hOver -HoleDia $clearDia -EdgeMargin $edgeMargin } catch { $res = $null }
+        }
         $script:cpResult = $res
 
         $valid = ($null -ne $res -and $res.Valid)
-        if ($explicit -and $null -ne $sizeParseErr) {
+        if ($null -ne $idxParseErr) {
             $lblReadout.Text = ''
+            $lblError.ForeColor = [System.Drawing.Color]::Firebrick
+            $lblError.Text   = $idxParseErr
+            $btnOk.Enabled   = $false
+        } elseif ($explicit -and $null -ne $sizeParseErr) {
+            $lblReadout.Text = ''
+            $lblError.ForeColor = [System.Drawing.Color]::Firebrick
             $lblError.Text   = $sizeParseErr
             $btnOk.Enabled   = $false
         } elseif ($valid) {
             $sizeTag = if ($res.WidthMode -eq 'explicit') { 'specified' } else { 'from holes' }
-            $txt = ('Part {0:0.00} x {1:0.00} ({2})  |  {3} hole(s)' -f $res.Width, $res.Height, $sizeTag, $res.Count)
+            # Count includes the index hole (Points[0]); show it explicitly so the
+            # operator sees index + others all drill.
+            $txt = ('Part {0:0.00} x {1:0.00} ({2})  |  index @ ({3:0.###},{4:0.###}) + {5} more = {6} hole(s)' -f `
+                $res.Width, $res.Height, $sizeTag, $res.IndexGridX, $res.IndexGridZ, ($res.Count - 1), $res.Count)
+            if ($script:cpSlotWidth -gt 0) {
+                $slN = 0
+                try { $slRc = Get-RowSlots -Points $res.Points -SlotWidth $script:cpSlotWidth -Width $res.Width -Height $res.Height -RowAxis 'X'; if ($slRc.Valid) { $slN = $slRc.Count } } catch {}
+                $txt += ('  |  {0} relief slot(s)' -f $slN)
+            }
             if ($hasHoleDia)   { $txt += ('  |  hole {0:0.###}' -f [double]$HoleDiameter) }
             if ($hasReliefDia) { $txt += ('  |  relief {0:0.###}' -f [double]$ReliefDiameter) }
             if ($hasThickness) { $txt += ('  |  depth {0:0.00}' -f [double]$Thickness) }
             $lblReadout.Text = $txt
-            # surface the origin-skip as an informational note (not an error).
-            if ($res.SkippedOrigin -gt 0) {
-                $lblError.ForeColor = [System.Drawing.Color]::DarkGreen
-                $lblError.Text = ('(note: {0} point(s) at the origin will NOT be drilled)' -f $res.SkippedOrigin)
-            } else {
-                $lblError.Text = ''
-            }
+            $lblError.Text = ''
             $btnOk.Enabled   = $true
         } else {
             $lblReadout.Text = ''
@@ -728,14 +997,16 @@ function Show-CustomPointsDialog {
             $penPlate = New-Object System.Drawing.Pen([System.Drawing.Color]::SteelBlue, 1.5)
             $g.DrawRectangle($penPlate, [single]$offX, [single]$offY, [single]$drawW, [single]$drawH)
             $penPlate.Dispose()
-            $dot = 3.0
-            $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Crimson)
-            foreach ($pt in $res.Points) {
-                $px = $offX + ([double]$pt.X) * $scale
-                $py = $offY + $drawH - ([double]$pt.Z) * $scale
-                $g.FillEllipse($brush, [single]($px - $dot), [single]($py - $dot), [single]($dot * 2), [single]($dot * 2))
+            # chip-relief slot bands (drawn UNDER the dots) - same Get-RowSlots math as slotinator.
+            if ($script:cpSlotWidth -gt 0) {
+                try {
+                    $slR = Get-RowSlots -Points $res.Points -SlotWidth $script:cpSlotWidth -Width $w -Height $h -RowAxis 'X'
+                    Draw-SlotRects -Graphics $g -Slots $slR -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale
+                } catch {}
             }
-            $brush.Dispose()
+            # grid points as TO-SCALE hole circles (fixed dot when the dia is unknown).
+            # $script:cpSlotWidth == the hole dia.
+            Draw-HoleCircles -Graphics $g -Points $res.Points -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale -HoleDia $script:cpSlotWidth
 
             # axis indicator (X -> right, Z ^ up) matching the X/Z offset fields.
             Draw-AxisGlyph -Graphics $g -ClientW $cw -ClientH $ch
@@ -760,6 +1031,8 @@ function Show-CustomPointsDialog {
     $rbExplicit.Add_CheckedChanged($updateState)
     $tbW.Add_TextChanged($updateState)
     $tbH.Add_TextChanged($updateState)
+    $tbIdxX.Add_TextChanged($updateState)
+    $tbIdxZ.Add_TextChanged($updateState)
 
     $btnOk.Add_Click({
         & $updateState

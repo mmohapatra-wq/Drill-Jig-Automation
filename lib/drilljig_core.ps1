@@ -60,9 +60,13 @@ function Write-DJ {
 # ============================================================================
 
 # Turn a machinist fraction or plain number ("3/4", "0.5") into a decimal.
+# A zero denominator ("3/0") returns $null, NOT Infinity: PowerShell double division
+# by zero yields [double]::PositiveInfinity (no exception), which would then slip past
+# a naive ">0" gate and flow downstream as a garbage/infinite dimension.
 function ConvertTo-Decimal {
     param([string]$Text)
     if ($Text -match '^\s*(\d+)\s*/\s*(\d+)\s*$') {
+        if ([double]$matches[2] -eq 0) { return $null }
         return [double]$matches[1] / [double]$matches[2]
     }
     $d = 0.0
@@ -70,12 +74,45 @@ function ConvertTo-Decimal {
     return $null
 }
 
-# Pull the machinist-fraction label ("3/4", "1 3/8") for OD or Lg out of an
+# Validate an operator-entered chip-relief SLOT DEPTH (inches). PURE (no COM/state)
+# so both front-ends validate a typed depth the same way and it is unit-testable.
+# The slot depth doubles as the plate EXTRUDE PAD: plate = bushingLen + slotDepth,
+# the slot removes slotDepth, so the functional guide depth stays == bushingLen for
+# ANY positive depth -- a smaller depth just yields a thinner overall plate (the
+# tight/restricted-space case, user 2026-07-21). Rules:
+#   * blank / whitespace / $null  -> Ok, Value = $Default (accept the default).
+#   * not a number                -> Error.
+#   * <= 0                        -> Error (a non-positive pad/cut is meaningless).
+#   * otherwise                   -> Ok, Value = the number rounded to 4 dp.
+# Returns @{ Ok = [bool]; Value = [double]; Error = [string]|$null }.
+# MUST be `function global:` -- the GUI's slot-depth step calls it from a TextBox
+# TextChanged .GetNewClosure() handler, and a closure module can ONLY resolve GLOBAL
+# functions (a plain script-scope dot-sourced function throws "'Resolve-SlotDepthInput'
+# is not recognized" at keystroke time -- confirmed live 2026-07-21). Same reason
+# Get-OrthogridGeometry / Get-RowSlots / the Draw-* helpers are global. The console
+# calls it directly (not a closure), which works either way.
+function global:Resolve-SlotDepthInput {
+    param([string]$Text, [double]$Default = 0.25)
+    $r = @{ Ok = $false; Value = [double]$Default; Error = $null }
+    if ($null -eq $Text -or [string]::IsNullOrWhiteSpace($Text)) { $r.Ok = $true; $r.Value = [double]$Default; return $r }
+    $v = 0.0
+    if (-not [double]::TryParse($Text.Trim(), [ref]$v)) { $r.Error = ("Not a number: '{0}'" -f $Text.Trim()); return $r }
+    if ($v -le 0) { $r.Error = 'Slot depth must be greater than 0.'; return $r }
+    $r.Ok = $true; $r.Value = [math]::Round($v, 4)
+    return $r
+}
+
+# Pull the machinist-fraction label ("3/4", "1 3/8") for OD, ID or Lg out of an
 # EasyName "<tag> | OD <od> x ID <id> x <len> Lg"; falls back to $Fallback.
+# The 'ID' branch (added for the ID-first pick flow) reads the middle "x ID <id> x"
+# token: drill-bushing IDs are decimals in EasyName so this returns the decimal
+# unchanged (matching how drills already display), while sleeve IDs are fractions
+# and render as such. OD/Lg branches are byte-identical to the original.
 function Get-FracLabel {
     param([string]$EasyName, [string]$Which, [string]$Fallback)
     if ($EasyName) {
         if ($Which -eq 'OD' -and $EasyName -match 'OD\s+(.+?)\s+x') { return $matches[1].Trim() }
+        if ($Which -eq 'ID' -and $EasyName -match 'x\s+ID\s+(.+?)\s+x') { return $matches[1].Trim() }
         if ($Which -eq 'Lg' -and $EasyName -match 'x\s+([^x]+?)\s+Lg') { return $matches[1].Trim() }
     }
     return $Fallback
@@ -164,8 +201,188 @@ function Group-CatalogByOD {
     return ,@($out)
 }
 
+# Group catalog rows into the ID-FIRST hierarchy ID -> length -> OD (all ascending),
+# carrying the machinist-fraction labels. Pure. The ID-first analog of
+# Group-CatalogByOD, used by the reordered pick flow (user 2026-07-21: ask ID first,
+# then length; after those the OD is usually unique so it is auto-resolved, and only
+# offered as a tie-breaker when a bore+length exists at more than one OD). Returns an
+# array of
+#   @{ ID; IDLabel; Lengths = @( @{ Length; LenLabel; ODCount; ODs = @( @{ OD; ODLabel; Rows = @(<row>...) } ) } ) }
+# The ODs tier is ALWAYS populated (even when ODCount == 1) so callers gate the
+# tie-breaker on the ODCount integer and never have to null-check ODs. ODCount and
+# ODs.Count are equal by construction. OD is THE drilled jig hole diameter, so it is
+# never silently chosen when ODCount > 1.
+function Group-CatalogByID {
+    param([array]$Rows)
+    $out = @()
+    if ($null -eq $Rows -or $Rows.Count -eq 0) { return ,@($out) }
+    $idGroups = @($Rows | Group-Object ID | Sort-Object { [double]$_.Name })
+    foreach ($ig in $idGroups) {
+        $idLabel = Get-FracLabel $ig.Group[0].EasyName 'ID' $ig.Name
+        $lenOut = @()
+        $lenGroups = @($ig.Group | Group-Object Length | Sort-Object { [double]$_.Name })
+        foreach ($lg in $lenGroups) {
+            $lenLabel = Get-FracLabel $lg.Group[0].EasyName 'Lg' $lg.Name
+            $odOut = @()
+            $odGroups = @($lg.Group | Group-Object OD | Sort-Object { [double]$_.Name })
+            foreach ($og in $odGroups) {
+                $odLabel = Get-FracLabel $og.Group[0].EasyName 'OD' $og.Name
+                $odOut += [pscustomobject]@{
+                    OD      = [double]$og.Name
+                    ODLabel = $odLabel
+                    # Rows here already share one (ID, Length, OD) - sort by PartNumber
+                    # (NOT ID, which is constant at this leaf) so Rows[0] is DETERMINISTIC
+                    # if a future catalog ever lists two part numbers at the same triplet.
+                    Rows    = @($og.Group | Sort-Object PartNumber)
+                }
+            }
+            $lenOut += [pscustomobject]@{
+                Length   = [double]$lg.Name
+                LenLabel = $lenLabel
+                ODCount  = $odOut.Count      # the tie-breaker gate; == ODs.Count
+                ODs      = $odOut
+            }
+        }
+        $out += [pscustomobject]@{
+            ID      = [double]$ig.Name
+            IDLabel = $idLabel
+            Lengths = $lenOut
+        }
+    }
+    return ,@($out)
+}
+
+# ============================================================================
+# STANDARDIZED-LENGTH PICK (user 2026-07-21): technicians report bushing sleeve
+# lengths are effectively standardized to the bore -- a 1/2" ID sleeve is normally
+# 1/2" long, a 3/4" ID 3/4" long. So the LENGTH menu is now a FIXED set {1/2, 3/4,
+# 1} + a Custom (type-anything) option, with a length RECOMMENDED from the chosen ID.
+# Because the fixed menu is DECOUPLED from the catalog's own length rows (a custom
+# length may match no SKU at all), OD can no longer be keyed on (ID, length) -- it is
+# re-keyed on ID ALONE (the union of the ID's distinct ODs). Applies to BOTH catalogs.
+# These three helpers are PURE (no COM/state) and are mirrored into jiginator.cmd /
+# jiginator.ps1 (which dot-source no lib). Flow stays ID -> length -> OD-tiebreak.
+# ============================================================================
+
+# The three standardized lengths (value -> machinist label), ascending.
+$script:DJStdLengths = @(
+    [pscustomobject]@{ Value = 0.5;  Label = '1/2' },
+    [pscustomobject]@{ Value = 0.75; Label = '3/4' },
+    [pscustomobject]@{ Value = 1.0;  Label = '1'   }
+)
+
+# Build the fixed length menu for a chosen ID (bore). Returns
+#   @{ Options = @( {Value; Label; IsCustom} , ... , {Value=$null; Label='Custom'; IsCustom=$true} );
+#      PreselectIndex = <int> }
+# PreselectIndex is the standardized length matching the ID by value (0.5->0, 0.75->1,
+# 1.0->2), or -1 when the ID matches none (e.g. drill ID 0.375). The recommendation is
+# by ID VALUE, independent of whether the catalog lists a SKU at that length. Pure.
+# `global:` so the GUI's Validate/OnNext/closures all resolve it (siblings Get-IdOdOptions /
+# Resolve-BushingPickRow are global too).
+function global:Get-BushingLengthOptions {
+    param([double]$Id)
+    $opts = @()
+    foreach ($s in $script:DJStdLengths) {
+        $opts += [pscustomobject]@{ Value = [double]$s.Value; Label = [string]$s.Label; IsCustom = $false }
+    }
+    $opts += [pscustomobject]@{ Value = $null; Label = 'Custom'; IsCustom = $true }
+    $pre = -1
+    for ($i = 0; $i -lt $script:DJStdLengths.Count; $i++) {
+        if ([math]::Abs([double]$script:DJStdLengths[$i].Value - $Id) -lt 1e-6) { $pre = $i; break }
+    }
+    return @{ Options = $opts; PreselectIndex = $pre }
+}
+
+# Distinct ODs reachable by one Group-CatalogByID entry (the UNION across its length
+# tier), ascending. Each -> @{ OD; ODLabel; Rows = @(all SKU rows at that OD) }. This
+# is the OD set the tie-break / auto-resolve now works from (OD re-keyed on ID). Pure.
+# `global:` so the GUI can call it from Build AND from .GetNewClosure() handlers (the
+# same reason Get-OrthogridGeometry / Resolve-SlotDepthInput are global).
+function global:Get-IdOdOptions {
+    param($IdGroup)
+    $byOd = @{}
+    if ($null -ne $IdGroup) {
+        foreach ($ln in @($IdGroup.Lengths)) {
+            foreach ($od in @($ln.ODs)) {
+                $key = ('{0:0.######}' -f [double]$od.OD)
+                if (-not $byOd.ContainsKey($key)) {
+                    $byOd[$key] = [pscustomobject]@{ OD = [double]$od.OD; ODLabel = [string]$od.ODLabel; Rows = @() }
+                }
+                $byOd[$key].Rows += @($od.Rows)
+            }
+        }
+    }
+    $out = @($byOd.Values | Sort-Object { [double]$_.OD })
+    # Rows here span the ID's lengths at this OD. Each catalog row has ONE Length so it
+    # lands in exactly one length group -> the union never repeats a row, so NO PartNumber
+    # de-dup (the drill catalog has truncated/duplicated PartNumbers -- e.g. many "8493A2"
+    # rows -- so a Sort-Unique on PartNumber would wrongly collapse distinct-length SKUs).
+    # Sort by (Length, PartNumber) for a deterministic order.
+    foreach ($o in $out) { $o.Rows = @($o.Rows | Sort-Object { [double]$_.Length }, PartNumber) }
+    return ,@($out)
+}
+
+# Resolve the final pick object from (ID group, chosen OD option, chosen length). If an
+# exact (ID, OD, Length) SKU row exists in the OD option's rows (matched within 1e-6),
+# return it verbatim (real EasyName + PartNumber). Otherwise synthesize a pick carrying
+# the chosen (possibly custom) length. Returns {EasyName; OD; ID; Length; PartNumber}.
+# CRITICAL: .Length is ALWAYS the chosen double -- downstream BushingLength -> STAGE 2
+# SIDE-plane offset (= plate thickness) reads it. .OD is ALWAYS a real catalog OD. Pure.
+# `global:` so the GUI's OnPick / "Use this length" .GetNewClosure() handlers resolve it.
+function global:Resolve-BushingPickRow {
+    param($IdGroup, $OdOption, [double]$Length, [string]$LenLabel)
+    $exact = @($OdOption.Rows | Where-Object { [math]::Abs([double]$_.Length - $Length) -lt 1e-6 } | Select-Object -First 1)
+    if ($exact.Count -gt 0) { return $exact[0] }
+    $tag = 'Bushing'
+    if (@($OdOption.Rows).Count -gt 0 -and $OdOption.Rows[0].EasyName) {
+        $tag = ($OdOption.Rows[0].EasyName -split '\|')[0].Trim()
+    }
+    return [pscustomobject]@{
+        EasyName   = ("{0} | OD {1} x ID {2} x {3} Lg" -f $tag, $OdOption.ODLabel, $IdGroup.IDLabel, $LenLabel)
+        OD         = [double]$OdOption.OD
+        ID         = [double]$IdGroup.ID
+        Length     = [double]$Length
+        PartNumber = '(custom length)'
+    }
+}
+
+# Validate an operator-entered CUSTOM bushing length (inches). PURE, unit-testable,
+# and the single validator shared by console + GUI so they behave identically. Accepts
+# a decimal ("0.9"), a simple fraction ("3/8"), OR a mixed number ("1 3/8") -- the
+# machinist audience types mixed numbers, which ConvertTo-Decimal alone does NOT parse.
+# Rules: blank/$null -> Ok, Value = $Default (accept the recommendation); non-numeric
+# or <= 0 -> Error. Returns @{ Ok = [bool]; Value = [double]; Error = [string]|$null }.
+# `function global:` for the same reason as Resolve-SlotDepthInput (called from a GUI
+# TextBox TextChanged .GetNewClosure() handler, which resolves GLOBAL functions only).
+function global:Resolve-BushingLengthInput {
+    param([string]$Text, [double]$Default = 0.5)
+    $r = @{ Ok = $false; Value = [double]$Default; Error = $null }
+    if ($null -eq $Text -or [string]::IsNullOrWhiteSpace($Text)) { $r.Ok = $true; $r.Value = [double]$Default; return $r }
+    $t = $Text.Trim()
+    $v = $null
+    # mixed number: "<whole> <num>/<den>"
+    if ($t -match '^\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s*$') {
+        $den = [double]$matches[3]
+        if ($den -ne 0) { $v = [double]$matches[1] + ([double]$matches[2] / $den) }
+    } else {
+        $v = ConvertTo-Decimal $t
+    }
+    if ($null -eq $v) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    # Reject NaN / +/-Infinity (PS 5.1 has no [double]::IsFinite) before the >0 gate --
+    # Infinity would pass "-gt 0" and Round() without throwing.
+    if ([double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ($v -le 0) { $r.Error = 'Length must be greater than 0.'; return $r }
+    $r.Ok = $true; $r.Value = [math]::Round([double]$v, 4)
+    return $r
+}
+
 # Synthesize an "ID unspecified" bushing pick from an OD+length group's rows
 # (OD still drives the hole; the user may leave the exact ID open). Pure.
+# RETAINED FOR BACK-COMPAT ONLY: this and Group-CatalogByOD are dead in the ID-first
+# pick flow (ID is now the first mandatory question, so there is no hidden ID to leave
+# unspecified). Kept because Group-CatalogByOD is still exported + unit-tested; if an
+# "any bore" need returns, the clean home is a separate top-level "pick OD directly"
+# branch reusing Group-CatalogByOD, not a first-position ID placeholder.
 function New-IdUnspecifiedPick {
     param([string]$ODLabel, [string]$LenLabel, [array]$Rows)
     $tag = ($Rows[0].EasyName -split '\|')[0].Trim()
@@ -533,6 +750,101 @@ function New-OffsetPlane {
     if ($needSym) { Write-DJ "    $Label offset dim: $sym = $($after[$sym])" 'Green' }
     else          { Write-DJ "    $Label plane feat id $newFeatId (offset $Offset)" 'DarkGray' }
     return [pscustomobject]@{ Symbol = $sym; FeatId = $newFeatId }
+}
+
+# ----------------------------------------------------------------------------
+# CSYS-REFERENCED DATUM PLANES (the 2026-07-14 architecture change): planes are
+# offset from a COORDINATE SYSTEM + one of its axes instead of from the TOP/SIDE/
+# FRONT default datums, so re-placing that csys (via the transform-reimport) moves
+# every plane -> point -> hole with it. New-OffsetPlane above is LEFT INTACT
+# (slotinator / New-SlotGuidePlanes still offset from planes); this is a sibling.
+# ----------------------------------------------------------------------------
+
+# Build-CsysOffsetPlaneMacro - PURE. mapkey 2: select the csys BY ID, ProCmdDatumPlane,
+# pick the csys axis (t1.constr_csys_axis = Axis_X/Y/Z), optional offset (t1.constr_dim1),
+# OK. ONE atomic RunMacro. Offset ~0 -> the axis's principal plane (no dim typed, like
+# the recorded axis-only planes). LIVE-UNVERIFIED that the axis dropdown + t1.constr_dim1
+# combine in one plane (the mapkey showed them separately) - New-CsysOffsetPlane canary-
+# gates; the fallback is the t1.constrs_table/column_2 path the recorded offset plane used.
+function Build-CsysOffsetPlaneMacro {
+    param([int]$CsysFeatId, [string]$Axis, [double]$Offset)
+    $axTok = "Axis_" + ($Axis.ToUpper())
+    $m = (Get-SelectByIdMacro -FeatId $CsysFeatId) +
+        "~ Command ``ProCmdDatumPlane``;" +
+        "~ Open  ``Odui_Dlg_00`` ``t1.constr_csys_axis``;" +
+        "~ Close ``Odui_Dlg_00`` ``t1.constr_csys_axis``;" +
+        "~ Select ``Odui_Dlg_00`` ``t1.constr_csys_axis`` 1 ``$axTok``;"
+    if ([math]::Abs([double]$Offset) -gt 1e-9) {
+        $m += "~ Input  ``Odui_Dlg_00`` ``t1.constr_dim1`` ``$Offset``;" +
+              "~ Update ``Odui_Dlg_00`` ``t1.constr_dim1`` ``$Offset``;" +
+              "~ Activate ``Odui_Dlg_00`` ``t1.constr_dim1``;" +
+              "~ FocusOut ``Odui_Dlg_00`` ``t1.constr_dim1``;"
+    }
+    $m += "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+    return $m
+}
+
+# Resolve-NewPlaneAfterCommit - the (A) VersionStamp wait + (B) new-feature/new-dim
+# discovery lifted verbatim from New-OffsetPlane, so New-CsysOffsetPlane shares the
+# EXACT same commit-wait + symbol/feat discovery + return shape without touching the
+# proven New-OffsetPlane. Caller snapshots $before (dim map, or @{} when !NeedSym),
+# $beforeFeat (Get-FeatureIdSet), $preStamp, and fires the macro FIRST.
+function Resolve-NewPlaneAfterCommit {
+    param([hashtable]$BeforeFeat, [hashtable]$Before, [string]$PreStamp, [string]$Label, [bool]$NeedSym)
+    $stampMoved = $false
+    if ($null -ne $PreStamp) {
+        $deadlineA = [DateTime]::Now.AddSeconds(20)
+        while ([DateTime]::Now -lt $deadlineA) {
+            try { if ([string]$script:DJModel.VersionStamp -ne $PreStamp) { $stampMoved = $true; break } } catch {}
+            Start-Sleep -Milliseconds 40
+        }
+        if (-not $stampMoved) { Write-DJ "    (waiting for Creo to commit the $Label plane timed out at 20s)" 'DarkGray' }
+    }
+    $newFeatId = $null; $sym = $null; $after = $Before
+    $deadlineB = [DateTime]::Now.AddSeconds($(if ($stampMoved) { 8 } else { 1 }))
+    while ($true) {
+        $afterFeat = Get-FeatureIdSet
+        $newFeats  = @($afterFeat.Keys | Where-Object { -not $BeforeFeat.ContainsKey($_) })
+        if ($newFeats.Count -ge 1) { $newFeatId = [int]$newFeats[0] }
+        if ($NeedSym) {
+            $after   = Get-LinearDimMap -Model $script:DJModel -TypeObj $script:DJType
+            $newSyms = @($after.Keys | Where-Object { -not $Before.ContainsKey($_) })
+            if ($newSyms.Count -ge 1) {
+                if ($newSyms.Count -gt 1) { Write-DJ "    More than one new dim appeared ($($newSyms -join ', ')); taking the first." 'Yellow' }
+                $sym = [string]$newSyms[0]; break
+            }
+        } elseif ($null -ne $newFeatId) {
+            break
+        }
+        if ([DateTime]::Now -ge $deadlineB) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    if ($NeedSym -and $null -eq $sym) {
+        Write-DJ "    No new linear dim appeared for the $Label plane (feat id $newFeatId)." 'Yellow'
+        return [pscustomobject]@{ Symbol = $null; FeatId = $newFeatId }
+    }
+    if (-not $NeedSym -and $null -eq $newFeatId) {
+        Write-DJ "    No new feature appeared for the $Label plane." 'Yellow'
+        return [pscustomobject]@{ Symbol = $null; FeatId = $null }
+    }
+    if ($NeedSym) { Write-DJ "    $Label offset dim: $sym = $($after[$sym])" 'Green' }
+    else          { Write-DJ "    $Label plane feat id $newFeatId" 'DarkGray' }
+    return [pscustomobject]@{ Symbol = $sym; FeatId = $newFeatId }
+}
+
+# New-CsysOffsetPlane - the csys+axis+offset sibling of New-OffsetPlane. Same
+# return shape @{ Symbol; FeatId } and same -SkipSymbolWait semantics, so every
+# downstream .Sym/.FeatId consumer (resize loop, slot-depth read, grid intersections,
+# show) is unchanged. Axis is 'X'|'Y'|'Z'.
+function New-CsysOffsetPlane {
+    param([int]$CsysFeatId, [ValidateSet('X','Y','Z')][string]$Axis, [double]$Offset, [switch]$SkipSymbolWait)
+    $needSym    = -not $SkipSymbolWait
+    $before     = if ($needSym) { Get-LinearDimMap -Model $script:DJModel -TypeObj $script:DJType } else { @{} }
+    $beforeFeat = Get-FeatureIdSet
+    $preStamp   = $null; try { $preStamp = [string]$script:DJModel.VersionStamp } catch {}
+    $label      = "csys Axis_$Axis @ $Offset"
+    Invoke-Macro "$label plane: csys+axis+offset + OK" (Build-CsysOffsetPlaneMacro -CsysFeatId $CsysFeatId -Axis $Axis -Offset $Offset)
+    return (Resolve-NewPlaneAfterCommit -BeforeFeat $beforeFeat -Before $before -PreStamp $preStamp -Label $label -NeedSym $needSym)
 }
 
 # Write one plane's offset, force a regen, return the value that stuck (or $null).
@@ -945,6 +1257,237 @@ function Invoke-IndexCsys {
         try { $script:DJSession.RunMacro((Get-CsysShowMacro -FeatId $newId)) } catch {}
     }
     return @{ Ok = $true; NewFeatId = $newId; NewFeatCount = $newFeats.Count; Reason = 'created' }
+}
+
+# ============================================================================
+# BASE COORDINATE SYSTEM (mapkey 1) - the reference csys everything hangs off
+# ============================================================================
+# Find-DefaultCsysId - the feature id of the part's DEFAULT coordinate system, found
+# fully automatically (no user pick). The default csys name varies by template
+# (CSYS_PAT_DEF on this build; PRT_CSYS_DEF / ASM_CSYS_DEF / DEFAULT_CSYS / CS0
+# elsewhere), so we enumerate the model's ACTUAL coordinate systems (ITEM_COORD_SYS)
+# and (1) prefer one whose name matches a known default; (2) else take the FIRST csys
+# in the model (the default is created first, so it enumerates first). Only if the
+# model exposes NO coordinate system do we scan features by name as a last resort.
+# ID-and-name ONLY; never reads geometry.
+function Find-DefaultCsysId {
+    $preferred = @('CSYS_PAT_DEF','PRT_CSYS_DEF','ASM_CSYS_DEF','DEFAULT_CSYS','CSYS_DEF','CS0')
+    $firstCsysFeatId = $null
+    try {
+        foreach ($c in @($script:DJModel.ListItems($script:DJType.ITEM_COORD_SYS))) {
+            # resolve this csys to its owning feature id (fall back to the item id)
+            $fid = $null; $ff = $null
+            try { $ff = $c.GetFeature(); if ($null -ne $ff) { $fid = [int]$ff.Id } } catch {}
+            if ($null -eq $fid) { try { $fid = [int]$c.Id } catch {} }
+            if ($null -eq $fid) { continue }
+            if ($null -eq $firstCsysFeatId) { $firstCsysFeatId = $fid }   # remember the first as the fallback
+            # name (prefer the feature's name; fall back to the item's)
+            $nm = $null
+            if ($null -ne $ff) { try { $nm = [string]$ff.GetName() } catch {} }
+            if (-not $nm) { try { $nm = [string]$c.GetName() } catch {} }
+            if ($nm -and ($preferred -contains $nm.ToUpper())) { return $fid }   # a known default -> use it
+        }
+    } catch {}
+    if ($null -ne $firstCsysFeatId) { return $firstCsysFeatId }   # no known-name match -> first csys in the model
+    # last resort: the model exposed no ITEM_COORD_SYS -> a FEATURE named like a default csys
+    try {
+        foreach ($f in @($script:DJModel.ListItems($script:DJType.ITEM_FEATURE))) {
+            $nm = $null; try { $nm = [string]$f.GetName() } catch {}
+            if ($nm -and ($preferred -contains $nm.ToUpper())) { try { return [int]$f.Id } catch {} }
+        }
+    } catch {}
+    return $null
+}
+
+# Build-CsysFromCsysMacro - PURE. mapkey 1: select the reference csys BY ID ->
+# ProCmdDatumCsys -> OK. The one-reference analog of Build-CsysFromPlanesMacro.
+function Build-CsysFromCsysMacro {
+    param([int]$RefCsysId)
+    return (Get-SelectByIdMacro -FeatId $RefCsysId) +
+        "~ Command ``ProCmdDatumCsys``;" +
+        "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+}
+
+# Invoke-BaseCsys - fire Build-CsysFromCsysMacro, GATE on a NEW feature (canary),
+# return @{ Ok; CsysFeatId; Reason }. The base csys everything is offset from.
+function Invoke-BaseCsys {
+    param([int]$RefCsysId, [switch]$Show)
+    if ($RefCsysId -le 0) { return @{ Ok = $false; CsysFeatId = $null; Reason = 'no reference csys id (no default coordinate system found)' } }
+    $beforeFeat = Get-FeatureIdSet
+    $preStamp = $null; try { $preStamp = [string]$script:DJModel.VersionStamp } catch {}
+    Invoke-Macro "base csys: from ref csys $RefCsysId -> ProCmdDatumCsys -> OK" (Build-CsysFromCsysMacro -RefCsysId $RefCsysId)
+    if ($null -ne $preStamp) { [void](Wait-ModelModified -Model $script:DJModel -PreviousStamp $preStamp -TimeoutMs 15000) } else { Start-Sleep -Milliseconds 400 }
+    $afterFeat = Get-FeatureIdSet
+    $newFeats  = @($afterFeat.Keys | Where-Object { -not $beforeFeat.ContainsKey($_) } | Sort-Object)
+    if ($newFeats.Count -lt 1) { return @{ Ok = $false; CsysFeatId = $null; Reason = 'no new feature appeared (base csys not created)' } }
+    $newId = [int]$newFeats[-1]
+    if ($Show) { try { $script:DJSession.RunMacro((Get-CsysShowMacro -FeatId $newId)) } catch {} }
+    return @{ Ok = $true; CsysFeatId = $newId; Reason = 'created' }
+}
+
+# ============================================================================
+# TRANSFORM RE-IMPORT (mapkey 3) - re-reference the base csys onto the index hole
+# ============================================================================
+# After the index csys exists, capture the transform between the base csys and the
+# index csys (Analysis -> Transform tool), save it to a file, then REDEFINE the base
+# csys with OffsetType=file importing that transform -> the base csys (and every
+# plane/point/hole hung off it) relocates to the index hole.
+#
+# *** LIVE-UNVERIFIED / FRAGILE. Transcribed faithfully from the operator's recorded
+# *** mapkey, but it drives file Save-As / Open dialogs (Desktop) and the recording
+# *** had a @PAUSE_FOR_SCREEN_PICK (which a RunMacro cannot replay, so it is omitted
+# *** here). The Save-As uses Creo's DEFAULT filename to the Desktop and the reimport
+# *** opens from the Desktop; wiring a specific $TrfPath filename + the pause are the
+# *** expected live-tuning points. Invoke-CsysTransformReimport CANARY-GATES on the
+# *** model changing and reports UNVERIFIED - never a false green.
+
+# Build-CsysTransformExportMacro - PURE. Select index + base csys (accumulated BY ID),
+# open the Measure>Transform analysis tool, produce the transform info, Save-As to the
+# Desktop (default filename), exit the tool, close the text window. (mapkey 3, first half.)
+# WIDGET SEQUENCE RECONCILED against the operator's live recording 2026-07-15
+# (csystrf-probe.cmd -> csystrf_recipe.txt): the real command is ProCmdNaMeasureTransform
+# (NOT ProCmdNmdTool) and it opens DIRECTLY into transform mode -- there is NO
+# page_Analysis_control_btn activation and NO nmd_type_rg='Transform' selection (both were
+# earlier GUESSES, now removed). The two csys are consumed from the pre-selection (the
+# recording tree-selected them; we feed them by ID, the proven accumulate pattern). Exit is
+# nmd_exit_pb THEN '~ Close texttool texttool' (the earlier 'texttool CloseButton' was wrong).
+# NOTE: the Save-As types NO filename in the recording -> Creo writes its DEFAULT name to the
+# Desktop, and the reimport opens that default (see Build-CsysReimportMacro); $TrfPath stays
+# advisory (logged only). Reference ORDER (index-then-base) sets the transform direction --
+# a live-verify item if the base moves the wrong way.
+function Build-CsysTransformExportMacro {
+    param([int]$IndexCsysId, [int]$BaseCsysId)
+    return (Get-SelectByIdMacro -FeatId $IndexCsysId) +
+        (Get-SelectByIdMacro -FeatId $BaseCsysId -NoClear) +
+        "~ Command ``ProCmdNaMeasureTransform``;" +
+        "~ Trigger ``nmd_1`` ``nmd_setup_tbl`` 2 ``0`` ``References``;" +
+        "~ Trigger ``nmd_1`` ``nmd_setup_tbl`` 2 ```` ````;" +
+        "~ Activate ``nmd_1`` ``nmd_info_pb``;" +
+        "~ Select ``texttool`` ``MenuBar`` 1 ``FileMenu``;" +
+        "~ Close ``texttool`` ``MenuBar``;" +
+        "~ Activate ``texttool`` ``SaveAsPushButton``;" +
+        "~ Activate ``file_saveas`` ``desktop_pb``;" +
+        "~ Activate ``file_saveas`` ``OK``;" +
+        "~ Activate ``nmd_1`` ``nmd_exit_pb``;" +
+        "~ Close ``texttool`` ``texttool``;"
+}
+
+# Build-CsysReimportMacro - PURE. Redefine the base csys, switch its placement to
+# OffsetType=file, open the transform file from the Desktop, OK. (mapkey 3, 2nd half.)
+function Build-CsysReimportMacro {
+    param([int]$BaseCsysId)
+    return (Get-SelectByIdMacro -FeatId $BaseCsysId) +
+        "~ Command ``ProCmdRedefine@PopupMenuTree``;" +
+        "~ Open  ``Odui_Dlg_00`` ``t1.OffsetType``;" +
+        "~ Close ``Odui_Dlg_00`` ``t1.OffsetType``;" +
+        "~ Select ``Odui_Dlg_00`` ``t1.OffsetType`` 1 ``file``;" +
+        "~ Activate ``file_open`` ``desktop_pb``;" +
+        "~ Command ``ProFileSelPushOpen_Standard@context_dlg_open_cmd``;" +
+        "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;"
+}
+
+# Invoke-CsysTransformReimport - fire the export then the reimport, canary on the
+# model changing (the base-csys redefine mutates it). Returns @{ Ok; Reason }. The
+# $TrfPath is advisory (logged); the macros use the recorded Desktop/default-name flow.
+function Invoke-CsysTransformReimport {
+    param([int]$BaseCsysId, [int]$IndexCsysId, [string]$TrfPath = '')
+    if ($BaseCsysId -le 0 -or $IndexCsysId -le 0) { return @{ Ok = $false; Reason = 'need base + index csys ids' } }
+    $preStamp = $null; try { $preStamp = [string]$script:DJModel.VersionStamp } catch {}
+    Invoke-Macro "transform export (index $IndexCsysId vs base $BaseCsysId)$(if ($TrfPath) { " -> $TrfPath" })" (Build-CsysTransformExportMacro -IndexCsysId $IndexCsysId -BaseCsysId $BaseCsysId)
+    Start-Sleep -Milliseconds 500
+    Invoke-Macro "reimport transform into base csys $BaseCsysId (OffsetType=file)" (Build-CsysReimportMacro -BaseCsysId $BaseCsysId)
+    $changed = $false
+    if ($null -ne $preStamp) { $changed = Wait-ModelModified -Model $script:DJModel -PreviousStamp $preStamp -TimeoutMs 20000 }
+    if (-not $changed) {
+        return @{ Ok = $false; Reason = 'model did not change - transform export/reimport was a no-op (UNVERIFIED widgets: Analysis Transform tool + file Save-As/Open dialogs + the omitted screen-pick pause need live tuning)' }
+    }
+    return @{ Ok = $true; Reason = 're-referenced (verify the whole jig followed the base csys)' }
+}
+
+# Invoke-OutputCsys - build a ROBUST, INDEPENDENT coordinate system AT the index hole,
+# referenced off the part DEFAULT csys (CSYS_PAT_DEF), NOT off the grid planes or the
+# base csys. This is the SAFE, cycle-free way to deliver "the frame at the index hole":
+# it creates a real datum coordinate-system FEATURE at the index hole that downstream
+# machining/CMM can target, WITHOUT moving any geometry and WITHOUT the info.trf leg.
+# ----------------------------------------------------------------------------
+# The base csys is created coincident with CSYS_PAT_DEF, so the index hole is at design
+# coords (GridX, GridY, GridZ) relative to CSYS_PAT_DEF. Three planes off CSYS_PAT_DEF at
+# those offsets intersect exactly there; Build-CsysFromPlanesMacro (the live-confirmed
+# 3-plane->ProCmdDatumCsys recipe) turns them into the csys. It references only
+# CSYS_PAT_DEF + literal offsets -> it is a SIBLING of the base under CSYS_PAT_DEF, never
+# a descendant of the base/grid, so nothing can cycle and it survives grid edits.
+#
+# THE Y (through-thickness) ANCHOR -- MUST be off CSYS_PAT_DEF Axis_Y for AXIS ALIGNMENT:
+#   The index csys is intersected from the 3 anchor planes, and Creo derives its axis
+#   DIRECTIONS from those planes' NORMALS. X/Z anchors off CSYS_PAT_DEF have deterministic
+#   +X/+Z normals. The Y anchor's normal must ALSO be a deterministic +Y for the resulting
+#   csys to come out model-aligned (+X,+Y,+Z, right-handed) -- which is what makes the
+#   grid-plane OFFSET DIRECTION correct for any index hole.
+#   *** DO NOT anchor Y off the SIDE default datum (the old -YBaseId path): a default datum's
+#   *** normal SIGN is PART-SPECIFIC (+Y on some parts, -Y on others). A -Y makes (+X,-Y,+Z)
+#   *** LEFT-handed, so Creo flips X or Z to restore right-handedness -> the csys is SOMETIMES
+#   *** mirrored -> the offset direction is sometimes wrong (the 2026-07-17 bug). Anchoring Y
+#   *** off CSYS_PAT_DEF Axis_Y @ GridY (always +Y) keeps the triple consistent -> aligned axes
+#   *** every time (the same alignment the Invoke-BaseCsys copy gets). The Y ORIGIN then sits
+#   *** at GridY off CSYS_PAT_DEF (pass 0 = the model-origin plane), NOT necessarily on the
+#   *** plate face -- but the Y position is COSMETIC: it does not affect hole X/Z (those come
+#   *** from the Axis_X/Axis_Z grid planes + the SIDE-datum-pinned points) nor the STAGE-6
+#   *** export (Y_index = 0 for every hole). To sit the csys on the plate face WITH aligned
+#   *** axes needs an offset-COORDINATE-SYSTEM (translate CSYS_PAT_DEF preserving axes), an
+#   *** unrecorded dialog -- a follow-up if wanted. -YBaseId is RETAINED for compat but the
+#   *** index-first callers no longer pass it (they must not, per the above).
+# Returns @{ Ok; CsysFeatId; Reason; AnchorPlaneIds }. Canary-gated (Invoke-IndexCsys).
+function Invoke-OutputCsys {
+    param([int]$RefCsysId, [double]$GridX, [double]$GridZ, [double]$GridY = 0.0, $YBaseId = $null)
+    if ($RefCsysId -le 0) { return @{ Ok = $false; CsysFeatId = $null; Reason = 'need the default (CSYS_PAT_DEF) csys id'; AnchorPlaneIds = @() } }
+    # X + Z anchors off CSYS_PAT_DEF at the index hole's grid coords.
+    $px = New-CsysOffsetPlane -CsysFeatId $RefCsysId -Axis 'X' -Offset ([double]$GridX) -SkipSymbolWait
+    $pz = New-CsysOffsetPlane -CsysFeatId $RefCsysId -Axis 'Z' -Offset ([double]$GridZ) -SkipSymbolWait
+    # Y anchor at the extrude-depth face: off the SIDE default datum @ GridY when its id
+    # is known (the plate's own frame), else Axis_Y @ GridY off the csys (legacy fallback).
+    if ($null -ne $YBaseId -and [int]$YBaseId -gt 0) {
+        $py = New-OffsetPlane -Label "IdxY" -Offset ([double]$GridY) -BaseId ([int]$YBaseId) -SkipSymbolWait
+    } else {
+        $py = New-CsysOffsetPlane -CsysFeatId $RefCsysId -Axis 'Y' -Offset ([double]$GridY) -SkipSymbolWait
+    }
+    if ($null -eq $px.FeatId -or $null -eq $py.FeatId -or $null -eq $pz.FeatId) {
+        return @{ Ok = $false; CsysFeatId = $null; Reason = 'could not create the 3 independent anchor planes (X/Z off CSYS_PAT_DEF, Y at the extrude depth)'; AnchorPlaneIds = @() }
+    }
+    # planeIds stay in X/Y/Z-normal order for the csys axis assignment.
+    $planeIds = @([int]$px.FeatId, [int]$py.FeatId, [int]$pz.FeatId)
+    # intersect them into the output csys (canary-gated on a new feature)
+    $csys = Invoke-IndexCsys -PlaneIds $planeIds -Show
+    if (-not $csys.Ok) { return @{ Ok = $false; CsysFeatId = $null; Reason = "independent output csys not created: $($csys.Reason)"; AnchorPlaneIds = $planeIds } }
+    return @{ Ok = $true; CsysFeatId = [int]$csys.NewFeatId; Reason = 'created (independent; Y at extrude depth)'; AnchorPlaneIds = $planeIds }
+}
+
+# Invoke-IndependentReref - reref-method 'independent' (an ALTERNATIVE to the default
+# 'transform'). Builds an anchor csys off CSYS_PAT_DEF at the index hole (Invoke-OutputCsys)
+# then TRANSFORMS the base csys onto that anchor via the info.trf leg.
+# ----------------------------------------------------------------------------
+# The DEFAULT method is 'transform' (Invoke-CsysTransformReimport): change the base csys's
+# coordinate-system TYPE to OffsetType=file importing the base->index transform. That is
+# NOT a reference cycle -- OffsetType=file bakes a STATIC matrix relative to the base's
+# parent (CSYS_PAT_DEF); the file is DATA, not a live feature reference to the index csys
+# (the index csys is only READ to compute the matrix, then frozen). This 'independent'
+# variant just targets an anchor off CSYS_PAT_DEF instead of the index csys directly --
+# useful if targeting the index csys ever misbehaves live. Both are acyclic.
+#
+# *** LIVE-VERIFY caveat (drilljig-no-single-movable-parent): the plate is sketched on the
+# *** SIDE DEFAULT DATUM ($sketchPlaneId = SIDE BaseId) while the holes hang off the base
+# *** csys, so how the plate footprint behaves under a base transform is an unverified live
+# *** question -- if it misbehaves, use reref-method 'output-csys' (a separate index-hole
+# *** datum, no move). Also still LIVE-UNVERIFIED for the info.trf transform leg.
+# Returns @{ Ok; Reason; AnchorCsysId }.
+function Invoke-IndependentReref {
+    param([int]$RefCsysId, [int]$BaseCsysId, [double]$GridX, [double]$GridZ, [string]$TrfPath = '')
+    if ($RefCsysId -le 0 -or $BaseCsysId -le 0) { return @{ Ok = $false; Reason = 'need the default (CSYS_PAT_DEF) + base csys ids'; AnchorCsysId = $null } }
+    # 1+2. build the independent anchor csys at the index hole (off CSYS_PAT_DEF)
+    $anchor = Invoke-OutputCsys -RefCsysId $RefCsysId -GridX $GridX -GridZ $GridZ
+    if (-not $anchor.Ok) { return @{ Ok = $false; Reason = $anchor.Reason; AnchorCsysId = $anchor.CsysFeatId } }
+    # 3. transform the base onto the anchor (acyclic: anchor is off CSYS_PAT_DEF)
+    $rr = Invoke-CsysTransformReimport -BaseCsysId $BaseCsysId -IndexCsysId ([int]$anchor.CsysFeatId) -TrfPath $TrfPath
+    return @{ Ok = $rr.Ok; Reason = $rr.Reason; AnchorCsysId = [int]$anchor.CsysFeatId }
 }
 
 # ============================================================================

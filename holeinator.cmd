@@ -68,6 +68,11 @@ function Wait-ModelModified {
     $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
     while ([DateTime]::Now -lt $deadline) {
         try { if ($Model.VersionStamp -ne $PreviousStamp) { return $true } } catch {}
+        # Poll gap (proven pattern from boxinator/drilljig_core): without it this loop
+        # busy-waits, pegging a CPU core AND flooding Creo with COM VersionStamp reads
+        # *during* the regen it is polling for -- which slows the very operation. 40ms
+        # is far finer than any Creo regen, so detection latency is imperceptible.
+        Start-Sleep -Milliseconds 40
     }
     return $false
 }
@@ -141,7 +146,7 @@ Write-Host ""
 # Connect (identical pattern to nodelator / every toolkit script)
 # ----------------------------------------------------------------------------
 try {
-    $proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
+    $proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
     if ($null -eq $proc) { throw "Running Creo process (xtop) not found" }
     $pc_path = $proc.Path -replace "xtop.exe", "pro_comm_msg.exe"
     $Env:PRO_DIRECTORY = $proc.Path.TrimEnd("xtop.exe")

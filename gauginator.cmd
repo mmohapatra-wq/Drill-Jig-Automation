@@ -31,7 +31,7 @@ Write-Host "  Connecting to Creo..." -ForegroundColor White
 
 # Set environment variables before connecting in
 try {
-    $proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
+    $proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
     if ($null -eq $proc) {
         throw "Running Creo process (xtop) not found"
     }

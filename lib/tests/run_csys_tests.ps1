@@ -434,6 +434,160 @@ if (Get-Command Format-IndexHoleReport -ErrorAction SilentlyContinue) {
 }
 
 # ----------------------------------------------------------------------------
+# CSYS-REFERENCED PLANE ARCHITECTURE (2026-07-14): the box + grid planes are
+# offset from a BASE CSYS + an axis instead of the TOP/SIDE/FRONT default datums,
+# so re-placing the base csys onto the index hole (transform-reimport) moves the
+# whole jig. Token-lock the four new PURE macro builders in drilljig_core.ps1.
+# ----------------------------------------------------------------------------
+Write-Host "  -- Build-CsysFromCsysMacro (base csys from CSYS_PAT_DEF) --" -ForegroundColor White
+if (Get-Command Build-CsysFromCsysMacro -ErrorAction SilentlyContinue) {
+    $mb = Build-CsysFromCsysMacro -RefCsysId 42
+    Assert-True "basecsys: selects the ref csys by id"  ($mb.Contains('`42`'))
+    Assert-True "basecsys: fires ProCmdDatumCsys"       ($mb.Contains('~ Command `ProCmdDatumCsys`'))
+    Assert-True "basecsys: OK via stdbtn_1"             ($mb.Contains('~ Activate `Odui_Dlg_00` `stdbtn_1`'))
+    Assert-True "basecsys: not a plane command"         (-not $mb.Contains('ProCmdDatumPlane'))
+} else {
+    Assert-True "Build-CsysFromCsysMacro resolves from drilljig_core.ps1" $false "function not found"
+}
+
+Write-Host "  -- Build-CsysOffsetPlaneMacro (plane off csys axis + offset) --" -ForegroundColor White
+if (Get-Command Build-CsysOffsetPlaneMacro -ErrorAction SilentlyContinue) {
+    # with an offset: axis dropdown + the offset dim field are BOTH present
+    $mp = Build-CsysOffsetPlaneMacro -CsysFeatId 7 -Axis 'X' -Offset 3.5
+    Assert-True "csysplane: selects the csys by id"      ($mp.Contains('`7`'))
+    Assert-True "csysplane: fires ProCmdDatumPlane"      ($mp.Contains('~ Command `ProCmdDatumPlane`'))
+    Assert-True "csysplane: picks the csys axis field"   ($mp.Contains('t1.constr_csys_axis'))
+    Assert-True "csysplane: Axis_X token"                ($mp.Contains('`Axis_X`'))
+    Assert-True "csysplane: offset dim field present"    ($mp.Contains('t1.constr_dim1'))
+    Assert-True "csysplane: threads the offset 3.5"      ($mp.Contains('`3.5`'))
+    Assert-True "csysplane: OK via stdbtn_1"             ($mp.Contains('~ Activate `Odui_Dlg_00` `stdbtn_1`'))
+    # axis Y / Z tokens
+    $mpY = Build-CsysOffsetPlaneMacro -CsysFeatId 7 -Axis 'Y' -Offset 0.0
+    Assert-True "csysplane: Axis_Y token"                ($mpY.Contains('`Axis_Y`'))
+    $mpZ = Build-CsysOffsetPlaneMacro -CsysFeatId 7 -Axis 'z' -Offset 1.0   # case-insensitive
+    Assert-True "csysplane: Axis_Z token (lowercase in)" ($mpZ.Contains('`Axis_Z`'))
+    # offset ~0 -> NO dim field typed (the axis's principal plane, no offset dim)
+    Assert-True "csysplane: offset 0 types no dim field" (-not $mpY.Contains('t1.constr_dim1'))
+    # regression: it is a PLANE, not the csys command
+    Assert-True "csysplane: not ProCmdDatumCsys"         (-not $mp.Contains('ProCmdDatumCsys'))
+} else {
+    Assert-True "Build-CsysOffsetPlaneMacro resolves from drilljig_core.ps1" $false "function not found"
+}
+
+# Token-lock RECONCILED against the operator's live recording 2026-07-15 (csystrf-probe.cmd
+# -> csystrf_recipe.txt): the real command is ProCmdNaMeasureTransform (opens directly into
+# transform mode), NO page_Analysis_control_btn and NO nmd_type_rg='Transform', and the exit
+# is nmd_exit_pb then '~ Close texttool texttool'. The asserts below lock in the confirmed
+# tokens AND lock OUT the earlier guesses so a regression to them fails.
+Write-Host "  -- Build-CsysTransformExportMacro (Measure>Transform -> info.trf; live-reconciled) --" -ForegroundColor White
+if (Get-Command Build-CsysTransformExportMacro -ErrorAction SilentlyContinue) {
+    $mt = Build-CsysTransformExportMacro -IndexCsysId 200 -BaseCsysId 100
+    Assert-True "export: selects the index csys by id"   ($mt.Contains('`200`'))
+    Assert-True "export: selects the base csys by id"    ($mt.Contains('`100`'))
+    Assert-True "export: fires ProCmdNaMeasureTransform" ($mt.Contains('~ Command `ProCmdNaMeasureTransform`'))
+    Assert-True "export: produces the info via nmd_info_pb" ($mt.Contains('nmd_info_pb'))
+    Assert-True "export: Save-As push button"            ($mt.Contains('SaveAsPushButton'))
+    Assert-True "export: Save-As desktop + OK"           ($mt.Contains('`file_saveas` `desktop_pb`') -and $mt.Contains('`file_saveas` `OK`'))
+    Assert-True "export: exits the tool (nmd_exit_pb)"   ($mt.Contains('nmd_exit_pb'))
+    Assert-True "export: closes the text window"         ($mt.Contains('~ Close `texttool` `texttool`'))
+    # regression lock-OUT: the earlier GUESSED tokens must be gone
+    Assert-True "export: NO ProCmdNmdTool (old guess)"   (-not $mt.Contains('ProCmdNmdTool'))
+    Assert-True "export: NO nmd_type_rg (old guess)"     (-not $mt.Contains('nmd_type_rg'))
+    Assert-True "export: NO page_Analysis_control_btn (old guess)" (-not $mt.Contains('page_Analysis_control_btn'))
+    Assert-True "export: NO texttool CloseButton (old guess)" (-not $mt.Contains('CloseButton'))
+    # exactly ONE buffer_clean (index clears; base accumulates -NoClear)
+    $clr = ([regex]::Matches($mt, 'buffer_clean')).Count
+    Assert-True "export: exactly one buffer_clear (accumulate the 2nd)" ($clr -eq 1)
+} else {
+    Assert-True "Build-CsysTransformExportMacro resolves from drilljig_core.ps1" $false "function not found"
+}
+
+Write-Host "  -- Build-CsysReimportMacro (redefine base csys, OffsetType=file) --" -ForegroundColor White
+if (Get-Command Build-CsysReimportMacro -ErrorAction SilentlyContinue) {
+    $mr = Build-CsysReimportMacro -BaseCsysId 100
+    Assert-True "reimport: selects the base csys by id"  ($mr.Contains('`100`'))
+    Assert-True "reimport: redefines the feature"        ($mr.Contains('ProCmdRedefine@PopupMenuTree'))
+    Assert-True "reimport: switches OffsetType"          ($mr.Contains('t1.OffsetType'))
+    Assert-True "reimport: to file"                      ($mr.Contains('`file`'))
+    Assert-True "reimport: OK via stdbtn_1"              ($mr.Contains('~ Activate `Odui_Dlg_00` `stdbtn_1`'))
+} else {
+    Assert-True "Build-CsysReimportMacro resolves from drilljig_core.ps1" $false "function not found"
+}
+
+# ----------------------------------------------------------------------------
+# Invoke-OutputCsys - the SAFE default reref (build an INDEPENDENT csys AT the index
+# hole off CSYS_PAT_DEF; no geometry moves, no cycle). COM-orchestration, so we shadow
+# its three dependencies with tracking stubs. Placed LAST so the stubs don't shadow the
+# pure-function tests above (the run_wizard_tests convention).
+# ----------------------------------------------------------------------------
+Write-Host "  -- Invoke-OutputCsys (independent frame at the index hole) --" -ForegroundColor White
+if (Get-Command Invoke-OutputCsys -ErrorAction SilentlyContinue) {
+    $script:ocPlaneCalls = @()      # New-CsysOffsetPlane (X/Z anchors, + Y in the legacy path)
+    $script:ocDatumCalls = @()      # New-OffsetPlane (the Y anchor off the SIDE datum, extrude-depth path)
+    $script:ocTransformCalls = 0
+    function New-CsysOffsetPlane { param($CsysFeatId,$Axis,$Offset,[switch]$SkipSymbolWait)
+        $script:ocPlaneCalls += [pscustomobject]@{ Csys=$CsysFeatId; Axis=$Axis; Offset=$Offset }
+        return [pscustomobject]@{ Symbol=$null; FeatId=(500 + $script:ocPlaneCalls.Count) } }
+    function New-OffsetPlane { param($Label,$Offset,$BaseId,[switch]$SkipSymbolWait)
+        $script:ocDatumCalls += [pscustomobject]@{ Label=$Label; Offset=$Offset; BaseId=$BaseId }
+        return [pscustomobject]@{ Symbol=$null; FeatId=(700 + $script:ocDatumCalls.Count) } }
+    function Invoke-IndexCsys { param($PlaneIds,[switch]$Show)
+        $script:ocLastPlaneIds = @($PlaneIds)
+        return @{ Ok=$true; NewFeatId=9001; Reason='created' } }
+    function Invoke-CsysTransformReimport { param($BaseCsysId,$IndexCsysId,$TrfPath)
+        $script:ocTransformCalls++; return @{ Ok=$true; Reason='reref' } }
+
+    # LEGACY path (no -YBaseId): all 3 anchors are csys offset planes; Y @ GridY off the csys.
+    $r = Invoke-OutputCsys -RefCsysId 7 -GridX 3.0 -GridZ 5.0
+    Assert-True "outputcsys: Ok"                          ($r.Ok)
+    Assert-True "outputcsys: returns the new csys feat id" ($r.CsysFeatId -eq 9001)
+    Assert-True "outputcsys: builds 3 csys anchor planes (legacy Y)" ($script:ocPlaneCalls.Count -eq 3)
+    Assert-True "outputcsys: no datum-offset plane in the legacy path" ($script:ocDatumCalls.Count -eq 0)
+    Assert-True "outputcsys: all csys planes off CSYS_PAT_DEF (ref 7)" (@($script:ocPlaneCalls | Where-Object { $_.Csys -eq 7 }).Count -eq 3)
+    $xp = @($script:ocPlaneCalls | Where-Object { $_.Axis -eq 'X' })[0]
+    $yp = @($script:ocPlaneCalls | Where-Object { $_.Axis -eq 'Y' })[0]
+    $zp = @($script:ocPlaneCalls | Where-Object { $_.Axis -eq 'Z' })[0]
+    Assert-True "outputcsys: X plane at GridX"            (Approx ([double]$xp.Offset) 3.0)
+    Assert-True "outputcsys: Y plane at GridY=0 default"  (Approx ([double]$yp.Offset) 0.0)
+    Assert-True "outputcsys: Z plane at GridZ"            (Approx ([double]$zp.Offset) 5.0)
+    # csys is intersected in X/Y/Z-normal order regardless of the build sequence
+    Assert-True "outputcsys: csys built from 3 planes"    (@($script:ocLastPlaneIds).Count -eq 3)
+    Assert-True "outputcsys: NEVER transforms the base (no info.trf leg)" ($script:ocTransformCalls -eq 0)
+    Assert-True "outputcsys: reports independent"         ($r.Reason -match 'independent')
+
+    # EXTRUDE-DEPTH path (-YBaseId given): X/Z are csys planes, but the Y anchor is a
+    # New-OffsetPlane off the SIDE datum @ GridY (= the extrude depth / bushing length),
+    # so the csys sits on the plate's drilled-hole face, not at Y=0.
+    $script:ocPlaneCalls = @(); $script:ocDatumCalls = @(); $script:ocLastPlaneIds = @()
+    $rd = Invoke-OutputCsys -RefCsysId 7 -GridX 3.0 -GridZ 5.0 -GridY 0.75 -YBaseId 44
+    Assert-True "outputcsys(depth): Ok"                   ($rd.Ok)
+    Assert-True "outputcsys(depth): 2 csys planes (X+Z only)" ($script:ocPlaneCalls.Count -eq 2)
+    Assert-True "outputcsys(depth): X+Z are the csys planes" ((@($script:ocPlaneCalls | ForEach-Object { $_.Axis } | Sort-Object) -join ',') -eq 'X,Z')
+    Assert-True "outputcsys(depth): exactly 1 datum-offset plane (the Y anchor)" ($script:ocDatumCalls.Count -eq 1)
+    Assert-True "outputcsys(depth): Y anchor off the SIDE datum id 44" ([int]$script:ocDatumCalls[0].BaseId -eq 44)
+    Assert-True "outputcsys(depth): Y anchor at the extrude depth 0.75" (Approx ([double]$script:ocDatumCalls[0].Offset) 0.75)
+    Assert-True "outputcsys(depth): still 3 planes into the csys" (@($script:ocLastPlaneIds).Count -eq 3)
+
+    # bad ref id -> not ok, no plane calls
+    $script:ocPlaneCalls = @(); $script:ocDatumCalls = @()
+    $rb = Invoke-OutputCsys -RefCsysId 0 -GridX 1.0 -GridZ 1.0
+    Assert-True "outputcsys: bad ref id not ok"           (-not $rb.Ok)
+    Assert-True "outputcsys: bad ref id builds no planes"  (($script:ocPlaneCalls.Count + $script:ocDatumCalls.Count) -eq 0)
+
+    # Invoke-IndependentReref now delegates to Invoke-OutputCsys then transforms the base
+    $script:ocPlaneCalls = @(); $script:ocDatumCalls = @(); $script:ocTransformCalls = 0
+    $ri = Invoke-IndependentReref -RefCsysId 7 -BaseCsysId 42 -GridX 2.0 -GridZ 4.0
+    Assert-True "indep: Ok"                               ($ri.Ok)
+    Assert-True "indep: reuses the output-csys anchor (3 csys planes, legacy Y)" ($script:ocPlaneCalls.Count -eq 3)
+    Assert-True "indep: DOES transform the base onto the anchor" ($script:ocTransformCalls -eq 1)
+    Assert-True "indep: reports the anchor csys id"        ($ri.AnchorCsysId -eq 9001)
+
+    Remove-Item Function:New-CsysOffsetPlane, Function:New-OffsetPlane, Function:Invoke-IndexCsys, Function:Invoke-CsysTransformReimport -ErrorAction SilentlyContinue
+} else {
+    Assert-True "Invoke-OutputCsys resolves from drilljig_core.ps1" $false "function not found"
+}
+
+# ----------------------------------------------------------------------------
 # Summary
 # ----------------------------------------------------------------------------
 Write-Host ""

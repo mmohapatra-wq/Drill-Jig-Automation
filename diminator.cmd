@@ -81,7 +81,7 @@ Write-Host ""
 # ============================================
 Write-Host "  Connecting to Creo..." -NoNewline
 
-$proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
+$proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
 if ($null -eq $proc) {
     Write-Host ""
     Write-Host "  FAILED: Creo process (xtop) not found." -ForegroundColor Red

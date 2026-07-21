@@ -464,48 +464,29 @@ if ($matchingEdges.Count -gt 0) {
         }
         catch {}
 
-        # Select edges for this batch
-        # Part 1: Open and configure the find tool once
-        try {
-            $openFindTool = "~ Command ``ProCmdMdlTreeSearch``;" +
-                "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Edge``;" +
-                "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Edge``;" +
-                "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Attributes``;" +
-                "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
-                "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``All``;" +
-                "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``ID``;"
-
-            $session.RunMacro($openFindTool)
-        }
-        catch {}
-
-        # Part 2: Loop through each edge, search and apply to selection buffer
-        $selectCount = 0
+        # Select this batch's edges into the buffer as ONE macro. The find-tool
+        # dialog (selspecdlg0) survives across the accumulate loop, so the whole
+        # open -> per-id search/apply -> close sequence is a SINGLE RunMacro instead
+        # of N+2 separate calls. This is byte-for-byte cornerinator's proven-live
+        # Build-EdgeSelectMacro pattern (confirmed on the foreign jig body). Selection
+        # does not regen, so there is no dashboard-atomicity concern -- collapsing the
+        # calls just removes ~N COM round-trips per batch (the dominant selection-phase
+        # cost on a big node model). The round dashboard below stays its own atomic macro.
+        Show-Progress ([Math]::Floor(($batchEnd / $matchingEdges.Count) * 100)) "Batch ${batchNum}/${totalBatches}"
+        $selectMacro = "~ Command ``ProCmdMdlTreeSearch``;" +
+            "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Edge``;" +
+            "~ Select ``selspecdlg0`` ``LookByOptionMenu`` 1 ``Edge``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Attributes``;" +
+            "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+            "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``All``;" +
+            "~ Select ``selspecdlg0`` ``RuleTypes`` 1 ``ID``;"
         foreach ($edgeData in $batchEdges) {
-            $edgeId = $edgeData.Id
-            $selectCount++
-
-            $overallIdx = $batchStart + $selectCount
-            $pct = [Math]::Floor(($overallIdx / $matchingEdges.Count) * 100)
-            Show-Progress $pct "Batch ${batchNum}/${totalBatches}"
-
-            try {
-                $searchAndApply = "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$edgeId``;" +
-                    "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
-                    "~ Activate ``selspecdlg0`` ``ApplyBtn``;"
-
-                $session.RunMacro($searchAndApply)
-            }
-            catch {}
-
+            $selectMacro += "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$($edgeData.Id)``;" +
+                "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+                "~ Activate ``selspecdlg0`` ``ApplyBtn``;"
         }
-
-        # Part 3: Close the find tool once
-        try {
-            $closeFindTool = "~ Activate ``selspecdlg0`` ``CancelButton``;"
-            $session.RunMacro($closeFindTool)
-        }
-        catch {}
+        $selectMacro += "~ Activate ``selspecdlg0`` ``CancelButton``;"
+        try { $session.RunMacro($selectMacro) } catch {}
 
         # Create round feature
         try {

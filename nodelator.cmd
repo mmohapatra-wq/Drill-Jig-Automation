@@ -38,6 +38,11 @@ function Wait-ModelModified {
         try {
             if ($Model.VersionStamp -ne $PreviousStamp) { return }
         } catch {}
+        # Poll gap (proven pattern from boxinator/drilljig_core): without it this loop
+        # busy-waits, pegging a CPU core AND flooding Creo with COM VersionStamp reads
+        # *during* the regen it is polling for -- which slows the very operation. 40ms
+        # is far finer than any Creo regen, so detection latency is imperceptible.
+        Start-Sleep -Milliseconds 40
     }
     Write-Host "  (warning: feature creation timed out)" -ForegroundColor Yellow
 }
@@ -105,7 +110,7 @@ Write-Host ""
 # Set environment variables for VB API connection
 try {
     # Find running Creo process (xtop.exe) to determine installation paths
-    $proc = Get-Process | Where-Object {$_.ProcessName -eq "xtop"}
+    $proc = Get-Process -Name xtop -ErrorAction SilentlyContinue
     if ($null -eq $proc) {
         throw "Running Creo process (xtop) not found"
     }

@@ -72,6 +72,7 @@ $dataDir = Join-Path $ScriptDir 'data'
 function ConvertTo-Decimal {
     param([string]$Text)
     if ($Text -match '^\s*(\d+)\s*/\s*(\d+)\s*$') {
+        if ([double]$matches[2] -eq 0) { return $null }   # "3/0" -> $null, not Infinity
         return [double]$matches[1] / [double]$matches[2]
     }
     $d = 0.0
@@ -82,12 +83,16 @@ function ConvertTo-Decimal {
 # Pull the machinist-fraction label for a dimension out of an EasyName so the
 # menu can show "3/4" / "1 3/8" instead of decimals. EasyName format is
 #   "<tag> | OD <od> x ID <id> x <len> Lg"
-# $Which is 'OD' or 'Lg' (length). Falls back to the decimal value if the name
-# doesn't parse (e.g. drill IDs are stored decimal).
+# $Which is 'OD', 'ID', or 'Lg' (length). Falls back to the decimal value if the
+# name doesn't parse (e.g. drill IDs are stored decimal -> ID branch returns the
+# decimal; sleeve IDs are fractions -> returns the fraction).
 function Get-FracLabel {
     param([string]$EasyName, [string]$Which, [string]$Fallback)
     if ($EasyName) {
         if ($Which -eq 'OD' -and $EasyName -match 'OD\s+(.+?)\s+x') {
+            return $matches[1].Trim()
+        }
+        if ($Which -eq 'ID' -and $EasyName -match 'x\s+ID\s+(.+?)\s+x') {
             return $matches[1].Trim()
         }
         if ($Which -eq 'Lg' -and $EasyName -match 'x\s+([^x]+?)\s+Lg') {
@@ -95,6 +100,127 @@ function Get-FracLabel {
         }
     }
     return $Fallback
+}
+
+# Group catalog rows into the ID-FIRST hierarchy ID -> length -> ODs (all ascending).
+# Local copy of lib\drilljig_core.ps1's Group-CatalogByID (jiginator.cmd is
+# self-contained by design - it dot-sources no lib). The ODs tier is ALWAYS
+# populated so callers gate the OD tie-breaker on the ODCount integer; OD is the
+# drilled jig hole and is never silently chosen when ODCount > 1.
+function Group-CatalogByID {
+    param([array]$Rows)
+    $out = @()
+    if ($null -eq $Rows -or $Rows.Count -eq 0) { return ,@($out) }
+    $idGroups = @($Rows | Group-Object ID | Sort-Object { [double]$_.Name })
+    foreach ($ig in $idGroups) {
+        $idLabel = Get-FracLabel $ig.Group[0].EasyName 'ID' $ig.Name
+        $lenOut = @()
+        $lenGroups = @($ig.Group | Group-Object Length | Sort-Object { [double]$_.Name })
+        foreach ($lg in $lenGroups) {
+            $lenLabel = Get-FracLabel $lg.Group[0].EasyName 'Lg' $lg.Name
+            $odOut = @()
+            $odGroups = @($lg.Group | Group-Object OD | Sort-Object { [double]$_.Name })
+            foreach ($og in $odGroups) {
+                $odLabel = Get-FracLabel $og.Group[0].EasyName 'OD' $og.Name
+                $odOut += [pscustomobject]@{
+                    OD      = [double]$og.Name
+                    ODLabel = $odLabel
+                    # sort by PartNumber (ID is constant at this leaf) so Rows[0] is deterministic
+                    Rows    = @($og.Group | Sort-Object PartNumber)
+                }
+            }
+            $lenOut += [pscustomobject]@{
+                Length   = [double]$lg.Name
+                LenLabel = $lenLabel
+                ODCount  = $odOut.Count
+                ODs      = $odOut
+            }
+        }
+        $out += [pscustomobject]@{
+            ID      = [double]$ig.Name
+            IDLabel = $idLabel
+            Lengths = $lenOut
+        }
+    }
+    return ,@($out)
+}
+
+# ---------------------------------------------------------------------------
+# STANDARDIZED-LENGTH PICK (user 2026-07-21). LOCAL copies of the shared helpers
+# in lib\drilljig_core.ps1 (jiginator.cmd dot-sources no lib by design). The length
+# menu is now a FIXED {1/2, 3/4, 1} + Custom, with a length RECOMMENDED from the ID;
+# OD is re-keyed on ID ALONE (union of the ID's distinct ODs). Keep byte-in-sync with
+# the lib copies.
+# ---------------------------------------------------------------------------
+$script:StdLengths = @(
+    [pscustomobject]@{ Value = 0.5;  Label = '1/2' },
+    [pscustomobject]@{ Value = 0.75; Label = '3/4' },
+    [pscustomobject]@{ Value = 1.0;  Label = '1'   }
+)
+function Get-BushingLengthOptions {
+    param([double]$Id)
+    $opts = @()
+    foreach ($s in $script:StdLengths) {
+        $opts += [pscustomobject]@{ Value = [double]$s.Value; Label = [string]$s.Label; IsCustom = $false }
+    }
+    $opts += [pscustomobject]@{ Value = $null; Label = 'Custom'; IsCustom = $true }
+    $pre = -1
+    for ($i = 0; $i -lt $script:StdLengths.Count; $i++) {
+        if ([math]::Abs([double]$script:StdLengths[$i].Value - $Id) -lt 1e-6) { $pre = $i; break }
+    }
+    return @{ Options = $opts; PreselectIndex = $pre }
+}
+function Get-IdOdOptions {
+    param($IdGroup)
+    $byOd = @{}
+    if ($null -ne $IdGroup) {
+        foreach ($ln in @($IdGroup.Lengths)) {
+            foreach ($od in @($ln.ODs)) {
+                $key = ('{0:0.######}' -f [double]$od.OD)
+                if (-not $byOd.ContainsKey($key)) {
+                    $byOd[$key] = [pscustomobject]@{ OD = [double]$od.OD; ODLabel = [string]$od.ODLabel; Rows = @() }
+                }
+                $byOd[$key].Rows += @($od.Rows)
+            }
+        }
+    }
+    $out = @($byOd.Values | Sort-Object { [double]$_.OD })
+    foreach ($o in $out) { $o.Rows = @($o.Rows | Sort-Object { [double]$_.Length }, PartNumber) }
+    return ,@($out)
+}
+function Resolve-BushingPickRow {
+    param($IdGroup, $OdOption, [double]$Length, [string]$LenLabel)
+    $exact = @($OdOption.Rows | Where-Object { [math]::Abs([double]$_.Length - $Length) -lt 1e-6 } | Select-Object -First 1)
+    if ($exact.Count -gt 0) { return $exact[0] }
+    $tag = 'Bushing'
+    if (@($OdOption.Rows).Count -gt 0 -and $OdOption.Rows[0].EasyName) {
+        $tag = ($OdOption.Rows[0].EasyName -split '\|')[0].Trim()
+    }
+    return [pscustomobject]@{
+        EasyName   = ("{0} | OD {1} x ID {2} x {3} Lg" -f $tag, $OdOption.ODLabel, $IdGroup.IDLabel, $LenLabel)
+        OD         = [double]$OdOption.OD
+        ID         = [double]$IdGroup.ID
+        Length     = [double]$Length
+        PartNumber = '(custom length)'
+    }
+}
+function Resolve-BushingLengthInput {
+    param([string]$Text, [double]$Default = 0.5)
+    $r = @{ Ok = $false; Value = [double]$Default; Error = $null }
+    if ($null -eq $Text -or [string]::IsNullOrWhiteSpace($Text)) { $r.Ok = $true; $r.Value = [double]$Default; return $r }
+    $t = $Text.Trim()
+    $v = $null
+    if ($t -match '^\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s*$') {
+        $den = [double]$matches[3]
+        if ($den -ne 0) { $v = [double]$matches[1] + ([double]$matches[2] / $den) }
+    } else {
+        $v = ConvertTo-Decimal $t
+    }
+    if ($null -eq $v) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ([double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ($v -le 0) { $r.Error = 'Length must be greater than 0.'; return $r }
+    $r.Ok = $true; $r.Value = [math]::Round([double]$v, 4)
+    return $r
 }
 
 # Parse a free-text outcome label into a catalog query:
@@ -161,120 +287,113 @@ function Invoke-BushingPick {
         return $null
     }
 
-    # Two-stage pick: OD first (drives the hole), then length within that OD.
-    # The user only needs to see OD + length; everything else is on the row.
+    # ID-FIRST staged pick (user 2026-07-21): ID first, then a STANDARDIZED length menu
+    # {1/2, 3/4, 1} + Custom with a length RECOMMENDED from the ID (a 1/2" ID sleeve is
+    # normally 1/2" long, a 3/4" ID 3/4" long). The fixed menu is decoupled from the
+    # catalog length-rows, so OD is re-keyed on ID ALONE (Get-IdOdOptions) -- auto-resolved
+    # when unique, offered as a tie-breaker when the ID reaches more than one OD. OD is
+    # the drilled jig hole and is NEVER silently guessed. Group-CatalogByID supplies the IDs.
+    $byId = Group-CatalogByID -Rows $rows
+
     while ($true) {
 
-        # --- stage 1: distinct ODs, ascending ---
-        $odGroups = @($rows | Group-Object OD | Sort-Object { [double]$_.Name })
+        # --- stage 1: distinct IDs (bore size), ascending ---
         Write-Host ""
-        Write-Host "  Select OD (hole diameter):" -ForegroundColor Cyan
-        for ($i = 0; $i -lt $odGroups.Count; $i++) {
-            $g = $odGroups[$i]
-            $lenWord = if ($g.Count -eq 1) { 'length' } else { 'lengths' }
-            Write-Host ("    {0,3}) OD {1,-7} [hole = {2:0.###}]   ({3} {4})" -f `
-                ($i + 1), (Get-FracLabel $g.Group[0].EasyName 'OD' $g.Name), $g.Name, $g.Count, $lenWord) `
-                -ForegroundColor White
+        Write-Host "  Select ID (bore size):" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $byId.Count; $i++) {
+            $g = $byId[$i]
+            $ods = Get-IdOdOptions -IdGroup $g
+            $hole = if (@($ods).Count -eq 1) { ("-> hole {0:0.###}`"" -f $ods[0].OD) } else { ("{0} OD options" -f @($ods).Count) }
+            $bit = if ($g.Lengths[0].ODs[0].Rows[0].PSObject.Properties.Name -contains 'DrillBitSize' -and $g.Lengths[0].ODs[0].Rows[0].DrillBitSize) { "  ($($g.Lengths[0].ODs[0].Rows[0].DrillBitSize))" } else { '' }
+            Write-Host ("    {0,3}) ID {1,-7}{2}   ({3})" -f ($i + 1), $g.IDLabel, $bit, $hole) -ForegroundColor White
         }
         Write-Host ""
 
-        $odPick = $null
+        $idPick = $null
         while ($true) {
-            $raw = Read-Host "  Pick OD (1-$($odGroups.Count), or Q to skip)"
+            $raw = Read-Host "  Pick ID (1-$($byId.Count), or Q to skip)"
             if ($raw -match '^[Qq]$') { return $null }
             $n = 0
-            if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $odGroups.Count) {
-                $odPick = $odGroups[$n - 1]; break
+            if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $byId.Count) {
+                $idPick = $byId[$n - 1]; break
             }
-            Write-Host "  Enter a number between 1 and $($odGroups.Count)." -ForegroundColor Yellow
+            Write-Host "  Enter a number between 1 and $($byId.Count)." -ForegroundColor Yellow
         }
+        $odOptions = Get-IdOdOptions -IdGroup $idPick
 
-        $odLabel = Get-FracLabel $odPick.Group[0].EasyName 'OD' $odPick.Name
-
-        # --- stage 2: distinct lengths within the chosen OD, ascending ---
-        # ID is intentionally hidden here - it doesn't change the jig hole (= OD).
-        # If an OD+length has more than one ID, stage 3 offers the ID choice.
-        $backToOd = $false
-        while (-not $backToOd) {
-            $lenGroups = @($odPick.Group | Group-Object Length | Sort-Object { [double]$_.Name })
+        # --- stage 2: STANDARDIZED length menu {1/2, 3/4, 1} + Custom, ID-recommended ---
+        $backToId = $false
+        while (-not $backToId) {
+            $lenOpt = Get-BushingLengthOptions -Id $idPick.ID
+            $opts   = @($lenOpt.Options)
+            $preIdx = [int]$lenOpt.PreselectIndex
             Write-Host ""
-            Write-Host ("  Select length (OD {0}):" -f $odLabel) -ForegroundColor Cyan
-            for ($i = 0; $i -lt $lenGroups.Count; $i++) {
-                $lg = $lenGroups[$i]
-                $lenLbl = Get-FracLabel $lg.Group[0].EasyName 'Lg' $lg.Name
-                $extra = if ($lg.Count -gt 1) { "   ($($lg.Count) ID options)" } else { '' }
-                Write-Host ("    {0,3}) {1,-7} Lg{2}" -f ($i + 1), $lenLbl, $extra) -ForegroundColor White
+            Write-Host ("  Select length (ID {0}):" -f $idPick.IDLabel) -ForegroundColor Cyan
+            for ($i = 0; $i -lt $opts.Count; $i++) {
+                $o = $opts[$i]
+                $tag = if ($i -eq $preIdx) { "   <- recommended for ID $($idPick.IDLabel)" } elseif ($o.IsCustom) { "   (type any length)" } else { '' }
+                $lbl = if ($o.IsCustom) { 'Custom' } else { ("{0}`" Lg" -f $o.Label) }
+                Write-Host ("    {0,3}) {1,-10}{2}" -f ($i + 1), $lbl, $tag) -ForegroundColor White
             }
+            $recNote = if ($preIdx -ge 0) { "ENTER = recommended ($($opts[$preIdx].Label)`"), " } else { '' }
             Write-Host ""
 
-            $lenPick = $null
+            $chosenLen = $null; $chosenLabel = $null
             while ($true) {
-                $raw = Read-Host "  Pick length (1-$($lenGroups.Count), B to change OD, or Q to skip)"
+                $raw = Read-Host "  Pick length (1-$($opts.Count), ${recNote}B to change ID, or Q to skip)"
                 if ($raw -match '^[Qq]$') { return $null }
-                if ($raw -match '^[Bb]$') { $backToOd = $true; break }
+                if ($raw -match '^[Bb]$') { $backToId = $true; break }
+                if ([string]::IsNullOrWhiteSpace($raw) -and $preIdx -ge 0) {
+                    $chosenLen = [double]$opts[$preIdx].Value; $chosenLabel = $opts[$preIdx].Label; break
+                }
                 $n = 0
-                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $lenGroups.Count) {
-                    $lenPick = $lenGroups[$n - 1]; break
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $opts.Count) {
+                    $o = $opts[$n - 1]
+                    if ($o.IsCustom) {
+                        $def = if ($preIdx -ge 0) { [double]$opts[$preIdx].Value } else { 0.5 }
+                        while ($true) {
+                            $ctxt = Read-Host "    Enter custom length in inches (e.g. 0.9, 3/8, 1 3/8; Q to cancel)"
+                            if ($ctxt -match '^[Qq]$') { break }
+                            $res = Resolve-BushingLengthInput -Text $ctxt -Default $def
+                            if ($res.Ok) { $chosenLen = [double]$res.Value; $chosenLabel = ('{0:0.###}' -f $chosenLen); break }
+                            Write-Host "    $($res.Error)" -ForegroundColor Yellow
+                        }
+                        if ($null -ne $chosenLen) { break }
+                        continue
+                    }
+                    $chosenLen = [double]$o.Value; $chosenLabel = $o.Label; break
                 }
-                Write-Host "  Enter a number between 1 and $($lenGroups.Count) (or B / Q)." -ForegroundColor Yellow
+                Write-Host "  Enter a number between 1 and $($opts.Count) (or ENTER / B / Q)." -ForegroundColor Yellow
             }
-            if ($backToOd) { break }          # back to stage 1
-            if ($null -eq $lenPick) { continue }
+            if ($backToId) { break }          # back to stage 1
+            if ($null -eq $chosenLen) { continue }
 
-            # --- stage 3: ID step (ALWAYS explicit - never assume the ID) ---
-            # ID does not change the jig hole (= OD). The user may leave it
-            # unspecified, view the IDs, and from there skip or pick one.
-            $idRows = @($lenPick.Group | Sort-Object { [double]$_.ID })
-            $lenLbl = Get-FracLabel $idRows[0].EasyName 'Lg' $lenPick.Name
-            $tag    = ($idRows[0].EasyName -split '\|')[0].Trim()
-
-            # synthetic "ID unspecified" result - OD still drives the hole
-            $idUnspec = [pscustomobject]@{
-                EasyName   = "$tag | OD $odLabel x ID (any) x $lenLbl Lg"
-                OD         = $idRows[0].OD
-                ID         = '(any)'
-                PartNumber = '(ID unspecified)'
+            # --- stage 3: OD - AUTO-RESOLVED when unique, tie-breaker only when not ---
+            if (@($odOptions).Count -eq 1) {
+                $odPick = $odOptions[0]
+                Write-Host ("  Hole diameter = {0:0.###}`" (the only OD for ID {1}); length = {2}`"." -f $odPick.OD, $idPick.IDLabel, $chosenLabel) -ForegroundColor Green
+                return (Resolve-BushingPickRow -IdGroup $idPick -OdOption $odPick -Length $chosenLen -LenLabel $chosenLabel)
             }
 
-            $idWord = if ($idRows.Count -eq 1) { 'is 1 ID' } else { "are $($idRows.Count) IDs" }
-
-            $backToLen = $false
-            while (-not $backToLen) {
+            # ambiguous: this bore is available at more than one OD. OD IS the drilled
+            # hole, so the operator MUST choose it - never silently picked.
+            while ($true) {
                 Write-Host ""
-                Write-Host ("  ID for OD {0} x {1} Lg: there {2} on file." -f $odLabel, $lenLbl, $idWord) -ForegroundColor Cyan
-                Write-Host "  ID does not change the jig hole (= OD); view it only if you need the exact bushing." -ForegroundColor DarkGray
+                Write-Host ("  ID {0} is available at more than one OD - OD IS the drilled hole, so pick it:" -f $idPick.IDLabel) -ForegroundColor Cyan
+                for ($i = 0; $i -lt $odOptions.Count; $i++) {
+                    $od = $odOptions[$i]
+                    Write-Host ("    {0,3}) OD {1,-7} [hole = {2:0.###}]" -f ($i + 1), $od.ODLabel, $od.OD) -ForegroundColor White
+                }
                 Write-Host ""
-                $raw = Read-Host "  View IDs? (Y to list, N to leave ID unspecified, B to change length, Q to skip)"
+                $raw = Read-Host "  Pick OD (1-$($odOptions.Count), B to change length, or Q to skip)"
                 if ($raw -match '^[Qq]$') { return $null }
-                if ($raw -match '^[Bb]$') { $backToLen = $true; break }
-                if ($raw -match '^[Nn]?$') { return $idUnspec }   # N or blank -> unspecified
-                if ($raw -notmatch '^[Yy]$') {
-                    Write-Host "  Enter Y, N, B, or Q." -ForegroundColor Yellow
-                    continue
+                if ($raw -match '^[Bb]$') { break }   # back to stage 2 (re-show length menu)
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $odOptions.Count) {
+                    return (Resolve-BushingPickRow -IdGroup $idPick -OdOption $odOptions[$n - 1] -Length $chosenLen -LenLabel $chosenLabel)
                 }
-
-                # Y -> list the IDs; user may pick one, skip (unspecified), back, or quit
-                while ($true) {
-                    Write-Host ""
-                    Write-Host ("  Select ID (OD {0} x {1} Lg):" -f $odLabel, $lenLbl) -ForegroundColor Cyan
-                    for ($i = 0; $i -lt $idRows.Count; $i++) {
-                        $r = $idRows[$i]
-                        $bit = if ($r.PSObject.Properties.Name -contains 'DrillBitSize' -and $r.DrillBitSize) { "  ($($r.DrillBitSize))" } else { '' }
-                        Write-Host ("    {0,3}) ID {1,-7}{2}   [{3}]" -f ($i + 1), $r.ID, $bit, $r.PartNumber) -ForegroundColor White
-                    }
-                    Write-Host ""
-                    $raw = Read-Host "  Pick ID (1-$($idRows.Count), S to skip / leave unspecified, B to change length, Q to skip)"
-                    if ($raw -match '^[Qq]$') { return $null }
-                    if ($raw -match '^[Ss]$') { return $idUnspec }
-                    if ($raw -match '^[Bb]$') { $backToLen = $true; break }
-                    $n = 0
-                    if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $idRows.Count) {
-                        return $idRows[$n - 1]
-                    }
-                    Write-Host "  Enter a number between 1 and $($idRows.Count) (or S / B / Q)." -ForegroundColor Yellow
-                }
+                Write-Host "  Enter a number between 1 and $($odOptions.Count) (or B / Q)." -ForegroundColor Yellow
             }
-            # backToLen -> re-show length list
         }
     }
 }

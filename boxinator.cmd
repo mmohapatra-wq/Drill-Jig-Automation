@@ -374,7 +374,7 @@ function Select-CreoSession {
     Write-Host "  running by itself yet). To use it, close every OTHER Creo session and leave" -ForegroundColor Yellow
     Write-Host "  ONLY PID $($chosen.Pid) open, then press ENTER here." -ForegroundColor Yellow
     Read-Host
-    $still = @(Get-Process | Where-Object { $_.ProcessName -eq "xtop" })
+    $still = @(Get-Process -Name xtop -ErrorAction SilentlyContinue)
     if ($still.Count -ne 1) {
         throw ("Expected exactly 1 Creo session after closing the others, found $($still.Count). " +
                "Close all but PID $($chosen.Pid) and re-run.")
@@ -413,7 +413,7 @@ Write-Host ""
 # ============================================
 # CONNECT TO CREO
 # ============================================
-$procs = @(Get-Process | Where-Object { $_.ProcessName -eq "xtop" })
+$procs = @(Get-Process -Name xtop -ErrorAction SilentlyContinue)
 if ($procs.Count -eq 0) { throw "Creo (xtop.exe) is not running" }
 $proc = $procs[0]
 

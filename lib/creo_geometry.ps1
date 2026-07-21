@@ -290,6 +290,121 @@ function Get-CylinderAxisFromSurface {
 }
 
 # ----------------------------------------------------------------------------
+# Read-FastenerCentersFromModel - the ONE shared "read fastener centers off the
+# live model" helper. fastenator.cmd, drilljig.cmd (point-source #4 live read),
+# and drilljig-gui.cmd (Import tile live read) all call THIS so the read never
+# drifts between the three front-ends.
+#
+# TWO modes, auto-selected by model type (confirmed live 2026-07-20):
+#   * ASSEMBLY (.asm): ListItems(ITEM_COMPONENT)/ITEM_BODY/surfaces are 0 at the
+#     assembly top, so the operator SELECTS the fastener components and each
+#     location is Selection.Path.GetTransform($true).GetOrigin() -- the member->
+#     root-assembly transform origin (fact fastener-assembly-component-path-
+#     transform). Deduped by leaf component id (a component picked as several
+#     surfaces counts once).
+#   * PART (.prt): sweep common bore radii with Get-CylinderAxes and take each
+#     bore's axis origin (fact fastener-center-via-cylinder-axis). Deduped by
+#     rounded origin (a bore read at two overlapping radii counts once).
+# NEVER reads IpfcPoint.Point (crashes -- the holeinator lesson).
+#
+# Inputs:
+#   Session  - live IpfcSession (needed for the assembly selection-buffer read).
+#   Model    - the active model to read (assembly or part).
+#   TypeObj  - pfcModelItemType (for ListItems in the part sweep).
+#   IsAsm    - optional override; when $null it is derived from the model FileName.
+#   Radii    - optional bore-radius sweep list (part mode). Defaults to a broad
+#              bushing/bolt set. RadTol is the match tolerance.
+#
+# Returns [pscustomobject] (NEVER throws):
+#   Ok         [bool]      $true iff >= 1 center was read
+#   Centers    [array]     of @(x,y,z) doubles (raw model coords, unprojected)
+#   Count      [int]
+#   IsAsm      [bool]
+#   ReadMethod [string]    provenance label for the handoff file
+#   MedianDia  [double]    median bore diameter (part mode) or 0 (assembly mode -
+#              components have no bore dia here); callers use it for a default margin
+#   Message    [string]    a short human hint when Ok is $false
+# The caller does the axis projection (ConvertTo-LayoutXZ) + margin + handoff; this
+# only does the RAW read so the projection/pure logic stays in lib\fastener_layout.ps1.
+# ----------------------------------------------------------------------------
+function Read-FastenerCentersFromModel {
+    param(
+        $Session,
+        $Model,
+        $TypeObj,
+        $IsAsm = $null,
+        $Radii = $null,
+        [double]$RadTol = 0.01
+    )
+    if ($null -eq $Model) {
+        return [pscustomobject]@{ Ok=$false; Centers=@(); Count=0; IsAsm=$false; ReadMethod='none'; MedianDia=0.0; Message='no model to read' }
+    }
+    if ($null -eq $IsAsm) {
+        $fn = ""
+        try { $fn = [string]$Model.FileName } catch {}
+        $IsAsm = ($fn -match '(?i)\.asm(\.\d+)?$')
+    }
+
+    $centers = @()
+    $medianDia = 0.0
+    $method = 'none'
+    $msg = ''
+
+    if ($IsAsm) {
+        # ASSEMBLY: read SELECTED component locations from the selection buffer.
+        $method = 'component-path transform (selected components)'
+        $buf = @()
+        try { if ($null -ne $Session) { $buf = @(($Session.CurrentSelectionBuffer()).Contents) } } catch {}
+        $seenComp = @{}
+        foreach ($sel in $buf) {
+            $path = $null; try { $path = $sel.Path } catch {}
+            if ($null -eq $path) { continue }
+            $cid = $null
+            try { $ids = $path.ComponentIds; if ($null -ne $ids -and $ids.Count -gt 0) { $cid = [int]$ids[$ids.Count - 1] } } catch {}
+            if ($null -ne $cid) { if ($seenComp.ContainsKey($cid)) { continue }; $seenComp[$cid] = $true }
+            $o = $null
+            try { $o = Get-Comp (($path.GetTransform($true)).GetOrigin()) } catch {}
+            if ($null -ne $o) { $centers += ,$o }
+        }
+        if ($centers.Count -eq 0) { $msg = 'no component locations read - select whole fastener component instances (not a surface/edge)' }
+    } else {
+        # PART: sweep bore radii and take each cylinder axis origin.
+        $method = 'cylinder-axis (model sweep)'
+        $sweep = if ($null -ne $Radii -and @($Radii).Count -gt 0) { @($Radii) } else {
+            @(0.0625,0.086,0.098,0.1015,0.125,0.1285,0.144,0.1495,0.166,0.1875,0.196,0.201,0.25,0.3125,0.375,0.4375,0.5)
+        }
+        $seen = @{}
+        $diams = @()
+        foreach ($rad in $sweep) {
+            $axes = @()
+            try { $axes = @(Get-CylinderAxes -Model $Model -TypeObj $TypeObj -TargetRadius $rad -RadTol $RadTol) } catch {}
+            foreach ($a in $axes) {
+                $key = ('{0:0.###}|{1:0.###}|{2:0.###}' -f [double]$a.A[0], [double]$a.A[1], [double]$a.A[2])
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+                $centers += ,$a.A
+                $diams += (2.0 * [double]$rad)
+            }
+        }
+        if ($centers.Count -eq 0) { $msg = 'no cylinder bores read - try --selected/--radius, or this may be an assembly (open a part)' }
+        else {
+            $sorted = @($diams | Where-Object { $_ -gt 0 } | Sort-Object)
+            if ($sorted.Count -gt 0) { $medianDia = [double]$sorted[[int]([math]::Floor($sorted.Count / 2))] }
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok         = ($centers.Count -ge 1)
+        Centers    = $centers
+        Count      = [int]$centers.Count
+        IsAsm      = [bool]$IsAsm
+        ReadMethod = $method
+        MedianDia  = [double]$medianDia
+        Message    = $msg
+    }
+}
+
+# ----------------------------------------------------------------------------
 # Read-PlaneNormal - best-effort planar-surface normal as @(x,y,z), or $null.
 # Uses the SAME read path proven LIVE for cylinders in Get-CylinderAxes: the
 # surface descriptor's .Origin is an IpfcTransform3D whose Z axis is the surface
