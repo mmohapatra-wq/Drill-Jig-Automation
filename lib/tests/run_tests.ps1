@@ -396,19 +396,23 @@ Assert-True "numeric pass gates TRUE with null verdict" `
 # ----------------------------------------------------------------------------
 Write-Host "  -- creo_geometry: Read-FastenerCentersFromModel (assembly) --" -ForegroundColor White
 
-# a fake selection whose Path yields a component id + a transform whose origin is (ox,oy,oz).
+# a fake selection whose Path yields a component id PATH + a transform whose origin
+# is (ox,oy,oz). $Ids is the FULL root->leaf ComponentIds path (an int array).
 function New-FakeCompSel {
-    param([int]$Cid, [double]$Ox, [double]$Oy, [double]$Oz)
+    param($Ids, [double]$Ox, [double]$Oy, [double]$Oz)
     $fcOrigin = @($Ox, $Oy, $Oz)
     $fcXform  = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name GetOrigin -Value { $fcOrigin }.GetNewClosure()
-    $fcPath   = [pscustomobject]@{ ComponentIds = @($Cid) } |
+    $fcPath   = [pscustomobject]@{ ComponentIds = @($Ids) } |
                 Add-Member -PassThru -MemberType ScriptMethod -Name GetTransform -Value { param($b) $fcXform }.GetNewClosure()
     return [pscustomobject]@{ Path = $fcPath }
 }
+# a selection with NO component Path (a surface/edge/datum pick) -> must be skipped.
+function New-FakeNoPathSel { return [pscustomobject]@{ Path = $null } }
+
 $fkSelItems = @(
-    (New-FakeCompSel -Cid 57 -Ox -2.5547 -Oy 0 -Oz 3.0624),
-    (New-FakeCompSel -Cid 59 -Ox -2.5547 -Oy 0 -Oz 18.0624),
-    (New-FakeCompSel -Cid 59 -Ox -2.5547 -Oy 0 -Oz 18.0624)   # duplicate component id -> merged
+    (New-FakeCompSel -Ids @(57) -Ox -2.5547 -Oy 0 -Oz 3.0624),
+    (New-FakeCompSel -Ids @(59) -Ox -2.5547 -Oy 0 -Oz 18.0624),
+    (New-FakeCompSel -Ids @(59) -Ox -2.5547 -Oy 0 -Oz 18.0624)   # duplicate component path -> merged
 )
 $fkBuffer  = [pscustomobject]@{ Contents = $fkSelItems }
 $fkSession = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { $fkBuffer }.GetNewClosure()
@@ -416,11 +420,74 @@ $fkModel   = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod
 # FileName is a property on the real COM object; here pass IsAsm explicitly to avoid the accessor.
 $rd = Read-FastenerCentersFromModel -Session $fkSession -Model ([pscustomobject]@{ FileName = 'x.asm' }) -TypeObj $null -IsAsm $true
 Assert-True "fastener read (asm): Ok" ($rd.Ok)
-Assert-True "fastener read (asm): dedup by component id -> 2 centers" ($rd.Count -eq 2)
+Assert-True "fastener read (asm): dedup by component path -> 2 centers" ($rd.Count -eq 2)
 Assert-True "fastener read (asm): IsAsm flagged" ($rd.IsAsm)
 Assert-True "fastener read (asm): read method labeled" ($rd.ReadMethod -match 'component-path')
 Assert-True "fastener read (asm): first center is the transform origin" (
     (Approx $rd.Centers[0][0] -2.5547 1e-4) -and (Approx $rd.Centers[0][2] 3.0624 1e-4))
+# diagnostics: 3 picked, 1 duplicate merged, 0 no-path/no-xform
+Assert-True "fastener read (asm): RawSelected counts every pick"     ($rd.RawSelected -eq 3)
+Assert-True "fastener read (asm): MergedDuplicate counts the dup"    ($rd.MergedDuplicate -eq 1)
+Assert-True "fastener read (asm): SkippedNoPath 0 (all components)"  ($rd.SkippedNoPath -eq 0)
+# Axes returned parallel to Centers; the stub xform has no GetZAxis -> null axes (no throw)
+Assert-True "fastener read (asm): Axes parallel to Centers"          (@($rd.Axes).Count -eq $rd.Count)
+Assert-True "fastener read (asm): no-GetZAxis stub -> null axes, AxisReads 0" ($rd.AxisReads -eq 0)
+
+# AXIS CAPTURE: a stub whose transform DOES expose GetZAxis -> the fastener's own
+# bore axis is read into .Axes (parallel to Centers) and AxisReads counts them.
+function New-FakeCompSelAx {
+    param($Ids, [double]$Ox, [double]$Oy, [double]$Oz, [double]$Zx, [double]$Zy, [double]$Zz)
+    $fcOrigin = @($Ox, $Oy, $Oz)
+    $fcZ      = @($Zx, $Zy, $Zz)
+    $fcXform  = [pscustomobject]@{} |
+                Add-Member -PassThru -MemberType ScriptMethod -Name GetOrigin -Value { $fcOrigin }.GetNewClosure() |
+                Add-Member -PassThru -MemberType ScriptMethod -Name GetZAxis  -Value { $fcZ }.GetNewClosure()
+    $fcPath   = [pscustomobject]@{ ComponentIds = @($Ids) } |
+                Add-Member -PassThru -MemberType ScriptMethod -Name GetTransform -Value { param($b) $fcXform }.GetNewClosure()
+    return [pscustomobject]@{ Path = $fcPath }
+}
+$fkAx = @(
+    (New-FakeCompSelAx -Ids @(1) -Ox 0 -Oy 5 -Oz 0 -Zx 0 -Zy 1 -Zz 0),
+    (New-FakeCompSelAx -Ids @(2) -Ox 2 -Oy 5 -Oz 0 -Zx 0 -Zy 1 -Zz 0),
+    (New-FakeCompSelAx -Ids @(3) -Ox 0 -Oy 5 -Oz 3 -Zx 0 -Zy 1 -Zz 0)
+)
+$fkAxSess = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { [pscustomobject]@{ Contents = $fkAx } }.GetNewClosure()
+$rdAx = Read-FastenerCentersFromModel -Session $fkAxSess -Model ([pscustomobject]@{ FileName='ax.asm' }) -TypeObj $null -IsAsm $true
+Assert-True "fastener read (asm): GetZAxis captured -> AxisReads 3" ($rdAx.AxisReads -eq 3)
+Assert-True "fastener read (asm): axis[0] is +Y"                    ((Approx $rdAx.Axes[0][1] 1.0 1e-9) -and (Approx $rdAx.Axes[0][0] 0.0 1e-9))
+
+# NESTED assembly: two DISTINCT instances sharing a LEAF id (7) in different
+# subassemblies (paths 1|5|7 vs 1|6|7) must NOT collapse -- the leaf-only dedup bug.
+$fkNested = @(
+    (New-FakeCompSel -Ids @(1,5,7) -Ox 1.0 -Oy 0 -Oz 2.0),
+    (New-FakeCompSel -Ids @(1,6,7) -Ox 3.0 -Oy 0 -Oz 4.0)   # same leaf 7, different path
+)
+$fkNestSess = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { [pscustomobject]@{ Contents = $fkNested } }.GetNewClosure()
+$rdN = Read-FastenerCentersFromModel -Session $fkNestSess -Model ([pscustomobject]@{ FileName='n.asm' }) -TypeObj $null -IsAsm $true
+Assert-True "fastener read (asm nested): shared leaf id kept distinct -> 2 centers" ($rdN.Count -eq 2)
+Assert-True "fastener read (asm nested): no false merge" ($rdN.MergedDuplicate -eq 0)
+
+# TRULY duplicated full path (1|5|7 twice) SHOULD merge to 1.
+$fkDupPath = @(
+    (New-FakeCompSel -Ids @(1,5,7) -Ox 1.0 -Oy 0 -Oz 2.0),
+    (New-FakeCompSel -Ids @(1,5,7) -Ox 1.0 -Oy 0 -Oz 2.0)
+)
+$fkDupSess = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { [pscustomobject]@{ Contents = $fkDupPath } }.GetNewClosure()
+$rdD = Read-FastenerCentersFromModel -Session $fkDupSess -Model ([pscustomobject]@{ FileName='d.asm' }) -TypeObj $null -IsAsm $true
+Assert-True "fastener read (asm): identical full path merges -> 1 center" ($rdD.Count -eq 1)
+
+# no-Path picks (surfaces/edges) are skipped and COUNTED, not silently lost.
+$fkMixed = @(
+    (New-FakeCompSel -Ids @(10) -Ox 0.0 -Oy 0 -Oz 0.0),
+    (New-FakeNoPathSel),
+    (New-FakeNoPathSel)
+)
+$fkMixSess = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { [pscustomobject]@{ Contents = $fkMixed } }.GetNewClosure()
+$rdM = Read-FastenerCentersFromModel -Session $fkMixSess -Model ([pscustomobject]@{ FileName='m.asm' }) -TypeObj $null -IsAsm $true
+Assert-True "fastener read (asm): no-path picks skipped -> 1 center"   ($rdM.Count -eq 1)
+Assert-True "fastener read (asm): SkippedNoPath counted (2)"           ($rdM.SkippedNoPath -eq 2)
+Assert-True "fastener read (asm): RawSelected includes skipped (3)"    ($rdM.RawSelected -eq 3)
+
 # empty selection -> Ok false, no throw
 $fkEmptySess = [pscustomobject]@{} | Add-Member -PassThru -MemberType ScriptMethod -Name CurrentSelectionBuffer -Value { [pscustomobject]@{ Contents = @() } }.GetNewClosure()
 $rdEmpty = Read-FastenerCentersFromModel -Session $fkEmptySess -Model $null -TypeObj $null -IsAsm $true

@@ -146,6 +146,87 @@ function Group-CatalogByID {
 }
 
 # ---------------------------------------------------------------------------
+# OD-FIRST (METAL removable-bushing) PICK (user 2026-07-22). LOCAL copies of the shared
+# lib\drilljig_core.ps1 helpers (jiginator.cmd dot-sources no lib). For METAL -> PFD /
+# Hand Drill the spec is OD-filtered (only 1/2" & 3/4" ODs) and the drilled hole IS the
+# removable bushing's OD, so the flow displays the OD, skips the ID question, then asks
+# the standardized length. Keep byte-in-sync with the lib copies.
+# ---------------------------------------------------------------------------
+function Test-OdFirstSpec {
+    param($Spec)
+    if ($null -eq $Spec -or $null -eq $Spec.Filters) { return $false }
+    foreach ($f in @($Spec.Filters)) {
+        if ($null -ne $f -and ([string]$f.Column).ToUpper() -eq 'OD') { return $true }
+    }
+    return $false
+}
+function Get-OdGroups {
+    param([array]$Rows)
+    $byOd = @{}
+    if ($null -ne $Rows) {
+        foreach ($r in @($Rows)) {
+            $key = ('{0:0.######}' -f [double]$r.OD)
+            if (-not $byOd.ContainsKey($key)) {
+                $odLabel = Get-FracLabel $r.EasyName 'OD' ([string]$r.OD)
+                $byOd[$key] = [pscustomobject]@{ OD = [double]$r.OD; ODLabel = [string]$odLabel; Rows = @() }
+            }
+            $byOd[$key].Rows += @($r)
+        }
+    }
+    $out = @($byOd.Values | Sort-Object { [double]$_.OD })
+    foreach ($o in $out) { $o.Rows = @($o.Rows | Sort-Object { [double]$_.Length }, { [double]$_.ID }, PartNumber) }
+    return ,@($out)
+}
+function Resolve-OdBushingPick {
+    param($OdGroup, [double]$Length, [string]$LenLabel)
+    $tag = 'Bushing'
+    if (@($OdGroup.Rows).Count -gt 0 -and $OdGroup.Rows[0].EasyName) { $tag = ($OdGroup.Rows[0].EasyName -split '\|')[0].Trim() }
+    $exact = @($OdGroup.Rows | Where-Object { [math]::Abs([double]$_.Length - $Length) -lt 1e-6 } | Select-Object -First 1)
+    $pn = if ($exact.Count -gt 0) { [string]$exact[0].PartNumber } else { '(ID unspecified)' }
+    return [pscustomobject]@{
+        EasyName   = ("{0} | OD {1} x ID (any) x {2} Lg" -f $tag, $OdGroup.ODLabel, $LenLabel)
+        OD         = [double]$OdGroup.OD
+        ID         = '(any)'
+        Length     = [double]$Length
+        PartNumber = $pn
+    }
+}
+
+# ---------------------------------------------------------------------------
+# CUSTOM HOLE OD (user 2026-07-23). LOCAL copies of the shared lib\drilljig_core.ps1
+# helpers (jiginator.cmd dot-sources no lib). Let the operator type an ARBITRARY hole
+# diameter instead of only catalog ODs; blank is an error (no default OD), and the caller
+# shows a bold warning that a real drill bushing / sleeve must be verified. Keep in sync.
+# ---------------------------------------------------------------------------
+function Resolve-CustomOdInput {
+    param([string]$Text)
+    $r = @{ Ok = $false; Value = 0.0; Error = $null }
+    if ($null -eq $Text -or [string]::IsNullOrWhiteSpace($Text)) { $r.Error = 'Enter a hole diameter.'; return $r }
+    $t = $Text.Trim()
+    $v = $null
+    if ($t -match '^\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s*$') {
+        $den = [double]$matches[3]
+        if ($den -ne 0) { $v = [double]$matches[1] + ([double]$matches[2] / $den) }
+    } else { $v = ConvertTo-Decimal $t }
+    if ($null -eq $v) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ([double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ($v -le 0) { $r.Error = 'Hole diameter must be greater than 0.'; return $r }
+    $r.Ok = $true; $r.Value = [math]::Round([double]$v, 4)
+    return $r
+}
+function Resolve-CustomOdPick {
+    param([double]$OD, [double]$Length, [string]$LenLabel, [string]$OdLabel = $null)
+    $odLbl = if ([string]::IsNullOrWhiteSpace($OdLabel)) { ('{0:0.###}' -f [double]$OD) } else { [string]$OdLabel }
+    return [pscustomobject]@{
+        EasyName   = ("Bushing | OD {0} x ID (custom) x {1} Lg" -f $odLbl, $LenLabel)
+        OD         = [double]$OD
+        ID         = '(custom)'
+        Length     = [double]$Length
+        PartNumber = '(verify bushing exists)'
+    }
+}
+
+# ---------------------------------------------------------------------------
 # STANDARDIZED-LENGTH PICK (user 2026-07-21). LOCAL copies of the shared helpers
 # in lib\drilljig_core.ps1 (jiginator.cmd dot-sources no lib by design). The length
 # menu is now a FIXED {1/2, 3/4, 1} + Custom, with a length RECOMMENDED from the ID;
@@ -259,6 +340,77 @@ function Get-CatalogSpec {
     return @{ File = $file; Filters = $filters }
 }
 
+# CUSTOM HOLE OD (user 2026-07-23): prompt for an ARBITRARY hole diameter (not limited to
+# the catalog), print a BOLD warning that a real drill bushing / bushing sleeve must be
+# verified, then run the standard length menu (recommended from the typed OD). Returns the
+# synthesized pick (Resolve-CustomOdPick) or $null on cancel. Reachable from BOTH the
+# OD-first (metal) and ID-first (sleeve) menus.
+function Invoke-CustomOdPick {
+    while ($true) {
+        Write-Host ""
+        Write-Host "  Custom hole OD (type any diameter -- NOT limited to the catalog):" -ForegroundColor Cyan
+        $odVal = $null; $odLabel = $null
+        while ($true) {
+            $raw = Read-Host "  Enter hole diameter in inches (e.g. 0.6, 3/8, 1 3/8; Q to cancel)"
+            if ($raw -match '^[Qq]$') { return $null }
+            $res = Resolve-CustomOdInput -Text $raw
+            if ($res.Ok) { $odVal = [double]$res.Value; $odLabel = ('{0:0.###}' -f $odVal); break }
+            Write-Host "  $($res.Error)" -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host ("  ** WARNING: custom hole OD {0}`" has NO catalog bushing behind it.  **" -f $odLabel) -ForegroundColor Yellow
+        Write-Host   "  ** Verify a drill bushing / bushing sleeve at this OD actually       **" -ForegroundColor Yellow
+        Write-Host   "  ** EXISTS before machining -- double-check against your supplier.     **" -ForegroundColor Yellow
+        $backToOd = $false
+        while (-not $backToOd) {
+            $lenOpt = Get-BushingLengthOptions -Id $odVal
+            $opts   = @($lenOpt.Options)
+            $preIdx = [int]$lenOpt.PreselectIndex
+            Write-Host ""
+            Write-Host ("  Select length (custom OD {0}`"):" -f $odLabel) -ForegroundColor Cyan
+            for ($i = 0; $i -lt $opts.Count; $i++) {
+                $o = $opts[$i]
+                $tag = if ($i -eq $preIdx) { "   <- recommended" } elseif ($o.IsCustom) { "   (type any length)" } else { '' }
+                $lbl = if ($o.IsCustom) { 'Custom' } else { ("{0}`" Lg" -f $o.Label) }
+                Write-Host ("    {0,3}) {1,-10}{2}" -f ($i + 1), $lbl, $tag) -ForegroundColor White
+            }
+            $recNote = if ($preIdx -ge 0) { "ENTER = recommended ($($opts[$preIdx].Label)`"), " } else { '' }
+            Write-Host ""
+            $chosenLen = $null; $chosenLabel = $null
+            while ($true) {
+                $raw = Read-Host "  Pick length (1-$($opts.Count), ${recNote}B to change OD, or Q to skip)"
+                if ($raw -match '^[Qq]$') { return $null }
+                if ($raw -match '^[Bb]$') { $backToOd = $true; break }
+                if ([string]::IsNullOrWhiteSpace($raw) -and $preIdx -ge 0) {
+                    $chosenLen = [double]$opts[$preIdx].Value; $chosenLabel = $opts[$preIdx].Label; break
+                }
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $opts.Count) {
+                    $o = $opts[$n - 1]
+                    if ($o.IsCustom) {
+                        $def = if ($preIdx -ge 0) { [double]$opts[$preIdx].Value } else { 0.5 }
+                        while ($true) {
+                            $ctxt = Read-Host "    Enter custom length in inches (e.g. 0.9, 3/8, 1 3/8; Q to cancel)"
+                            if ($ctxt -match '^[Qq]$') { break }
+                            $lres = Resolve-BushingLengthInput -Text $ctxt -Default $def
+                            if ($lres.Ok) { $chosenLen = [double]$lres.Value; $chosenLabel = ('{0:0.###}' -f $chosenLen); break }
+                            Write-Host "    $($lres.Error)" -ForegroundColor Yellow
+                        }
+                        if ($null -ne $chosenLen) { break }
+                        continue
+                    }
+                    $chosenLen = [double]$o.Value; $chosenLabel = $o.Label; break
+                }
+                Write-Host "  Enter a number between 1 and $($opts.Count) (or ENTER / B / Q)." -ForegroundColor Yellow
+            }
+            if ($backToOd) { break }
+            if ($null -eq $chosenLen) { continue }
+            Write-Host ("  Custom hole diameter = {0}`"; length = {1}`" (verify bushing exists)." -f $odLabel, $chosenLabel) -ForegroundColor Green
+            return (Resolve-CustomOdPick -OD $odVal -Length $chosenLen -LenLabel $chosenLabel -OdLabel $odLabel)
+        }
+    }
+}
+
 # Load + filter the catalog and let the user pick one row.
 # Returns the chosen row (PSCustomObject) or $null on quit / no matches.
 function Invoke-BushingPick {
@@ -287,6 +439,86 @@ function Invoke-BushingPick {
         return $null
     }
 
+    # OD-FIRST metal path (user 2026-07-22): for METAL -> PFD / Hand Drill the spec is
+    # OD-filtered (only 1/2" & 3/4" ODs). The drilled jig hole IS the removable bushing's
+    # OD, so DISPLAY THE OD, skip the ID question, then ask the standardized length only
+    # (recommended from the OD value). The 3D-print SLEEVE path (ID-filtered) falls through.
+    if (Test-OdFirstSpec -Spec $Spec) {
+        $odGroups = Get-OdGroups -Rows $rows
+        while ($true) {
+            Write-Host ""
+            Write-Host "  Select OD (removable bushing = the drilled hole diameter):" -ForegroundColor Cyan
+            for ($i = 0; $i -lt $odGroups.Count; $i++) {
+                $og = $odGroups[$i]
+                Write-Host ("    {0,3}) OD {1,-7}   (-> hole {2:0.###}`")" -f ($i + 1), $og.ODLabel, $og.OD) -ForegroundColor White
+            }
+            $customIdx = $odGroups.Count + 1
+            Write-Host ("    {0,3}) Custom hole OD... (type any diameter)" -f $customIdx) -ForegroundColor Yellow
+            Write-Host ""
+            $odPick = $null
+            while ($true) {
+                $raw = Read-Host "  Pick OD (1-$customIdx, or Q to skip)"
+                if ($raw -match '^[Qq]$') { return $null }
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -eq $customIdx) {
+                    $cpick = Invoke-CustomOdPick
+                    if ($null -ne $cpick) { return $cpick }
+                    break   # custom cancelled -> re-show the OD menu
+                }
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $odGroups.Count) { $odPick = $odGroups[$n - 1]; break }
+                Write-Host "  Enter a number between 1 and $customIdx." -ForegroundColor Yellow
+            }
+            if ($null -eq $odPick) { continue }   # custom was cancelled; re-show the OD menu
+            $backToOd = $false
+            while (-not $backToOd) {
+                $lenOpt = Get-BushingLengthOptions -Id $odPick.OD   # recommend length from the OD value
+                $opts   = @($lenOpt.Options)
+                $preIdx = [int]$lenOpt.PreselectIndex
+                Write-Host ""
+                Write-Host ("  Select length (OD {0}):" -f $odPick.ODLabel) -ForegroundColor Cyan
+                for ($i = 0; $i -lt $opts.Count; $i++) {
+                    $o = $opts[$i]
+                    $tag = if ($i -eq $preIdx) { "   <- recommended for OD $($odPick.ODLabel)" } elseif ($o.IsCustom) { "   (type any length)" } else { '' }
+                    $lbl = if ($o.IsCustom) { 'Custom' } else { ("{0}`" Lg" -f $o.Label) }
+                    Write-Host ("    {0,3}) {1,-10}{2}" -f ($i + 1), $lbl, $tag) -ForegroundColor White
+                }
+                $recNote = if ($preIdx -ge 0) { "ENTER = recommended ($($opts[$preIdx].Label)`"), " } else { '' }
+                Write-Host ""
+                $chosenLen = $null; $chosenLabel = $null
+                while ($true) {
+                    $raw = Read-Host "  Pick length (1-$($opts.Count), ${recNote}B to change OD, or Q to skip)"
+                    if ($raw -match '^[Qq]$') { return $null }
+                    if ($raw -match '^[Bb]$') { $backToOd = $true; break }
+                    if ([string]::IsNullOrWhiteSpace($raw) -and $preIdx -ge 0) {
+                        $chosenLen = [double]$opts[$preIdx].Value; $chosenLabel = $opts[$preIdx].Label; break
+                    }
+                    $n = 0
+                    if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $opts.Count) {
+                        $o = $opts[$n - 1]
+                        if ($o.IsCustom) {
+                            $def = if ($preIdx -ge 0) { [double]$opts[$preIdx].Value } else { 0.5 }
+                            while ($true) {
+                                $ctxt = Read-Host "    Enter custom length in inches (e.g. 0.9, 3/8, 1 3/8; Q to cancel)"
+                                if ($ctxt -match '^[Qq]$') { break }
+                                $res = Resolve-BushingLengthInput -Text $ctxt -Default $def
+                                if ($res.Ok) { $chosenLen = [double]$res.Value; $chosenLabel = ('{0:0.###}' -f $chosenLen); break }
+                                Write-Host "    $($res.Error)" -ForegroundColor Yellow
+                            }
+                            if ($null -ne $chosenLen) { break }
+                            continue
+                        }
+                        $chosenLen = [double]$o.Value; $chosenLabel = $o.Label; break
+                    }
+                    Write-Host "  Enter a number between 1 and $($opts.Count) (or ENTER / B / Q)." -ForegroundColor Yellow
+                }
+                if ($backToOd) { break }
+                if ($null -eq $chosenLen) { continue }
+                Write-Host ("  Hole diameter = {0:0.###}`" (OD {1}); length = {2}`" (ID unspecified)." -f $odPick.OD, $odPick.ODLabel, $chosenLabel) -ForegroundColor Green
+                return (Resolve-OdBushingPick -OdGroup $odPick -Length $chosenLen -LenLabel $chosenLabel)
+            }
+        }
+    }
+
     # ID-FIRST staged pick (user 2026-07-21): ID first, then a STANDARDIZED length menu
     # {1/2, 3/4, 1} + Custom with a length RECOMMENDED from the ID (a 1/2" ID sleeve is
     # normally 1/2" long, a 3/4" ID 3/4" long). The fixed menu is decoupled from the
@@ -307,18 +539,26 @@ function Invoke-BushingPick {
             $bit = if ($g.Lengths[0].ODs[0].Rows[0].PSObject.Properties.Name -contains 'DrillBitSize' -and $g.Lengths[0].ODs[0].Rows[0].DrillBitSize) { "  ($($g.Lengths[0].ODs[0].Rows[0].DrillBitSize))" } else { '' }
             Write-Host ("    {0,3}) ID {1,-7}{2}   ({3})" -f ($i + 1), $g.IDLabel, $bit, $hole) -ForegroundColor White
         }
+        $customIdx = $byId.Count + 1
+        Write-Host ("    {0,3}) Custom hole OD... (type any diameter)" -f $customIdx) -ForegroundColor Yellow
         Write-Host ""
 
         $idPick = $null
         while ($true) {
-            $raw = Read-Host "  Pick ID (1-$($byId.Count), or Q to skip)"
+            $raw = Read-Host "  Pick ID (1-$customIdx, or Q to skip)"
             if ($raw -match '^[Qq]$') { return $null }
             $n = 0
+            if ([int]::TryParse($raw, [ref]$n) -and $n -eq $customIdx) {
+                $cpick = Invoke-CustomOdPick
+                if ($null -ne $cpick) { return $cpick }
+                break   # custom cancelled -> re-show the ID menu
+            }
             if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $byId.Count) {
                 $idPick = $byId[$n - 1]; break
             }
-            Write-Host "  Enter a number between 1 and $($byId.Count)." -ForegroundColor Yellow
+            Write-Host "  Enter a number between 1 and $customIdx." -ForegroundColor Yellow
         }
+        if ($null -eq $idPick) { continue }   # custom was cancelled; re-show the ID menu
         $odOptions = Get-IdOdOptions -IdGroup $idPick
 
         # --- stage 2: STANDARDIZED length menu {1/2, 3/4, 1} + Custom, ID-recommended ---

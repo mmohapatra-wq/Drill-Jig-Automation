@@ -194,12 +194,17 @@ if (-not $asmMode -and $optSelected) {
 } else {
     if ($asmMode) {
         # ASSEMBLY: the SELECTION BUFFER is the read path -- prompt to select components first.
+        # ONE component per hole: select the BOLT SHANKS ONLY. Selecting a bolt + its
+        # washer + nut stack reads as 2-3 separate components at ~the same spot and the
+        # tight assembly dedup tol (1e-3) won't merge them -> too many holes.
         Write-Host "  ASSEMBLY mode: reading SELECTED fastener component locations." -ForegroundColor Cyan
         $buf = @()
         try { $buf = @(($session.CurrentSelectionBuffer()).Contents) } catch {}
         if ($buf.Count -eq 0) {
-            Write-Host "  Select the fastener COMPONENTS in Creo (Ctrl-click them in the tree or graphics)," -ForegroundColor Yellow
-            Write-Host "  then return here and press ENTER." -ForegroundColor Yellow
+            Write-Host "  Select the fastener COMPONENTS in Creo (Ctrl-click them in the tree or graphics)." -ForegroundColor Yellow
+            Write-Host "  Select ONE component per hole -- the BOLT SHANKS only, NOT their washers/nuts" -ForegroundColor Yellow
+            Write-Host "  (a bolt+washer+nut stack reads as 2-3 holes at the same spot)." -ForegroundColor Yellow
+            Write-Host "  Then return here and press ENTER." -ForegroundColor Yellow
             Read-Host "  Press ENTER once the fasteners are selected" | Out-Null
         }
     } else {
@@ -214,7 +219,15 @@ if (-not $asmMode -and $optSelected) {
     }
     $centers = $read.Centers
     if ($read.MedianDia -gt 0) { $medianDia = $read.MedianDia; Write-Host ("  Median bore diameter ~ {0:0.####}" -f $medianDia) -ForegroundColor DarkGray }
-    Write-Host ("  Read {0} fastener {1}." -f $centers.Count, $(if ($asmMode) { 'component location(s)' } else { 'bore center(s)' })) -ForegroundColor Green
+    # COUNT FEEDBACK: expose the selection accounting so a wrong count is visible.
+    if ($asmMode) {
+        Write-Host ("  Selection: {0} picked -> {1} component location(s) read." -f $read.RawSelected, $centers.Count) -ForegroundColor Green
+        if ($read.SkippedNoPath   -gt 0) { Write-Host ("    - skipped {0} pick(s) with no component (surface/edge/datum? select whole instances)." -f $read.SkippedNoPath) -ForegroundColor Yellow }
+        if ($read.SkippedNoXform  -gt 0) { Write-Host ("    - skipped {0} component(s) whose location was unreadable." -f $read.SkippedNoXform) -ForegroundColor Yellow }
+        if ($read.MergedDuplicate -gt 0) { Write-Host ("    - merged {0} duplicate pick(s) of the same component." -f $read.MergedDuplicate) -ForegroundColor DarkGray }
+    } else {
+        Write-Host ("  Read {0} bore center(s)." -f $centers.Count) -ForegroundColor Green
+    }
 }
 Write-Host ""
 
@@ -245,10 +258,12 @@ if ($null -ne $optMargin) { try { $margin = [double]$optMargin } catch {} }
 if ($margin -le 0) { $margin = 0.25 }
 
 # Dedup default depends on the read: bolt+washer+nut BORES in a PART sit at the same
-# (X,Z) but are separate cylinders -> merge at ~the bore dia. Assembly COMPONENTS are
-# discrete instances; a bolt + its nut stack at the SAME (X,Z), but two DISTINCT
-# fasteners spaced by their diameter must NOT merge -> a tight numeric-dup tol.
-$dedup = if ($asmMode) { 1e-3 } else { $medianDia }
+# (X,Z) but are separate SWEPT cylinders -> merge at ~the bore dia. ASSEMBLY COMPONENTS
+# are 1:1 with fasteners (user 2026-07-23: "the amount picked = the amount of fasteners"),
+# so NO proximity merge (DedupTol=0): distinct fasteners must NEVER collapse; the shared
+# reader already dropped exact same-instance re-picks by component path, and two truly
+# coincident holes surface via the collision check rather than a silent merge.
+$dedup = if ($asmMode) { 0.0 } else { $medianDia }
 if ($null -ne $optDedup) { try { $dedup = [double]$optDedup } catch {} }
 if ($dedup -lt 0) { $dedup = 0.0 }
 
@@ -261,11 +276,23 @@ Write-Host ""
 # ============================================
 # 3. PROJECT + CANARY
 # ============================================
-$layout = ConvertTo-LayoutXZ -Centers $centers -AxisX $axisX -AxisZ $axisZ -AxisXSign $signX -AxisZSign $signZ -Margin $margin -DedupTol $dedup
+# -Axes (each fastener's own bore axis, parallel to $centers) => project onto the
+# fastener PANEL plane so real inter-hole distances survive a panel not square to
+# the global axes. Only the shared reader populates it; --selected sets it $null
+# (that path reads bore surfaces and does not build an axis list) => legacy global
+# projection, unchanged.
+$fastAxes = if (-not $asmMode -and $optSelected) { $null } elseif ($null -ne $read) { $read.Axes } else { $null }
+$layout = ConvertTo-LayoutXZ -Centers $centers -Axes $fastAxes -AxisX $axisX -AxisZ $axisZ -AxisXSign $signX -AxisZSign $signZ -Margin $margin -DedupTol $dedup
 if (-not $layout.Valid) {
     Write-Host "  Could not build a valid layout:" -ForegroundColor Red
     foreach ($e in $layout.Errors) { Write-Host ("    - $e") -ForegroundColor Red }
+    Write-Host "  (Select at least 3 fasteners that are NOT all in one row/column so the panel plane is defined; select a single flat panel at a time.)" -ForegroundColor Yellow
     throw "Projection failed."
+}
+if ($layout.Frame -eq 'plane') {
+    Write-Host ("  Projected onto the fastener PANEL plane (axis spread {0:0.##} deg) -- true hole spacing preserved." -f [double]$layout.AxisSpreadDeg) -ForegroundColor DarkGray
+} elseif ($asmMode -or -not $optSelected) {
+    Write-Host "  NOTE: fastener axes were not readable -- fell back to global-axis projection (may distort a tilted panel)." -ForegroundColor Yellow
 }
 
 $sane = Test-FastenerLayoutSane -Layout $layout

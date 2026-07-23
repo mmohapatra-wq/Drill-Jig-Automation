@@ -73,11 +73,336 @@ function global:Get-AxisComponent {
 }
 
 # ----------------------------------------------------------------------------
+# Tiny vec3 helpers (file-local, FL- prefixed) - this lib's convention is to NOT
+# depend on creo_geometry.ps1 being dot-sourced (the offline tests load it alone),
+# so it carries its own Dot/Cross/Unit/Sub. Component-per-line to dodge the COM
+# op_* on-array trap. @(x,y,z) double arrays in, same out.
+# ----------------------------------------------------------------------------
+function FL-Dot  { param($A,$B) return ([double]$A[0]*[double]$B[0] + [double]$A[1]*[double]$B[1] + [double]$A[2]*[double]$B[2]) }
+function FL-Sub  { param($A,$B) $x=[double]$A[0]-[double]$B[0]; $y=[double]$A[1]-[double]$B[1]; $z=[double]$A[2]-[double]$B[2]; return @($x,$y,$z) }
+function FL-Cross{ param($A,$B) $cx=[double]$A[1]*[double]$B[2]-[double]$A[2]*[double]$B[1]; $cy=[double]$A[2]*[double]$B[0]-[double]$A[0]*[double]$B[2]; $cz=[double]$A[0]*[double]$B[1]-[double]$A[1]*[double]$B[0]; return @($cx,$cy,$cz) }
+function FL-Norm { param($A) return [Math]::Sqrt((FL-Dot $A $A)) }
+function FL-Unit { param($A,[double]$Eps=1e-12) $n=FL-Norm $A; if ($n -lt $Eps) { return $null }; $ux=[double]$A[0]/$n; $uy=[double]$A[1]/$n; $uz=[double]$A[2]/$n; return @($ux,$uy,$uz) }
+
+# ----------------------------------------------------------------------------
+# FL-Eigen3Sym - eigen-decomposition of a SYMMETRIC 3x3 matrix by cyclic Jacobi
+# rotations. Pure PS 5.1 (nested-array matrices - $A[i][j] - because the parser
+# rejects $A[i,j] 2D indexing inside method-call args). Returns
+#   @{ Vals = @(v0,v1,v2); Vecs = @(vec0,vec1,vec2) }  (columns of V; NOT sorted).
+# Converges in a handful of sweeps for a 3x3; capped at 100 as a backstop.
+# ----------------------------------------------------------------------------
+function FL-Eigen3Sym {
+    param([double]$a11,[double]$a12,[double]$a13,[double]$a22,[double]$a23,[double]$a33)
+    $A = @(@([double]$a11,[double]$a12,[double]$a13), @([double]$a12,[double]$a22,[double]$a23), @([double]$a13,[double]$a23,[double]$a33))
+    $V = @(@(1.0,0.0,0.0), @(0.0,1.0,0.0), @(0.0,0.0,1.0))
+    for ($sweep = 0; $sweep -lt 100; $sweep++) {
+        $off = [Math]::Abs($A[0][1]) + [Math]::Abs($A[0][2]) + [Math]::Abs($A[1][2])
+        if ($off -lt 1e-18) { break }
+        foreach ($pq in @(@(0,1), @(0,2), @(1,2))) {
+            $p = $pq[0]; $q = $pq[1]
+            $apq = $A[$p][$q]
+            if ([Math]::Abs($apq) -lt 1e-300) { continue }
+            $theta = ($A[$q][$q] - $A[$p][$p]) / (2.0 * $apq)
+            if ($theta -eq 0) { $t = 1.0 } else { $t = [Math]::Sign($theta) / ([Math]::Abs($theta) + [Math]::Sqrt($theta*$theta + 1.0)) }
+            $c = 1.0 / [Math]::Sqrt($t*$t + 1.0)
+            $s = $t * $c
+            $r = 3 - $p - $q
+            $app = $A[$p][$p]; $aqq = $A[$q][$q]; $arp = $A[$r][$p]; $arq = $A[$r][$q]
+            $A[$p][$p] = $c*$c*$app - 2.0*$s*$c*$apq + $s*$s*$aqq
+            $A[$q][$q] = $s*$s*$app + 2.0*$s*$c*$apq + $c*$c*$aqq
+            $A[$p][$q] = 0.0; $A[$q][$p] = 0.0
+            $A[$r][$p] = $c*$arp - $s*$arq; $A[$p][$r] = $A[$r][$p]
+            $A[$r][$q] = $s*$arp + $c*$arq; $A[$q][$r] = $A[$r][$q]
+            for ($i = 0; $i -lt 3; $i++) {
+                $vip = $V[$i][$p]; $viq = $V[$i][$q]
+                $V[$i][$p] = $c*$vip - $s*$viq
+                $V[$i][$q] = $s*$vip + $c*$viq
+            }
+        }
+    }
+    $vals = @([double]$A[0][0], [double]$A[1][1], [double]$A[2][2])
+    $vec0 = @([double]$V[0][0], [double]$V[1][0], [double]$V[2][0])
+    $vec1 = @([double]$V[0][1], [double]$V[1][1], [double]$V[2][1])
+    $vec2 = @([double]$V[0][2], [double]$V[1][2], [double]$V[2][2])
+    return @{ Vals = $vals; Vecs = @($vec0, $vec1, $vec2) }
+}
+
+# ----------------------------------------------------------------------------
+# FL-BestFitNormal - the least-squares plane normal of a POINT CLOUD (the drilled
+# holes are coplanar on the plate, so their point cloud defines the true plate
+# normal - regardless of how each fastener's OWN axis is modelled; live data
+# 2026-07-23 showed the fastener csys Z axis can lie IN the plate plane, so the
+# axis is NOT a reliable normal, but the hole positions always are).
+#
+# The normal is the eigenvector of the SMALLEST eigenvalue of the centered
+# covariance. Returns @{ Normal=@(x,y,z) unit; Flatness=<smallest/largest ratio>;
+# Vals=@(sorted asc) } or $null when it cannot be trusted:
+#   - fewer than 3 points, OR
+#   - the TWO smallest eigenvalues are both ~0 relative to the largest (the points
+#     are COLLINEAR - a single row of holes - so the normal is indeterminate).
+# Flatness ~0 == perfectly coplanar; a large Flatness == the points are NOT
+# coplanar (a mixed-panel selection) and the caller should warn.
+# ----------------------------------------------------------------------------
+function FL-BestFitNormal {
+    param([array]$Points, [double]$CollinearTol = 1e-6)
+    $pts = @()
+    if ($null -ne $Points) { foreach ($p in $Points) { if ($null -ne $p) { $pts += ,$p } } }
+    if ($pts.Count -lt 3) { return $null }
+    $cx = 0.0; $cy = 0.0; $cz = 0.0
+    foreach ($p in $pts) { $cx += [double]$p[0]; $cy += [double]$p[1]; $cz += [double]$p[2] }
+    $np = [double]$pts.Count
+    $cx = $cx / $np; $cy = $cy / $np; $cz = $cz / $np
+    $xx = 0.0; $xy = 0.0; $xz = 0.0; $yy = 0.0; $yz = 0.0; $zz = 0.0
+    foreach ($p in $pts) {
+        $dx = [double]$p[0] - $cx; $dy = [double]$p[1] - $cy; $dz = [double]$p[2] - $cz
+        $xx += $dx*$dx; $xy += $dx*$dy; $xz += $dx*$dz; $yy += $dy*$dy; $yz += $dy*$dz; $zz += $dz*$dz
+    }
+    $e = FL-Eigen3Sym $xx $xy $xz $yy $yz $zz
+    # index eigenvalues ascending
+    $idx = @(0,1,2)
+    for ($i = 0; $i -lt 3; $i++) { for ($j = $i+1; $j -lt 3; $j++) { if ($e.Vals[$idx[$j]] -lt $e.Vals[$idx[$i]]) { $tmp = $idx[$i]; $idx[$i] = $idx[$j]; $idx[$j] = $tmp } } }
+    $lo = [double]$e.Vals[$idx[0]]; $mid = [double]$e.Vals[$idx[1]]; $hi = [double]$e.Vals[$idx[2]]
+    if ($hi -le 0) { return $null }                              # degenerate (all points coincident)
+    if (($mid / $hi) -lt $CollinearTol) { return $null }         # collinear: normal indeterminate
+    $nrm = FL-Unit $e.Vecs[$idx[0]]
+    if ($null -eq $nrm) { return $null }
+    $flat = $lo / $hi
+    $spanRatio = $mid / $hi     # 2nd-largest span ratio: ~0 == collinear, larger == genuinely 2D
+    return @{ Normal = $nrm; Flatness = [double]$flat; Vals = @($lo, $mid, $hi); SpanRatio = [double]$spanRatio }
+}
+
+# Project a vector onto the plane with unit normal $N; return @{ U = unit(in-plane part);
+# Mag = |in-plane part| } or $null if the projection is degenerate (V ~ parallel to N).
+# Component-per-line (COM-array trap). Used to pick valid in-plane layout axes.
+function FL-ProjPlane {
+    param($V, $N)
+    if ($null -eq $V -or $null -eq $N) { return $null }
+    $d = FL-Dot $V $N
+    $px = [double]$V[0] - $d*[double]$N[0]
+    $py = [double]$V[1] - $d*[double]$N[1]
+    $pz = [double]$V[2] - $d*[double]$N[2]
+    $mag = [Math]::Sqrt($px*$px + $py*$py + $pz*$pz)
+    $u = FL-Unit @($px, $py, $pz)
+    if ($null -eq $u) { return $null }
+    return @{ U = $u; Mag = [double]$mag }
+}
+
+# Map an axis token to its global unit vector, honouring a sign. 'X'/'Y'/'Z' ->
+# +/- the basis vector; anything else -> $null.
+function FL-AxisVec {
+    param([string]$Axis, [double]$Sign = 1.0)
+    $s = if ($Sign -lt 0) { -1.0 } else { 1.0 }
+    switch (("" + $Axis).Trim().ToUpper()) {
+        'X' { return @($s, 0.0, 0.0) }
+        'Y' { return @(0.0, $s, 0.0) }
+        'Z' { return @(0.0, 0.0, $s) }
+        default { return $null }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Get-FastenerPlaneFrame - build an in-plane orthonormal frame for the fastener
+# PANEL from each fastener's OWN AXIS (user 2026-07-23: "every single bolt has
+# its own axis that defines itself ... read to the assembly default coordinate
+# system, and then the software does the math between all of the fasteners").
+#
+# WHY THIS EXISTS (the bug it fixes): the old ConvertTo-LayoutXZ kept two GLOBAL
+# axis COMPONENTS of each origin and discarded the third. When the fastener panel
+# is NOT square to the global X/Z plane (normal in a higher-level assembly), that
+# naive drop COLLAPSES the real separation into the discarded axis - so points
+# that are far apart on the panel land coincident (merged -> UNDER-COUNT) or
+# near-coincident (the collision check errors "holes too close"). BOTH reported
+# symptoms are the SAME projection bug.
+#
+# THE FIX: the fasteners are (near-)coaxial and their centers lie ON the panel.
+# The panel NORMAL is the common fastener axis; projecting the origins onto the
+# plane with that normal is an ISOMETRY, so every true hole-to-hole distance is
+# preserved. As a bonus a bolt+washer+nut STACK is coaxial -> its members project
+# to the SAME point and merge to one hole (correct), while distinct holes stay
+# apart.
+#
+# Inputs:
+#   Centers  - array of 3-element origins (@(x,y,z)/COM Get-Comp results).
+#   Axes     - array PARALLEL to Centers of each fastener's axis direction
+#              (@(x,y,z); need not be unit; a $null entry is skipped). For an
+#              assembly this is GetTransform($true).GetZAxis(); for a part it is
+#              the bore cylinder's .D.
+#   AxisX/AxisZ (+Signs) - the GLOBAL axes the user chose as the layout's in-plane
+#              X and Z REFERENCE directions. They are PROJECTED onto the plane
+#              (Gram-Schmidt) so an axis-aligned panel reduces EXACTLY to keeping
+#              those two global components (byte-identical to the old behaviour),
+#              while a tilted panel gets the correct in-plane axes.
+#
+# Returns [pscustomobject] (NEVER throws):
+#   Valid  [bool]      $true iff a normal AND both in-plane axes were derivable
+#   Errors [string[]]
+#   O      [double[3]] centroid of the centers (frame origin; the corner-shift
+#                      downstream makes the absolute origin irrelevant)
+#   N,Xhat,Zhat [double[3]] plane normal + in-plane unit axes ($null when invalid)
+#   AxisSpreadDeg [double] max angle between any fastener axis and the mean normal
+#                      (advisory - large => the "axes" are not really parallel)
+# ----------------------------------------------------------------------------
+function global:Get-FastenerPlaneFrame {
+    param(
+        [array]$Centers, [array]$Axes,
+        [string]$AxisX = 'X', [string]$AxisZ = 'Z',
+        [double]$AxisXSign = 1.0, [double]$AxisZSign = 1.0,
+        [double]$Eps = 1e-9
+    )
+    $errors = @()
+    $pts = @()
+    if ($null -ne $Centers) { foreach ($c in $Centers) { if ($null -ne $c) { $pts += ,$c } } }
+    if ($pts.Count -lt 1) {
+        return [pscustomobject]@{ Valid=$false; Errors=@("no centers to build a plane from"); O=$null; N=$null; Xhat=$null; Zhat=$null; AxisSpreadDeg=$null; NormalSource='none'; Flatness=$null; SpanRatio=$null }
+    }
+
+    # centroid = frame origin (component-per-line: the file's COM-array trap rule -
+    # a comma-separated @(math,math,math) literal misfires under PS 5.1)
+    $ox=0.0; $oy=0.0; $oz=0.0
+    foreach ($p in $pts) { $ox+=[double]$p[0]; $oy+=[double]$p[1]; $oz+=[double]$p[2] }
+    $nPts = [double]$pts.Count
+    $ocx = $ox / $nPts
+    $ocy = $oy / $nPts
+    $ocz = $oz / $nPts
+    $O = @($ocx, $ocy, $ocz)
+
+    # gather the fastener axes (for the advisory + the collinear fallback)
+    $units = @()
+    if ($null -ne $Axes) { foreach ($a in $Axes) { if ($null -ne $a) { $u = FL-Unit $a; if ($null -ne $u) { $units += ,$u } } } }
+
+    # -- normal: PRIMARY = best-fit plane of the POINTS. The drilled holes are coplanar
+    #    on the plate, so their point cloud defines the TRUE plate normal -- regardless
+    #    of how each fastener's OWN axis is modelled (live 2026-07-23: the fastener csys
+    #    Z axis read (1,0,0) LAY IN the plate plane, i.e. the axis was NOT the normal, so
+    #    an axis-average normal projected the layout wrong; the point cloud is reliable).
+    #    FALLBACK = sign-aligned average of the fastener axes, only when best-fit is
+    #    indeterminate (fewer than 3 holes, or a single collinear row).
+    $normalSource = 'points'
+    $flatness = $null
+    $spanRatio = $null
+    $bf = FL-BestFitNormal -Points $pts
+    if ($null -ne $bf) {
+        $N = $bf.Normal
+        $flatness = [double]$bf.Flatness
+        $spanRatio = [double]$bf.SpanRatio
+    } else {
+        $normalSource = 'axis'
+        if ($units.Count -lt 1) {
+            return [pscustomobject]@{ Valid=$false; Errors=@("cannot derive a panel normal: fewer than 3 non-collinear holes AND no readable fastener axes"); O=$O; N=$null; Xhat=$null; Zhat=$null; AxisSpreadDeg=$null; NormalSource='none'; Flatness=$null; SpanRatio=$null }
+        }
+        $ref = $units[0]
+        $sx=0.0; $sy=0.0; $sz=0.0
+        foreach ($u in $units) {
+            $sgn = if ((FL-Dot $u $ref) -lt 0) { -1.0 } else { 1.0 }   # anti-parallel returns must not cancel
+            $sx += $sgn*$u[0]; $sy += $sgn*$u[1]; $sz += $sgn*$u[2]
+        }
+        $N = FL-Unit @($sx,$sy,$sz)
+        if ($null -eq $N) {
+            return [pscustomobject]@{ Valid=$false; Errors=@("fastener axes cancel out - cannot derive a panel normal"); O=$O; N=$null; Xhat=$null; Zhat=$null; AxisSpreadDeg=$null; NormalSource='axis'; Flatness=$null; SpanRatio=$null }
+        }
+        # GUARD (live 2026-07-23): the axis is a valid NORMAL only if the points have
+        # ~ZERO spread ALONG it. If they spread along $N, the axis lies IN the hole
+        # plane (the real 22-fastener panel: axis (1,0,0) in-plane, variance ratio 0.19)
+        # and projecting perpendicular to it would COLLAPSE that spread -> reject rather
+        # than silently distort. A legitimate single row perpendicular to its bolt axis
+        # measures ratio ~0; the empty gap [0.001..0.1] makes 0.02 a robust cutoff.
+        $sAlong = 0.0; $sTot = 0.0
+        foreach ($p in $pts) {
+            $dx = [double]$p[0]-[double]$O[0]; $dy = [double]$p[1]-[double]$O[1]; $dz = [double]$p[2]-[double]$O[2]
+            $along = $dx*[double]$N[0] + $dy*[double]$N[1] + $dz*[double]$N[2]
+            $sAlong += $along*$along
+            $sTot   += $dx*$dx + $dy*$dy + $dz*$dz
+        }
+        $rAlong = if ($sTot -gt 0) { $sAlong / $sTot } else { 0.0 }
+        if ($rAlong -ge 0.02) {
+            return [pscustomobject]@{ Valid=$false; Errors=@("fastener axis lies in the hole plane (points spread along it) - cannot use it as the panel normal; select 3+ non-collinear fasteners (not one row/column) or pick layout axes explicitly"); O=$O; N=$null; Xhat=$null; Zhat=$null; AxisSpreadDeg=$null; NormalSource='axis-rejected'; Flatness=$null; SpanRatio=$null }
+        }
+    }
+
+    # advisory: how non-parallel are the fastener axes vs the CHOSEN normal? For a
+    # points-derived normal a LARGE value just means the fastener axis is not the plate
+    # normal (fine -- the points win); it is NOT an error.
+    $maxDeg = 0.0
+    foreach ($u in $units) {
+        $c = FL-Dot $u $N; if ($c -gt 1.0) { $c = 1.0 } elseif ($c -lt -1.0) { $c = -1.0 }
+        $deg = [Math]::Acos([Math]::Abs($c)) * 180.0 / [Math]::PI
+        if ($deg -gt $maxDeg) { $maxDeg = $deg }
+    }
+
+    # -- in-plane X/Z axes. PREFER the operator's chosen global axes projected onto the
+    #    plane; but if a chosen axis is (near-)parallel to the normal it CANNOT lie in the
+    #    plane (live 2026-07-23: a panel with normal (1,0,0) makes the default AxisX='X'
+    #    degenerate), so AUTO-SUBSTITUTE the most-in-plane global axis. This makes the
+    #    layout work for ANY panel orientation with no operator axis knowledge. Xhat/Zhat
+    #    are an orthonormal in-plane basis regardless; spacing/count are preserved (an
+    #    isometry) -- only the plate's in-plane ORIENTATION follows the chosen/auto axes.
+    $MIN_INPLANE = 0.35   # a layout axis must keep >= this in-plane magnitude after projection
+    $axVec = FL-AxisVec $AxisX $AxisXSign
+    $azVec = FL-AxisVec $AxisZ $AxisZSign
+    if ($null -eq $axVec) { $errors += "AxisX must be one of X/Y/Z (got '$AxisX')" }
+    if ($null -eq $azVec) { $errors += "AxisZ must be one of X/Y/Z (got '$AxisZ')" }
+    $Xhat = $null; $Zhat = $null
+    if ($null -ne $axVec -and $null -ne $azVec) {
+        # Xhat = operator's AxisX projected onto the plane, if it stays in-plane enough;
+        # else auto-pick the global axis with the largest in-plane projection.
+        $pxX = FL-ProjPlane $axVec $N
+        if ($null -ne $pxX -and $pxX.Mag -ge $MIN_INPLANE) {
+            $Xhat = $pxX.U
+        } else {
+            $bestU = $null; $bestMag = 0.0
+            foreach ($g in @( (@(1.0,0.0,0.0)), (@(0.0,1.0,0.0)), (@(0.0,0.0,1.0)) )) {
+                $pg = FL-ProjPlane $g $N
+                if ($null -ne $pg -and $pg.Mag -gt $bestMag) { $bestMag = $pg.Mag; $bestU = $pg.U }
+            }
+            $Xhat = $bestU
+        }
+        if ($null -eq $Xhat) { $errors += "cannot form an in-plane X axis (degenerate plane)" }
+        else {
+            # Zhat = the UNIQUE in-plane axis perpendicular to Xhat (= N x Xhat), signed
+            # toward the operator's AxisZ so the layout keeps the requested handedness.
+            $zc = FL-Unit (FL-Cross $N $Xhat)
+            if ($null -eq $zc) { $errors += "cannot form an in-plane Z axis (Xhat parallel to normal)" }
+            else {
+                $pzZ = FL-ProjPlane $azVec $N
+                if ($null -ne $pzZ -and (FL-Dot $pzZ.U $zc) -lt 0) {
+                    # flip sign toward AxisZ (component-per-line: @(math,math,math) is the COM-array trap)
+                    $nzx = -1.0 * [double]$zc[0]
+                    $nzy = -1.0 * [double]$zc[1]
+                    $nzz = -1.0 * [double]$zc[2]
+                    $Zhat = @($nzx, $nzy, $nzz)
+                } else {
+                    $Zhat = $zc
+                }
+            }
+        }
+    }
+
+    $valid = ($errors.Count -eq 0 -and $null -ne $Xhat -and $null -ne $Zhat)
+    return [pscustomobject]@{
+        Valid = $valid; Errors = [string[]]$errors
+        O = $O; N = $N; Xhat = $Xhat; Zhat = $Zhat
+        AxisSpreadDeg = [double]$maxDeg
+        NormalSource  = $normalSource          # 'points' (best-fit plane) | 'axis' (fallback) | 'axis-rejected' | 'none'
+        Flatness      = $flatness              # smallest/largest eigenvalue ratio; ~0 = perfectly coplanar
+        SpanRatio     = $spanRatio             # mid/largest eigenvalue ratio; ~0 = collinear selection
+    }
+}
+
+# ----------------------------------------------------------------------------
 # ConvertTo-LayoutXZ - project 3D fastener CENTERS onto the 2D jig layout plane
 # the user chose, corner-shift so every point is a positive offset, and merge
 # near-coincident stacks (a through-bolt reads as bolt + washer + nut cylinders
 # at nearly the same (X,Z)). This is the PUBLIC CONTRACT fastenator.cmd + the
 # drilljig import mode bind to.
+#
+# PROJECTION MODE (user 2026-07-23): when -Axes is supplied (each fastener's own
+# axis, parallel to -Centers) a PANEL-PLANE frame is built (Get-FastenerPlaneFrame)
+# and the centers are projected onto that plane - an ISOMETRY that preserves true
+# hole-to-hole distances even when the panel is not square to the global axes.
+# Without -Axes (or if a plane cannot be derived) it FALLS BACK to the legacy
+# per-axis global-component projection (Frame='global'), byte-identical to before,
+# so every existing caller/test is unchanged. For an axis-aligned panel the two
+# modes agree exactly (the projected in-plane axes ARE the chosen global axes).
 #
 # WHY straight axis projection (not index_frame's Get-IndexFrame): the user picks
 # which model axes map to layout X and Z explicitly, so the frame is GIVEN - the
@@ -126,7 +451,8 @@ function global:ConvertTo-LayoutXZ {
         [double]$AxisXSign = 1.0,
         [double]$AxisZSign = 1.0,
         [double]$Margin = 0.25,
-        [double]$DedupTol = 1e-4
+        [double]$DedupTol = 1e-4,
+        [array]$Axes = $null      # OPTIONAL each-fastener axis (parallel to Centers) -> panel-plane projection
     )
 
     $errors = @()
@@ -143,15 +469,79 @@ function global:ConvertTo-LayoutXZ {
     if ($Margin -le 0)   { $errors += "Margin must be > 0 (got $Margin) - a 0 margin lets a corner fastener land on the origin, which the layout drops" }
     if ($DedupTol -lt 0) { $errors += "DedupTol must be >= 0 (got $DedupTol)" }
 
+    # -- decide projection mode: panel-plane (if axes given) or legacy global ---
+    # PANEL-PLANE (user 2026-07-23): project onto the plane whose normal is the
+    # common fastener axis, so real inter-hole distances survive a tilted panel.
+    # This is the FIX for both the under-count (collapsed points merge away) and
+    # the "holes too close" errors (distorted distances) on higher-level assemblies.
+    $frame = $null
+    $frameMode = 'global'
+    $axisSpreadDeg = $null
+    $normalSource = 'global'
+    $flatness = $null
+    $spanRatio = $null
+    # conditioning thresholds (measured 2026-07-23 on the real 22-fastener panel):
+    # good 2D panels have SpanRatio (mid/hi eigenvalue) >= 0.06; collinear ones <= 3e-10.
+    # coplanar panels have Flatness (lo/hi) ~0; a non-coplanar mix pushes it up.
+    $TOL_SPAN = 1e-6
+    $TOL_FLAT = 1e-3
+    if ($null -ne $Axes -and @($Axes).Count -ge 1 -and $errors.Count -eq 0) {
+        # PLANE MODE was REQUESTED (-Axes supplied). A plane that cannot be trusted must
+        # FAIL LOUD -- NOT silently fall back to the legacy global drop, which on a tilted
+        # panel compresses spacing by 1/sqrt2 and merges/mis-spaces distinct holes (the
+        # "3->2" / "holes too close" bug, confirmed 2026-07-23). The front-ends already
+        # show .Errors and gate on .Valid, so this surfaces with no UI change.
+        $frame = Get-FastenerPlaneFrame -Centers $Centers -Axes $Axes -AxisX $ax -AxisZ $az -AxisXSign $AxisXSign -AxisZSign $AxisZSign
+        $illReason = $null
+        if ($null -eq $frame -or -not $frame.Valid) {
+            $illReason = if ($null -ne $frame -and @($frame.Errors).Count -gt 0) { ($frame.Errors -join '; ') } `
+                         else { "the selected fasteners are collinear (or fewer than 3) - they define a LINE, not a panel plane. Select at least 3 fasteners that are NOT all in one row/column." }
+        } elseif ($null -ne $frame.SpanRatio -and [double]$frame.SpanRatio -le $TOL_SPAN) {
+            $illReason = "the selected fasteners are collinear - they define a LINE, not a panel plane. Select fasteners that span the panel in two directions."
+        } elseif ($null -ne $frame.Flatness -and [double]$frame.Flatness -ge $TOL_FLAT) {
+            $illReason = "the selected fasteners are not coplanar (they span two surfaces) - select fasteners from a single flat panel."
+        }
+        if ($null -ne $illReason) {
+            return [pscustomobject]@{
+                Valid=$false; Errors=[string[]]@($illReason); Points=@(); Count=0; Dropped=0; Skipped=0;
+                MinX=0.0; MinZ=0.0; MaxX=0.0; MaxZ=0.0; SpanX=0.0; SpanZ=0.0;
+                AxisX=$ax; AxisZ=$az; AxisXSign=[double]$AxisXSign; AxisZSign=[double]$AxisZSign;
+                Margin=[double]$Margin; DedupTol=[double]$DedupTol; Frame='plane'; AxisSpreadDeg=$null; NormalSource='none'; Flatness=$null; SpanRatio=$null
+            }
+        }
+        $frameMode = 'plane'
+        $axisSpreadDeg = [double]$frame.AxisSpreadDeg
+        $normalSource = [string]$frame.NormalSource
+        $flatness = $frame.Flatness
+        $spanRatio = $frame.SpanRatio
+    }
+
     # -- project every center to a raw (x,z); collect problems, never throw ---
-    # raw = the chosen model-axis components BEFORE the corner-shift.
+    # PLANE mode: raw = the center's coordinates in the panel's in-plane (Xhat,Zhat)
+    #   frame (an isometry). GLOBAL mode (legacy/fallback): raw = the two chosen
+    #   global-axis components. For an axis-aligned panel the two AGREE exactly.
     $raw     = @()
     $skipped = 0
     $i = 0
     if ($null -ne $Centers) {
         foreach ($ctr in $Centers) {
-            $rx = Get-AxisComponent -Center $ctr -Axis $ax -Sign $AxisXSign
-            $rz = Get-AxisComponent -Center $ctr -Axis $az -Sign $AxisZSign
+            $rx = $null; $rz = $null
+            if ($frameMode -eq 'plane') {
+                # in-plane coords: R = ctr - O ; rx = R.Xhat ; rz = R.Zhat
+                $okc = $false
+                try { $okc = ($null -ne $ctr -and $ctr.Count -ge 3) } catch { $okc = $false }
+                if ($okc) {
+                    try {
+                        $R = FL-Sub $ctr $frame.O
+                        $rx = FL-Dot $R $frame.Xhat
+                        $rz = FL-Dot $R $frame.Zhat
+                        if ([double]::IsNaN($rx) -or [double]::IsInfinity($rx) -or [double]::IsNaN($rz) -or [double]::IsInfinity($rz)) { $rx = $null; $rz = $null }
+                    } catch { $rx = $null; $rz = $null }
+                }
+            } else {
+                $rx = Get-AxisComponent -Center $ctr -Axis $ax -Sign $AxisXSign
+                $rz = Get-AxisComponent -Center $ctr -Axis $az -Sign $AxisZSign
+            }
             if ($null -eq $rx -or $null -eq $rz) {
                 $skipped++
                 $i++
@@ -170,7 +560,7 @@ function global:ConvertTo-LayoutXZ {
             Valid=$false; Errors=[string[]]$errors; Points=@(); Count=0; Dropped=0; Skipped=[int]$skipped;
             MinX=0.0; MinZ=0.0; MaxX=0.0; MaxZ=0.0; SpanX=0.0; SpanZ=0.0;
             AxisX=$ax; AxisZ=$az; AxisXSign=[double]$AxisXSign; AxisZSign=[double]$AxisZSign;
-            Margin=[double]$Margin; DedupTol=[double]$DedupTol
+            Margin=[double]$Margin; DedupTol=[double]$DedupTol; Frame=$frameMode; AxisSpreadDeg=$axisSpreadDeg; NormalSource=$normalSource; Flatness=$flatness; SpanRatio=$spanRatio
         }
     }
 
@@ -229,6 +619,11 @@ function global:ConvertTo-LayoutXZ {
         AxisZSign = [double]$AxisZSign
         Margin    = [double]$Margin
         DedupTol  = [double]$DedupTol
+        Frame     = $frameMode                # 'plane' (axes given, tilt-corrected) | 'global' (legacy)
+        AxisSpreadDeg = $axisSpreadDeg         # advisory: max fastener-axis vs chosen-normal angle
+        NormalSource  = $normalSource          # 'points' (best-fit plane) | 'axis' (fallback) | 'global'
+        Flatness      = $flatness              # smallest/largest eigenvalue ratio; ~0 = perfectly coplanar
+        SpanRatio     = $spanRatio             # mid/largest eigenvalue ratio; ~0 = collinear selection
     }
 }
 

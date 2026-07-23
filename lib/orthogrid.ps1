@@ -1158,6 +1158,261 @@ function global:Get-SlotPatternPlan {
     }
 }
 
+# ----------------------------------------------------------------------------
+# Get-SlotPatternRuns -- partition the slot rows into MAXIMAL runs of EQUAL
+# spacing (multi-SEED decomposition: one drawn seed PER run). SUPERSEDED for the
+# drilljig-gui by Get-SlotSeedPatterns (below), the single-SEED approach the user
+# chose 2026-07-23 ("you dont need a 2nd seed sketch. just do as many patterns
+# until all rows have a slot"). Retained pure + tested as a reference / for the
+# console tools that still draw a seed per run.
+#
+# Original intent: an IRREGULAR layout relieved with MULTIPLE hands-free patterns
+# (one per run) instead of hand-drawing every row (user: "if some holes share a
+# distance, that pattern could work, and a second pattern could do the others").
+#
+# Where Get-SlotPatternPlan is all-or-nothing (one constant increment fits ONLY a
+# fully-even layout, else cut per-row), this DECOMPOSES the rows: the operator
+# draws ONE seed per run and each run is a separate single-direction pattern
+# (Build-SlotPatternMacro, already live). Manual draws drop from N (rows) to R
+# (runs). It is a STRICT generalization of the single-pattern path:
+#   - fully-even   -> 1 run              (== today's single pattern)
+#   - fully-irregular (all gaps differ) -> runs pair up where they can, singletons
+#     otherwise                          (each singleton == today's per-row draw)
+#
+# ALGORITHM (greedy longest-run on the sorted cross-coords): start a run at the
+# first unassigned row; its Increment = the gap to the next row; extend the run
+# while the following gap stays within Tol of that Increment; close it and start a
+# fresh run when the gap breaks. A run opened on the last row is a singleton. This
+# is OPTIMAL for the minimum run count: any valid arithmetic run's prefix is itself
+# a valid run, so taking the longest prefix each time never costs an extra run. The
+# runs PARTITION the sorted rows and each run's pattern copies land exactly on its
+# own member rows, so there is no overlap / double-cut.
+#
+# Carries the ROW OBJECTS (not just coords) so the caller has each run's SeedRow
+# (.SlotLen/.CrossCoord/.Corner0/.Corner1 for the guide planes + draw prompt).
+#
+# Returns a [pscustomobject]:
+#   Valid     [bool]     $true when >=1 row with a numeric CrossCoord
+#   Runs      [array]    ordered runs (ascending CrossCoord). Each run is a
+#                        [pscustomobject]: SeedRow (the run's first row object),
+#                        Rows (all row objects in the run), Count (int, =Rows.Count
+#                        = pattern instance count), Increment (double, the common
+#                        gap; 0 for a singleton), IsSingleton (bool, Count==1).
+#   RunCount  [int]      Runs.Count
+#   DrawCount [int]      == RunCount (one manual seed draw per run)
+#   TotalRows [int]      number of rows with a numeric CrossCoord
+#   Reason    [string]   short human-readable explanation
+# global: scope (closures resolve it). Pure; never throws (malformed rows skipped).
+# ----------------------------------------------------------------------------
+function global:Get-SlotPatternRuns {
+    param(
+        [array]$Rows,
+        [double]$Tol = 1e-4
+    )
+
+    # keep the ROW OBJECTS that carry a numeric CrossCoord; skip malformed rows
+    # (explicit null-check before coercion -- the [double]$null -> 0.0 trap).
+    $valid = @()
+    if ($null -ne $Rows) {
+        foreach ($r in $Rows) {
+            $c = $null
+            try { if ($null -ne $r.CrossCoord) { $c = [double]$r.CrossCoord } } catch {}
+            if ($null -ne $c) { $valid += [pscustomobject]@{ Row = $r; Cross = $c } }
+        }
+    }
+    # sort ascending by cross-coord (rows may arrive unsorted, e.g. custom layouts)
+    $valid = @($valid | Sort-Object -Property Cross)
+    $n = $valid.Count
+
+    if ($n -lt 1) {
+        return [pscustomobject]@{
+            Valid = $false; Runs = @(); RunCount = 0; DrawCount = 0; TotalRows = 0
+            Reason = "no rows with a numeric CrossCoord"
+        }
+    }
+
+    # greedy: walk the sorted rows, extending a run while the gap holds.
+    $runs = @()
+    $i = 0
+    while ($i -lt $n) {
+        $runRows = @($valid[$i].Row)
+        $inc = 0.0
+        if ($i + 1 -lt $n) {
+            # this run's pitch = the gap to the next row; extend while it repeats.
+            $inc = [double]$valid[$i + 1].Cross - [double]$valid[$i].Cross
+            $j = $i + 1
+            while ($j -lt $n) {
+                $gap = [double]$valid[$j].Cross - [double]$valid[$j - 1].Cross
+                if ([math]::Abs($gap - $inc) -gt $Tol) { break }
+                $runRows += $valid[$j].Row
+                $j++
+            }
+            $i = $j
+        } else {
+            # last row with no successor -> singleton run.
+            $i = $i + 1
+        }
+        $cnt = @($runRows).Count
+        $runs += [pscustomobject]@{
+            SeedRow     = $runRows[0]
+            Rows        = @($runRows)
+            Count       = [int]$cnt
+            Increment   = if ($cnt -ge 2) { [double]$inc } else { 0.0 }
+            IsSingleton = [bool]($cnt -eq 1)
+        }
+    }
+
+    $rc = @($runs).Count
+    $reason = if ($rc -eq 1 -and -not $runs[0].IsSingleton) {
+        ("{0} rows evenly spaced -> 1 pattern ({0} copies at pitch {1:0.####})" -f $n, $runs[0].Increment)
+    } elseif ($rc -eq $n) {
+        ("{0} rows, no shared spacing -> {1} seed(s) drawn by hand (no run of >=2)" -f $n, $rc)
+    } else {
+        ("{0} rows -> {1} equal-spacing run(s): draw {1} seed(s), the rest pattern hands-free" -f $n, $rc)
+    }
+    return [pscustomobject]@{
+        Valid = $true; Runs = @($runs); RunCount = [int]$rc; DrawCount = [int]$rc
+        TotalRows = [int]$n; Reason = $reason
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Get-SlotSeedPatterns -- ONE seed, MANY patterns (user 2026-07-23: "you dont
+# actually need to do a 2nd seed sketch. just do as many patterns until all rows
+# have a slot"). The operator draws the seed slot ONCE (at the lowest-cross row);
+# every OTHER row is then reached by patterning THAT SAME seed again -- the user
+# confirmed re-patterning an already-patterned seed makes a "new sketch + new slot"
+# on this build, so a fresh ProCmdGeomPattern per group adds slots without erasing
+# earlier ones. This SUPERSEDES the multi-seed Get-SlotPatternRuns for the GUI
+# (which drew a seed per run); Get-SlotPatternRuns is retained (pure + tested) for
+# the console tools / reference.
+#
+# GEOMETRY: a single-direction Creo pattern emanates from its seed (leader = instance
+# 0, copies land at seed + k*increment). So from ONE seed at cross p0, a pattern with
+# increment g and count c places copies at p0 + {g, 2g, ..., (c-1)g}, and may only span
+# CONSECUTIVE present multiples of g (else it drops a slot on an empty non-row position).
+#
+# DECOMPOSITION (user 2026-07-23: "if there is a hole row that doesnt fall in the regular
+# pattern, create a second pattern to accommodate"): exactly ONE "regular" pattern + one
+# count-2 "accommodation" pattern per stray row.
+#   - The REGULAR pattern = the single from-seed pitch g whose consecutive multiples land
+#     on the MOST rows (the dominant spacing). Count = seed + those multiples.
+#   - Every row NOT on the regular pattern = its OWN count-2 pattern (seed + that row) --
+#     a distinct "second pattern" in the tree per stray, NEVER a second multi-count run.
+# Result: draws = 1 (always); patterns = 1 (regular) + (#stray rows).
+#
+# Returns a [pscustomobject]:
+#   Valid        [bool]    $true when >=1 row with a numeric CrossCoord
+#   SeedRow      [obj]     the lowest-cross row object (the ONE slot to draw)
+#   Patterns     [array]   ordered, the REGULAR pattern FIRST then the accommodations;
+#                          each [pscustomobject]: Increment (double, the pattern pitch),
+#                          Count (int, instances incl. the seed leader = covered-rows + 1),
+#                          Offsets (double[], the covered row offsets from the seed),
+#                          Kind ('regular' | 'accommodation')
+#   PatternCount [int]     Patterns.Count (= number of ProCmdGeomPattern fires)
+#   TotalRows    [int]     rows with a numeric CrossCoord
+#   Reason       [string]  short human-readable explanation
+# global: scope (closures resolve it). Pure; never throws (malformed rows skipped).
+# ----------------------------------------------------------------------------
+function global:Get-SlotSeedPatterns {
+    param(
+        [array]$Rows,
+        [double]$Tol = 1e-4
+    )
+
+    # keep the ROW OBJECTS with a numeric CrossCoord; skip malformed (the
+    # [double]$null -> 0.0 trap). Carry the object so the caller has SeedRow.
+    $valid = @()
+    if ($null -ne $Rows) {
+        foreach ($r in $Rows) {
+            $c = $null
+            try { if ($null -ne $r.CrossCoord) { $c = [double]$r.CrossCoord } } catch {}
+            if ($null -ne $c) { $valid += [pscustomobject]@{ Row = $r; Cross = $c } }
+        }
+    }
+    $valid = @($valid | Sort-Object -Property Cross)
+    $n = $valid.Count
+
+    if ($n -lt 1) {
+        return [pscustomobject]@{
+            Valid = $false; SeedRow = $null; Patterns = @(); PatternCount = 0; TotalRows = 0
+            Reason = "no rows with a numeric CrossCoord"
+        }
+    }
+
+    $seedRow  = $valid[0].Row
+    $seedX    = [double]$valid[0].Cross
+    if ($n -eq 1) {
+        return [pscustomobject]@{
+            Valid = $true; SeedRow = $seedRow; Patterns = @(); PatternCount = 0; TotalRows = 1
+            Reason = "1 row -> draw the seed slot only (no pattern needed)"
+        }
+    }
+
+    # offsets of every OTHER row from the seed (all > 0 since the seed is the min),
+    # ascending (the input was sorted by cross).
+    $offsets = @()
+    for ($i = 1; $i -lt $n; $i++) { $offsets += ([double]$valid[$i].Cross - $seedX) }
+
+    # ONE regular pattern + count-2 accommodations (user 2026-07-23: "if there is a hole
+    # row that doesnt fall in the regular pattern, create a second pattern to accommodate").
+    # THE REGULAR PATTERN = the single from-seed pitch g whose consecutive multiples
+    # g,2g,3g,... land on the MOST rows (a pattern may only span PRESENT consecutive
+    # multiples, else it drops a slot on an empty position). EVERY other row then gets its
+    # OWN count-2 pattern (seed + that row) -- a separate "second pattern" in the tree per
+    # stray, never a second multi-count run.
+    $bestG = [double]$offsets[0]; $bestLen = 0; $bestCov = @()
+    foreach ($cand in $offsets) {
+        $g = [double]$cand
+        if ($g -le 0) { continue }
+        $cov = @(); $m = 1
+        while ($true) {
+            $target = $g * $m
+            $hit = $false
+            foreach ($o in $offsets) { if ([math]::Abs([double]$o - $target) -le $Tol) { $hit = $true; break } }
+            if (-not $hit) { break }
+            $cov += ($g * $m); $m++
+        }
+        # prefer the longest run; tie -> the finer (smaller) pitch.
+        if (@($cov).Count -gt $bestLen -or (@($cov).Count -eq $bestLen -and $g -lt $bestG)) {
+            $bestLen = @($cov).Count; $bestG = $g; $bestCov = @($cov)
+        }
+    }
+
+    $patterns = @()
+    # the regular pattern: leader (seed) + the covered multiples.
+    $patterns += [pscustomobject]@{
+        Increment = [double]$bestG
+        Count     = [int]($bestLen + 1)
+        Offsets   = @($bestCov)
+        Kind      = 'regular'
+    }
+    # each row NOT on the regular pattern -> its own count-2 accommodation (ascending).
+    foreach ($o in $offsets) {
+        $inReg = $false
+        foreach ($cv in $bestCov) { if ([math]::Abs([double]$o - [double]$cv) -le $Tol) { $inReg = $true; break } }
+        if ($inReg) { continue }
+        $patterns += [pscustomobject]@{
+            Increment = [double]$o
+            Count     = 2
+            Offsets   = @([double]$o)
+            Kind      = 'accommodation'
+        }
+    }
+
+    $pc = @($patterns).Count
+    $accN = $pc - 1
+    $reason = if ($accN -le 0) {
+        ("{0} rows evenly spaced from the seed -> 1 regular pattern ({1} slots at pitch {2:0.####})" -f $n, $patterns[0].Count, $patterns[0].Increment)
+    } else {
+        ("{0} rows -> 1 regular pattern ({1} slots at pitch {2:0.####}) + {3} accommodation pattern(s) for the off-pattern row(s); draw 1 seed only" -f $n, $patterns[0].Count, $patterns[0].Increment, $accN)
+    }
+    return [pscustomobject]@{
+        Valid = $true; SeedRow = $seedRow; Patterns = @($patterns); PatternCount = [int]$pc
+        TotalRows = [int]$n; Reason = $reason
+    }
+}
+
 function Resolve-EdgeAxis {
     param([double]$Length, [double]$Width, [double]$Height, [double]$Tol = 0.20)
     $dw = [math]::Abs($Length - $Width)

@@ -1,7 +1,7 @@
 <# :
 @echo off
 setlocal
-powershell -ExecutionPolicy Bypass -NoProfile -Command "$ScriptDir='%~dp0'; $ScriptArgs='%*'; & ([scriptblock]::Create((Get-Content -Raw -Encoding UTF8 '%~f0')))"
+powershell -ExecutionPolicy Bypass -NoProfile -STA -Command "$ScriptDir='%~dp0'; $ScriptArgs='%*'; & ([scriptblock]::Create((Get-Content -Raw -Encoding UTF8 '%~f0')))"
 exit /b %errorlevel%
 #>
 
@@ -53,6 +53,29 @@ trap {
 # $ctx.Model is never rebound to a fastener model). Read-FastenerLayout only.
 . (Join-Path $ScriptDir 'lib\fastener_layout.ps1')
 . (Join-Path $ScriptDir 'lib\drilljig_core.ps1')
+# bushing schematic renderer (Draw-BushingSchematic / Get-BushingLayout / etc.) - a
+# DISPLAY-ONLY GDI+ picture of the picked bushing shown on the bushing-confirmation
+# page. All functions are global:, so the confirmation view's .GetNewClosure() Paint
+# handler resolves them. System.Drawing is loaded by wizard.ps1 before any paint.
+. (Join-Path $ScriptDir 'lib\bushing_svg.ps1')
+# WPF Media3D bushing 3D preview (Build-BushingModelGroup + mesh helpers), shown NEXT
+# TO the 2D schematic on the bushing-confirmation page. WPF needs its assemblies + an
+# STA thread (the launcher passes -STA). Loaded GUARDED: if WPF is unavailable the
+# confirmation degrades to the 2D schematic only (never crashes). $script:Wpf3dOk gates it.
+. (Join-Path $ScriptDir 'lib\wpf3d_preview.ps1')
+$script:Wpf3dOk = $false
+try {
+    Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+    Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+    Add-Type -AssemblyName WindowsFormsIntegration -ErrorAction Stop
+    $script:Wpf3dOk = $true
+} catch { $script:Wpf3dOk = $false }
+# WebView2 host (Resolve-WebView2Assets / Add-WebView2Assemblies) - lets the Overview
+# AND Welcome stages embed the three.js 3D preview (docs\drilljig_3d_preview.html).
+# Lazy-loaded when those pages are reached; the rest of the GUI is unaffected if
+# WebView2 is unavailable (the pages degrade to a note).
+. (Join-Path $ScriptDir 'lib\webview2_host.ps1')
 . (Join-Path $ScriptDir 'lib\wizard.ps1')
 
 $dataDir = Join-Path $ScriptDir 'data'
@@ -74,6 +97,11 @@ $slotFlipDefault = ($ScriptArgs -match '(?i)--slot-flip')
 $slotPatternFlip = ($ScriptArgs -match '(?i)--pattern-flip')
 $slotNoPattern   = ($ScriptArgs -match '(?i)--no-pattern')
 $noSlotRelief    = ($ScriptArgs -match '(?i)--no-slot-relief')
+# Chip-relief slot removal-path DIRECTION (X or Z). The 'slot-dir' step (Relief stage)
+# OFFERS the choice for an imported FASTENER layout (user 2026-07-23); orthogrid/custom
+# keep 'X'. --slot-dir X|Z pins it (skips the step's cards). $slotDirFlag = 'X'|'Z'|$null.
+$mSlotDirG = [regex]::Match($ScriptArgs, '(?i)--slot-dir\s+([XZxz])')
+$slotDirFlag = if ($mSlotDirG.Success) { Resolve-SlotRowAxis -Text $mSlotDirG.Groups[1].Value } else { $null }
 # csys-referenced architecture: box + grid planes offset from a base csys (not the
 # default datums), so re-placing the base csys onto the index hole moves the grid.
 $noBaseCsys      = ($ScriptArgs -match '(?i)--no-base-csys')   # revert to legacy default-datum planes
@@ -112,20 +140,41 @@ $ctx = @{
     # user 2026-07-21: length is a FIXED {1/2,3/4,1}+Custom menu recommended from the ID;
     # OD is re-keyed on ID ALONE (Get-IdOdOptions), auto-resolved when unique.
     PendingSpec = $null      # catalog spec awaiting an ID/length/OD pick
-    BushStage   = $null      # 'id' | 'len' | 'od' (od reached only when >1 OD for the ID)
+    BushStage   = $null      # 'id' | 'len' | 'od' (id-first) or 'od1' | 'len' (od-first metal)
     Grouped     = $null      # catalog grouped by ID (persistent so OnPick can index it)
     BushID      = $null      # chosen ID group (from Group-CatalogByID)
-    BushOD      = $null      # retained for back-compat (unused in the ID-first flow)
+    # OD-FIRST metal path (user 2026-07-22): METAL -> PFD / Hand Drill is OD-filtered; the
+    # operator picks the OD (= drilled hole) directly, ID is unspecified. BushOdFirst gates
+    # the OD-first sub-flow; BushOdGroups = Get-OdGroups (persistent for OnPick); BushOD =
+    # the chosen OD group. Set-BushLengthPick reads these when BushOdFirst is true.
+    BushOdFirst = $false     # true when PendingSpec is the metal OD-first path
+    BushOdGroups = $null     # Get-OdGroups for the metal spec (persistent for OnPick)
+    BushOD      = $null      # chosen OD group (OD-first metal path)
     BushOdOptions   = $null  # Get-IdOdOptions for the chosen ID (persistent for OnPick)
     BushLenValue    = $null  # chosen length (double; fixed or custom)
     BushLenLabel    = $null  # chosen length machinist label ('1/2' / '3/4' / '1' / custom)
     BushLenIsCustom = $false # 'len' sub-state: showing the custom textbox
     BushLenCustomText = ''   # raw custom textbox string (survives Pop/Rerender)
     BushLenValid    = $true  # gates the custom "Use this length" commit
+    # CUSTOM HOLE OD (user 2026-07-23): a "Custom hole OD..." card on BOTH the OD list
+    # (metal) and the ID list (sleeve) lets the operator type an arbitrary hole diameter.
+    # BushCustom gates the 'customod' sub-stage; the typed OD lives in BushCustomOd (double)
+    # + BushCustomOdLabel/Text; BushCustomOdValid gates the "Use this OD" commit. There is
+    # no catalog SKU behind a typed OD, so a bold verify-bushing warning is shown.
+    BushCustom      = $false # true when the operator chose "Custom hole OD..."
+    BushCustomOd    = $null  # typed hole diameter (double)
+    BushCustomOdLabel = $null # typed OD machinist/decimal label
+    BushCustomOdText  = ''   # raw custom-OD textbox string (survives Pop/Rerender)
+    BushCustomOdValid = $false # gates the "Use this OD" commit (blank OD is invalid)
     # POINT SOURCE
     PointMode    = 'predefined'
     OrthoGeo     = $null
     LayoutPicked = $false
+    # RADIO-SELECT the tiles (user 2026-07-22): the recommended tile is auto-SELECTED (green)
+    # so Next works immediately; clicking a different tile only MOVES the green highlight (it
+    # does NOT open the sub-view) -- Next COMMITS the selection. LayoutSel = the selected tile
+    # index (0=Skeleton,1=Orthogrid,2=Custom,3=Fastener); default 3 = the recommended Fastener.
+    LayoutSel    = 3
     LayoutMode   = $null      # $null = show tiles; 'orthogrid'|'custom'|'fastener' = inline editor
     # IMPORT FASTENER LAYOUT (Layout tile #4): FILE-ONLY here. The path of the
     # fastener_layout.json loaded (provenance); the live read lives in fastenator.cmd.
@@ -169,6 +218,12 @@ $ctx = @{
     SketchPlaneId = $null
     ExtrudeToId   = $null
     BoxBuilt    = $false
+    # snapshot of what the COMMITTED plate was sized for (set in box-b). A later upstream
+    # change (different bushing OD, edited layout) recomputes HoleDia/OrthoGeo but the built
+    # plate + holes are frozen -> compare against these to WARN of a stale/oversized plate.
+    BuiltHoleDia = $null
+    BuiltPlateW  = $null
+    BuiltPlateH  = $null
     # STAGE 2.5 points
     GridPointIDs = @()
     GridPlaneIds = @()
@@ -189,8 +244,19 @@ $ctx = @{
     SlotArmed    = $false     # slot-a armed the seed sketcher; gates slot-b
     SlotSkip     = $false     # metal declined, or no layout -> skip the slot stage
     SlotFlip     = $false     # confirmed cut-direction flip (learned on the seed)
-    SlotPlan     = $null      # {Rows; SlotWidth; RowAxis; CrossAxis; Depth; FaceId; DirDatumId; DirName; PatPlan; UsePattern}
+    SlotPlan     = $null      # {Mode='pattern'|'perrow'; SeedRow; Patterns[]; Rows[]; SlotWidth; RowAxis; CrossAxis; Depth; FaceId; DirDatumId; DirName}
+    SlotRunIndex = 0          # PER-ROW mode: which row slot-b is currently drawing/cutting
+    SeedCut      = $false     # PATTERN mode: the ONE seed slot has been cut + direction-verified
+    SlotAnyCut   = $false     # a slot was cut (>=1) -> the plate is at least partly relieved
+    SlotWarn     = $false     # a pattern did not verify (seed only) -> surface it honestly at the summary
+    SlotHasPlanes = $false    # slot-a made the visible slot-edge guide planes -> show the CTRL+ALT snap technique
     SlotsDone    = $false
+    # SLOT DIRECTION (removal-path axis) -- 'X'|'Z', or $null = not chosen yet (defaults to
+    # 'X' at the Get-RowSlots cut). The 'slot-dir' step (Relief stage) OFFERS X/Z for an
+    # IMPORTED FASTENER layout (user 2026-07-23); orthogrid/custom keep 'X'. Seeded from
+    # --slot-dir (pins it + marks SlotDirFromFlag so the step skips the cards).
+    SlotRowAxis     = $slotDirFlag                    # 'X'|'Z'|$null
+    SlotDirFromFlag = ($null -ne $slotDirFlag)        # --slot-dir given -> no cards, just confirm
     # CHIP-RELIEF DEPTH BUDGET -- decided in box-a's OnNext (BEFORE the planes are made) so
     # the SIDE/extrude offset can be PADDED by the relief depth: plate = bushingLen + SLOT_DEPTH_ABS,
     # the slot removes SLOT_DEPTH_ABS, so the final guide depth == bushingLen. $WillSlot is
@@ -209,6 +275,17 @@ $ctx = @{
     SlotSpaceMode    = $null      # $null = not asked; 'standard' | 'tight' | 'flag'
     SlotDepthFromFlag = $slotDepthFromFlagG   # --slot-depth given -> skip the question
     SlotDepthValid   = $true      # gates Next in the tight branch (default 0.25 is valid)
+    # HOLE-TO-EDGE MARGIN -- the required wall from a border hole's EDGE to the part
+    # edge. Asked in the 'edge-margin' step (Bushing stage) RIGHT AFTER the bushing tree
+    # and BEFORE the slot-depth step (user 2026-07-23: an option for SMALLER edge margins
+    # so a border hole can sit closer to the part edge, shrinking the plate in tight jobs).
+    # The default wall is one full hole DIAMETER (the 2026-07-21 rule). This value threads
+    # into EVERY layout site (orthogrid Edge lock + -EdgeMargin, custom/index -EdgeMargin +
+    # seed, fastener re-anchor + -EdgeMargin) via Get-EffectiveEdgeMargin. $null = not
+    # chosen -> the sites default to the hole diameter, so this is backward-compatible.
+    EdgeMargin       = $null      # chosen wall in inches, or $null = default (hole dia)
+    EdgeMarginMode   = $null      # $null = not asked; 'standard' | 'custom'
+    EdgeMarginValid  = $true      # gates Next in the custom branch (default is valid)
     # IMPORT-FIRST (user 2026-07-20): the fastener read is offered as the FIRST stage,
     # before Bushing. It captures RAW {X;Z} points here; the Layout stage builds the
     # plate from them once the hole dia is known (re-anchored via Set-LayoutMargin).
@@ -275,12 +352,20 @@ function global:Push-TreeHistory {
         PendingSpec = $Context.PendingSpec
         BushStage   = $Context.BushStage
         BushID      = $Context.BushID
+        BushOdFirst = $Context.BushOdFirst
+        BushOdGroups = $Context.BushOdGroups
+        BushOD      = $Context.BushOD
         BushOdOptions   = $Context.BushOdOptions
         BushLenValue    = $Context.BushLenValue
         BushLenLabel    = $Context.BushLenLabel
         BushLenIsCustom = $Context.BushLenIsCustom
         BushLenCustomText = $Context.BushLenCustomText
         BushLenValid    = $Context.BushLenValid
+        BushCustom      = $Context.BushCustom
+        BushCustomOd    = $Context.BushCustomOd
+        BushCustomOdLabel = $Context.BushCustomOdLabel
+        BushCustomOdText  = $Context.BushCustomOdText
+        BushCustomOdValid = $Context.BushCustomOdValid
         Grouped     = $Context.Grouped
         PicksCount  = @($Context.Picks).Count
     })
@@ -298,12 +383,20 @@ function global:Pop-TreeHistory {
     $Context.PendingSpec = $snap.PendingSpec
     $Context.BushStage   = $snap.BushStage
     $Context.BushID      = $snap.BushID
+    $Context.BushOdFirst = $snap.BushOdFirst
+    $Context.BushOdGroups = $snap.BushOdGroups
+    $Context.BushOD      = $snap.BushOD
     $Context.BushOdOptions   = $snap.BushOdOptions
     $Context.BushLenValue    = $snap.BushLenValue
     $Context.BushLenLabel    = $snap.BushLenLabel
     $Context.BushLenIsCustom = $snap.BushLenIsCustom
     $Context.BushLenCustomText = $snap.BushLenCustomText
     $Context.BushLenValid    = $snap.BushLenValid
+    $Context.BushCustom      = $snap.BushCustom
+    $Context.BushCustomOd    = $snap.BushCustomOd
+    $Context.BushCustomOdLabel = $snap.BushCustomOdLabel
+    $Context.BushCustomOdText  = $snap.BushCustomOdText
+    $Context.BushCustomOdValid = $snap.BushCustomOdValid
     $Context.Grouped     = $snap.Grouped
     $Context.TreeDone    = $false
     while (@($Context.Path).Count  -gt [int]$snap.PathCount)  { $Context.Path.RemoveAt($Context.Path.Count - 1) }
@@ -316,8 +409,11 @@ function global:Reset-TreeWalk {
     param($Context)
     $Context.TreeDone = $false; $Context.PendingSpec = $null; $Context.BushStage = $null
     $Context.Grouped = $null; $Context.BushID = $null
+    $Context.BushOdFirst = $false; $Context.BushOdGroups = $null; $Context.BushOD = $null
     $Context.BushOdOptions = $null; $Context.BushLenValue = $null; $Context.BushLenLabel = $null
     $Context.BushLenIsCustom = $false; $Context.BushLenCustomText = ''; $Context.BushLenValid = $true
+    $Context.BushCustom = $false; $Context.BushCustomOd = $null; $Context.BushCustomOdLabel = $null
+    $Context.BushCustomOdText = ''; $Context.BushCustomOdValid = $false
     $Context.TreeNode = $Context.TreeRoot
     if ($null -ne $Context.Path)  { $Context.Path.Clear() }
     if ($null -ne $Context.Picks -and @($Context.Picks).Count -gt 0) { $Context.Picks.Clear() }
@@ -333,13 +429,35 @@ function global:Reset-TreeWalk {
 # itself global, so this is safe inside a .GetNewClosure().
 function global:Set-BushLengthPick {
     param($Context, [double]$LenValue, [string]$LenLabel)
-    if ($null -eq $Context.BushID) { return 'noop' }
     $Context.BushLenValue = [double]$LenValue
     $Context.BushLenLabel = [string]$LenLabel
+    # CUSTOM-OD path (user 2026-07-23): the operator typed an arbitrary hole OD (no catalog
+    # SKU behind it). $Context.BushCustomOd holds the typed diameter; resolve via
+    # Resolve-CustomOdPick (ID '(custom)', PartNumber flags verify) and finish. This MUST be
+    # the FIRST branch -- a custom pick sets neither BushOdFirst nor BushID, so without it
+    # the ID-null guard below would no-op and the pick would silently drop.
+    if ($Context.BushCustom) {
+        if ($null -eq $Context.BushCustomOd) { return 'noop' }
+        $pick = Resolve-CustomOdPick -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel)
+        [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
+        $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
+        return 'done'
+    }
+    # OD-FIRST metal path (user 2026-07-22): no ID was chosen (the drilled hole IS the
+    # removable bushing's OD). $Context.BushOD holds the chosen OD group; resolve via
+    # Resolve-OdBushingPick (ID unspecified) and finish -- there is never an OD tie-break.
+    if ($Context.BushOdFirst) {
+        if ($null -eq $Context.BushOD) { return 'noop' }
+        $pick = Resolve-OdBushingPick -OdGroup $Context.BushOD -Length ([double]$LenValue) -LenLabel ([string]$LenLabel)
+        [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
+        $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
+        return 'done'
+    }
+    if ($null -eq $Context.BushID) { return 'noop' }
     $ods = @($Context.BushOdOptions)
     if (@($ods).Count -gt 1) { $Context.BushStage = 'od'; return 'od' }
     $pick = Resolve-BushingPickRow -IdGroup $Context.BushID -OdOption $ods[0] -Length ([double]$LenValue) -LenLabel ([string]$LenLabel)
-    [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
+    [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
     $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
     return 'done'
 }
@@ -386,6 +504,69 @@ function Get-StackTop {
     foreach ($ctl in $Panel.Controls) { try { if ($null -eq $b -or $ctl.Bottom -gt $b) { $b = $ctl.Bottom } } catch {} }
     if ($null -eq $b) { return $Min }
     return ([Math]::Max($Min, [int]$b + $Gap))
+}
+
+# New-BushingViewportHost - a WPF Media3D 3D view of a bushing as a WinForms
+# ElementHost, for the confirmation page NEXT TO the 2D schematic. Drill bushings
+# (HeadDia > OD) render HEADED; sleeves headless - the SAME distinction the 2D makes
+# (the caller passes HeadDia from Get-BushingHeadDia). Drag orbits, wheel zooms.
+# Returns $null on ANY failure so the caller falls back to a 2D-only layout (the 3D is
+# a bonus, never a crash). Needs the WPF assemblies ($script:Wpf3dOk). global: so the
+# step Build resolves it. Orbit state lives in captured hashtables (mutated across events).
+function global:New-BushingViewportHost {
+    param([double]$OD, [double]$ID, [double]$Length, [double]$HeadDia, [int]$Width, [int]$Height, $Background)
+    try {
+        $vp = New-Object System.Windows.Controls.Viewport3D
+        $cam = New-Object System.Windows.Media.Media3D.PerspectiveCamera; $cam.FieldOfView = 46
+        $vp.Camera = $cam
+        $lg = New-Object System.Windows.Media.Media3D.Model3DGroup
+        # NOTE: every collection .Add() below returns an int index; [void]-wrap them so
+        # they do NOT leak into this function's output (else the return is an array, not
+        # the ElementHost, and $eh3d.Location fails at the call site).
+        [void]$lg.Children.Add((New-Object System.Windows.Media.Media3D.AmbientLight([System.Windows.Media.Color]::FromRgb(96,106,126))))
+        [void]$lg.Children.Add((New-Object System.Windows.Media.Media3D.DirectionalLight([System.Windows.Media.Color]::FromRgb(255,255,255), (New-Object System.Windows.Media.Media3D.Vector3D(-0.5,-1,-0.6)))))
+        [void]$lg.Children.Add((New-Object System.Windows.Media.Media3D.DirectionalLight([System.Windows.Media.Color]::FromRgb(120,150,200), (New-Object System.Windows.Media.Media3D.Vector3D(0.6,-0.3,0.5)))))
+        $lv = New-Object System.Windows.Media.Media3D.ModelVisual3D; $lv.Content = $lg; [void]$vp.Children.Add($lv)
+        $mv = New-Object System.Windows.Media.Media3D.ModelVisual3D
+        $mv.Content = Build-BushingModelGroup -OD $OD -ID $ID -Length $Length -HeadDia $HeadDia -Segments 48
+        [void]$vp.Children.Add($mv)
+        # iso fit + orbit state (hashtable captured by the handlers => mutation persists)
+        $headLen = if ($HeadDia -gt $OD) { $OD * 0.3 } else { 0.0 }
+        $Hdim = $Length + $headLen
+        $maxDim = [math]::Max([math]::Max($OD, $HeadDia), $Hdim); if ($maxDim -le 0) { $maxDim = 1 }
+        $rad0 = ($maxDim / (2*[math]::Tan(($cam.FieldOfView*[math]::PI/180)/2))) * 1.9
+        $st = @{ az=0.9; el=0.5; rad=$rad0; cam=$cam }
+        $place = {
+            $cx = $st.rad*[math]::Cos($st.el)*[math]::Cos($st.az)
+            $cy = $st.rad*[math]::Sin($st.el)
+            $cz = $st.rad*[math]::Cos($st.el)*[math]::Sin($st.az)
+            $st.cam.Position = New-Object System.Windows.Media.Media3D.Point3D($cx,$cy,$cz)
+            $st.cam.LookDirection = New-Object System.Windows.Media.Media3D.Vector3D((-$cx),(-$cy),(-$cz))
+            $st.cam.UpDirection = New-Object System.Windows.Media.Media3D.Vector3D(0,1,0)
+        }.GetNewClosure()
+        & $place
+        $grid = New-Object System.Windows.Controls.Grid
+        $bg = if ($null -ne $Background) { $Background } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+        $grid.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb([byte]$bg.R,[byte]$bg.G,[byte]$bg.B))
+        [void]$grid.Children.Add($vp)
+        $drag = @{ on=$false; lx=0.0; ly=0.0 }
+        $grid.Add_MouseDown({ param($s,$e) $p=$e.GetPosition($s); $drag.on=$true; $drag.lx=$p.X; $drag.ly=$p.Y; [void]$s.CaptureMouse() }.GetNewClosure())
+        $grid.Add_MouseUp({ param($s,$e) $drag.on=$false; [void]$s.ReleaseMouseCapture() }.GetNewClosure())
+        $grid.Add_MouseMove({ param($s,$e)
+            if (-not $drag.on) { return }
+            $p=$e.GetPosition($s); $dx=$p.X-$drag.lx; $dy=$p.Y-$drag.ly
+            $st.az -= $dx*0.01; $st.el += $dy*0.01
+            $st.el = [math]::Max(-1.55, [math]::Min(1.55, $st.el)); & $place
+            $drag.lx=$p.X; $drag.ly=$p.Y
+        }.GetNewClosure())
+        $grid.Add_MouseWheel({ param($s,$e)
+            $factor = if ($e.Delta -gt 0) { 0.88 } else { 1.136 }
+            $st.rad = [math]::Max(0.2, [math]::Min(200.0, $st.rad*$factor)); & $place
+        }.GetNewClosure())
+        $eh = New-Object System.Windows.Forms.Integration.ElementHost
+        $eh.Child = $grid
+        return $eh
+    } catch { return $null }
 }
 
 # A big "look at Creo" arm banner for a pick step. Both lines AUTO-HEIGHT + wrap, so
@@ -548,7 +729,7 @@ function global:Invoke-GuiFastenerLiveRead {
     # instead of a floating popup.
     param($OutPath, [double]$HoleDia, $Wizard)
     # 1. confirm the fastener model is active
-    $ans = $Wizard.AskInline('Import fastener layout - live read', ("Make the FASTENER model (the one full of fasteners) the ACTIVE window in Creo, then click OK.`r`n`r`nFor an ASSEMBLY, also SELECT the fastener components first (Ctrl-click them).`r`n`r`nThe jig part is only READ from here -- nothing is modified."), 'OKCancel')
+    $ans = $Wizard.AskInline('Import fastener layout - live read', ("Make the FASTENER model (the one full of fasteners) the ACTIVE window in Creo, then click OK.`r`n`r`nFor an ASSEMBLY, also SELECT the fastener components first (Ctrl-click them). Select ONE component per hole -- the BOLT SHANKS only, NOT their washers/nuts (a bolt+washer+nut stack reads as 2-3 holes at the same spot).`r`n`r`nThe jig part is only READ from here -- nothing is modified."), 'OKCancel')
     if ($ans -ne 'OK') { return $null }
 
     $fConn = $null; $written = $null
@@ -568,8 +749,15 @@ function global:Invoke-GuiFastenerLiveRead {
             return $null
         }
         $mg = if ($HoleDia -gt 0) { [double]$HoleDia } else { 0.25 }
-        $dt = if ($fIsAsm) { 1e-3 } else { $mg }
-        $layout = ConvertTo-LayoutXZ -Centers $read.Centers -AxisX 'X' -AxisZ 'Z' -Margin $mg -DedupTol $dt
+        # ASSEMBLY: NO proximity merge (user 2026-07-23: one selected fastener = one hole,
+        # picked count = hole count). DedupTol=0 so distinct fasteners can NEVER collapse;
+        # the reader dropped exact same-instance re-picks by path, and coincident holes
+        # surface via the collision check, not a silent merge.
+        $dt = if ($fIsAsm) { 0.0 } else { $mg }
+        # -Axes = each fastener's own bore axis (parallel to Centers) => project onto
+        # the fastener PANEL plane so true hole spacing survives a panel not square to
+        # the global axes (fixes "only some register" / "holes too close" in big asms).
+        $layout = ConvertTo-LayoutXZ -Centers $read.Centers -Axes $read.Axes -AxisX 'X' -AxisZ 'Z' -Margin $mg -DedupTol $dt
         if (-not $layout.Valid) {
             [void]$Wizard.AskInline('Live read', ("Read $($read.Count) center(s) but could not build a layout:`r`n`r`n" + (($layout.Errors) -join "`r`n")), 'OK')
             return $null
@@ -582,9 +770,24 @@ function global:Invoke-GuiFastenerLiveRead {
         $ok = Write-FastenerLayout -Path $OutPath -Layout $layout -SourceModel $fName -Units 'unknown' -ReadMethod ($read.ReadMethod + ' (GUI live)') -WhenIso ((Get-Date).ToString('o'))
         if (-not $ok) { [void]$Wizard.AskInline('Live read', "Failed to write $OutPath.", 'OK'); return $null }
         $written = $OutPath
+        # COUNT FEEDBACK: show the selection accounting so a wrong count is visible.
+        $acct = ''
+        if ($fIsAsm) {
+            $acct = "`r`n`r`nSelection: $($read.RawSelected) picked -> $($layout.Count) hole(s)."
+            if ($read.SkippedNoPath   -gt 0) { $acct += "`r`n  - skipped $($read.SkippedNoPath) pick(s) with no component (surface/edge? select whole instances)." }
+            if ($read.SkippedNoXform  -gt 0) { $acct += "`r`n  - skipped $($read.SkippedNoXform) component(s) with an unreadable location." }
+            if ($read.MergedDuplicate -gt 0) { $acct += "`r`n  - merged $($read.MergedDuplicate) duplicate pick(s) of the same component." }
+            $acct += "`r`n`r`nIf that count looks wrong, select ONE component per hole (bolt shanks only) and re-read."
+        }
+        # projection-mode note: plane (tilt-corrected) vs global fallback.
+        if ($layout.Frame -eq 'plane') {
+            $acct += "`r`n`r`nProjected onto the fastener PANEL plane (axis spread {0:0.##} deg) -- true hole spacing preserved." -f [double]$layout.AxisSpreadDeg
+        } else {
+            $acct += "`r`n`r`nNOTE: fastener axes not readable -- used global-axis projection (may distort a tilted panel)."
+        }
         # -NoActivate: the operator switches Creo's active window right after, so the
         # wizard must NOT steal focus (a focus grab would fight the window switch).
-        [void]$Wizard.AskInline('Live read - switch back to the jig part', ("Read $($layout.Count) fastener location(s) from '$fName' and saved the layout.`r`n`r`nNow switch Creo's active window BACK to the BLANK JIG PART, then click OK to continue."), 'OK', $true)
+        [void]$Wizard.AskInline('Live read - switch back to the jig part', ("Read $($layout.Count) fastener location(s) from '$fName' and saved the layout.$acct`r`n`r`nNow switch Creo's active window BACK to the BLANK JIG PART, then click OK to continue."), 'OK', $true)
     } catch {
         [void]$Wizard.AskInline('Live read', ("Live read failed: $($_.Exception.Message)"), 'OK')
         $written = $null
@@ -625,16 +828,20 @@ function Add-InlineOrthogrid {
     $clearDia = 0.0
     if ($null -ne $Context.HoleDia -and [double]$Context.HoleDia -gt 0) { $clearDia = [double]$Context.HoleDia }
 
-    # EDGE MARGIN = THE HOLE DIAMETER (user 2026-07-21). The plate is sized with
-    # ClearDia = the hole dia, so the Edge field IS the border hole-edge -> part-edge
-    # wall; forcing Edge = hole dia makes that wall exactly one diameter. Lock the box
-    # (read-only, below) so the operator can't break the rule. Only when the dia is
-    # known (the jig flow always knows it); with no dia the field stays editable.
+    # EDGE MARGIN = the chosen hole-to-edge wall (user 2026-07-23: default one hole
+    # DIAMETER, or a SMALLER wall picked in the edge-margin step). The plate is sized with
+    # ClearDia = the hole dia, so the Edge field IS the border hole-edge -> part-edge wall;
+    # locking Edge = the chosen wall (via Get-EffectiveEdgeMargin: $c.EdgeMargin when set,
+    # else the hole dia) enforces exactly that margin. The box is locked read-only (below)
+    # so the operator can't fight the edge-margin step. Only when the dia is known (the jig
+    # flow always knows it); with no dia the field stays editable + the check uses -1 (legacy
+    # one-radius). $Context.EdgeMargin=$null -> default = hole dia = the prior behaviour.
     $lockEdge = ($clearDia -gt 0)
-    if ($lockEdge) { $Context.OrthoFields.Edge = $clearDia }
+    $wallReq = Get-EffectiveEdgeMargin -ChosenMargin $Context.EdgeMargin -HoleDia $clearDia
+    if ($lockEdge) { $Context.OrthoFields.Edge = $wallReq }
     # pass the SAME wall to Get-OrthogridGeometry so its check + echoed .EdgeMargin agree
-    # with the locked field (one diameter); -1 (legacy one-radius) when the dia is unknown.
-    $edgeMargin = if ($lockEdge) { $clearDia } else { -1.0 }
+    # with the locked field; -1 (legacy one-radius) when the dia is unknown.
+    $edgeMargin = if ($lockEdge) { $wallReq } else { -1.0 }
 
     # left column: labelled fields. The Edge row is relabelled + locked when the hole
     # dia is known (wall = one diameter).
@@ -643,7 +850,7 @@ function Add-InlineOrthogrid {
         @{ Key='CcZ';  Label='Center-to-center Z' },
         @{ Key='Nx';   Label='Holes along X (Nx)' },
         @{ Key='Nz';   Label='Holes along Z (Nz)' },
-        @{ Key='Edge'; Label=$(if ($lockEdge) { 'Edge margin (= hole dia)' } else { 'Edge margin' }) }
+        @{ Key='Edge'; Label=$(if ($lockEdge) { ('Edge margin (= {0:0.###}")' -f $wallReq) } else { 'Edge margin' }) }
     )
     $y = 6
     $boxes = @{}
@@ -802,18 +1009,19 @@ function Add-InlineCustomPoints {
     $okCol  = if ($thm) { $thm.Ok }  else { [System.Drawing.Color]::FromArgb(120,210,150) }
     $clearDia = 0.0
     if ($null -ne $Context.HoleDia -and [double]$Context.HoleDia -gt 0) { $clearDia = [double]$Context.HoleDia }
-    # EDGE MARGIN = THE HOLE DIAMETER (user 2026-07-21): every border wall is one full
-    # diameter. -1 (legacy one-radius rule) when the hole dia is unknown.
-    $edgeMargin = if ($clearDia -gt 0) { $clearDia } else { -1.0 }
+    # EDGE MARGIN = the chosen hole-to-edge wall (user 2026-07-23: default one full hole
+    # diameter, or a SMALLER wall from the edge-margin step). -1 (legacy one-radius rule)
+    # when the hole dia is unknown. $Context.EdgeMargin=$null -> default = the hole dia.
+    $edgeMargin = Get-EffectiveEdgeMargin -ChosenMargin $Context.EdgeMargin -HoleDia $clearDia
 
     # INDEX-RELATIVE (user 2026-07-21): the operator sets the INDEX hole (offset from the
     # plate corner) once, then each grid row is one OTHER hole's offset FROM THE INDEX.
     # persistent index store (seed once: prior edit, or a sane default). The default index
-    # offset must clear the edge-margin rule: near wall = index - radius >= EdgeMargin, and
-    # EdgeMargin = HoleDia, so index >= radius + HoleDia = 1.5*HoleDia. Seed at 1.5*dia so
-    # the default layout is VALID (tangent) out of the box; 0.5 when the hole dia is unknown.
+    # offset must clear the edge-margin rule: near wall = index - radius >= EdgeMargin, so
+    # index >= radius + EdgeMargin. Seed at radius + the chosen wall so the default layout is
+    # VALID (tangent) out of the box; 0.5 when the hole dia is unknown.
     if ($null -eq $Context.CustomIndex) {
-        $ixSeed = if ($clearDia -gt 0) { 1.5 * $clearDia } else { 0.5 }
+        $ixSeed = if ($clearDia -gt 0) { (0.5 * $clearDia) + $edgeMargin } else { 0.5 }
         # re-open to edit: recover the index from the tagged OrthoGeo if present.
         if ($null -ne $Context.OrthoGeo -and ($Context.OrthoGeo.PSObject.Properties.Name -contains 'IndexGridX') -and $null -ne $Context.OrthoGeo.IndexGridX) {
             $Context.CustomIndex = @{ X = ('{0}' -f [double]$Context.OrthoGeo.IndexGridX); Z = ('{0}' -f [double]$Context.OrthoGeo.IndexGridZ) }
@@ -1093,9 +1301,13 @@ function Add-LayoutPreview {
             $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(110,150,210), 1.5)
             $g.DrawRectangle($pen, [single]$offX, [single]$offY, [single]$drawW, [single]$drawH); $pen.Dispose()
             # chip-relief slot bands (UNDER the dots) - same Get-RowSlots math as the editor.
+            # Honors $Context.SlotRowAxis (the layout-stage X/Z toggle) so the preview shows
+            # which way the slots actually run; defaults to 'X' when unset (orthogrid/custom/
+            # index previews, which never toggle it).
             if ($clearDia -gt 0) {
                 try {
-                    $sl = Get-RowSlots -Points $res.Points -SlotWidth $clearDia -Width $w -Height $h -RowAxis 'X'
+                    $slotRA = if ($Context.SlotRowAxis -eq 'Z') { 'Z' } else { 'X' }
+                    $sl = Get-RowSlots -Points $res.Points -SlotWidth $clearDia -Width $w -Height $h -RowAxis $slotRA
                     Draw-SlotRects -Graphics $g -Slots $sl -OffX $offX -OffY $offY -DrawH $drawH -Scale $scale
                 } catch {}
             }
@@ -1113,6 +1325,45 @@ function Add-LayoutPreview {
 }
 
 # ============================================================================
+# Add-SlotDirToggle - an inline X/Z chip-relief slot-DIRECTION picker for the LAYOUT
+# stage (user 2026-07-23: the direction choice should live in the layout GUI so the
+# operator SEES which way the slots run in the preview, not in a later Relief step).
+# Two segmented toggle buttons ("Along X" / "Along Z"); the active one is accent-filled.
+# Clicking sets $Context.SlotRowAxis and $Wizard.Rerender()s -- the rebuild re-runs
+# Add-LayoutPreview, whose slot bands now read SlotRowAxis, so the preview updates live.
+# Offered for the IMPORTED FASTENER layout (a fastener pattern has no operator-laid
+# primary axis); orthogrid/custom keep 'X'. Returns the bottom Y of the row.
+# ============================================================================
+function Add-SlotDirToggle {
+    param($Panel, $Context, $Wizard, [int]$Top, [int]$Left = 8)
+    if ($null -eq $Context.SlotRowAxis) { $Context.SlotRowAxis = 'X' }
+    $cur = if ($Context.SlotRowAxis -eq 'Z') { 'Z' } else { 'X' }
+    $thm = $script:WizTheme
+    $accent = if ($thm -and $thm.Accent) { $thm.Accent } else { [System.Drawing.Color]::FromArgb(40,90,170) }
+    $idle   = if ($thm) { $thm.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = 'Chip-relief slot direction:'; $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point($Left, ($Top + 5))
+    $lbl.ForeColor = Get-UiColor ''; $lbl.BackColor = [System.Drawing.Color]::Transparent
+    $Panel.Controls.Add($lbl)
+    $bx = $Left + 175
+    foreach ($opt in @(@{ A='X'; T='Along X' }, @{ A='Z'; T='Along Z' })) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $opt.T; $b.Size = New-Object System.Drawing.Size(92, 28)
+        $b.Location = New-Object System.Drawing.Point($bx, $Top)
+        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90,104,132)
+        $b.ForeColor = Get-UiColor ''
+        $b.BackColor = if ($opt.A -eq $cur) { $accent } else { $idle }
+        $ax = $opt.A
+        $b.Add_Click({ param($s,$e) $Context.SlotRowAxis = $ax; $Wizard.Rerender() }.GetNewClosure())
+        $Panel.Controls.Add($b)
+        $bx += 100
+    }
+    return ($Top + 28)
+}
+
+# ============================================================================
 # Build the connection up front (before the wizard) so the breadcrumb's later
 # stages reflect a real session and pick steps have a live buffer to read. The
 # decision tree + point-source are pure WinForms and could run before connecting,
@@ -1125,6 +1376,48 @@ if ($procs.Count -gt 1) { throw "More than one Creo session is open. This tool e
 $proc = $procs[0]
 $Env:PRO_DIRECTORY    = $proc.Path.TrimEnd("xtop.exe")
 $Env:PRO_COMM_MSG_EXE = $proc.Path -replace "xtop.exe", "pro_comm_msg.exe"
+
+# ----------------------------------------------------------------------------
+# PREFLIGHT self-heal: clear ORPHANED repo automation shells before connecting.
+# The #1 cause of a persistent RPC_E_SERVERFAULT (0x80010105 "the server threw
+# an exception") on Connect() -- the fault that looks like "Creo needs
+# restarting AGAIN" -- is a PRIOR run of a repo .cmd tool that is still ALIVE
+# holding Creo's single async-COM slot: parked at "Press any key to exit" after
+# a failure, a wizard window closed without pressing a key, or a leaked
+# throwaway fastener connection. Creo serves ~one async client at a time, so the
+# next Connect() faults until that process dies. Restarting Creo "fixes" it only
+# because it drops the server side of the stale link -- killing the orphan does
+# the same WITHOUT losing the Creo session. So self-heal here: find lingering
+# repo-tool shells (the hybrid-.cmd launcher signature -- scriptblock::Create +
+# Get-Content -Raw + THIS repo path -- which never matches a VS Code / Claude
+# terminal) other than THIS process, and terminate them. Never throws: a CIM /
+# permission hiccup must not block a legitimate launch (the retry loop below is
+# the fallback). Because the tool already requires exactly ONE Creo, two repo
+# automation shells can never usefully coexist -- killing the others is correct.
+$selfPid = $PID
+try {
+    $repoPat = [regex]::Escape($ScriptDir.TrimEnd('\'))
+    $orphans = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop | Where-Object {
+        $_.ProcessId -ne $selfPid -and
+        $null -ne $_.CommandLine -and
+        $_.CommandLine -match 'scriptblock\]::Create' -and
+        $_.CommandLine -match 'Get-Content -Raw' -and
+        $_.CommandLine -match $repoPat
+    })
+    if ($orphans.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  Found $($orphans.Count) lingering drill-jig automation shell(s) from a prior run." -ForegroundColor Yellow
+        Write-Host "  These hold Creo's COM connection and are the usual cause of the 'server threw an exception' fault." -ForegroundColor DarkGray
+        foreach ($o in $orphans) {
+            Write-Host "    - terminating orphan PID $($o.ProcessId) (frees the Creo connection; no Creo restart needed)" -ForegroundColor DarkGray
+            try { Stop-Process -Id $o.ProcessId -Force -ErrorAction Stop } catch {}
+        }
+        Start-Sleep -Milliseconds 1000   # let Creo's RPC server notice the dropped client and release the slot
+        Write-Host "  Cleared. Connecting..." -ForegroundColor Green
+    }
+} catch {
+    # CIM unavailable / access denied -- skip self-heal, fall through to the retry loop.
+}
 
 try { New-Object -ComObject pfcls.pfcAsyncConnection | Out-Null }
 catch {
@@ -1155,10 +1448,16 @@ for ($cattempt = 1; $cattempt -le 5; $cattempt++) {
     }
 }
 if ($null -eq $connection) {
+    # Release the faulted async object so THIS process leaves nothing holding the
+    # Creo slot on its way out (a leaked $async here would poison the next launch too).
+    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($async) | Out-Null } catch {}
+    $async = $null
     throw ("Could not connect to Creo after 5 attempts ($($connErr.Exception.Message)). This is a Creo-SIDE " +
            "connection fault (the Creo COM server threw), NOT a script error. Recover by: (1) click into the Creo " +
            "window and DISMISS any open dialog / finish or cancel any in-progress feature; (2) make sure a PART is " +
-           "open and Creo is fully loaded and idle; (3) if it still fails, SAVE and RESTART Creo, then re-run.")
+           "open and Creo is fully loaded and idle; (3) if it still fails, SAVE and RESTART Creo, then re-run. " +
+           "NOTE: a lingering prior run is the usual cause -- this tool now auto-clears those at launch, so a plain " +
+           "re-run normally succeeds without touching Creo.")
 }
 $session    = $connection.Session
 $model      = $session.GetActiveModel()
@@ -1198,6 +1497,110 @@ $ctx.Connected = $true
 # WIZARD STEPS
 # ============================================================================
 $steps = New-Object System.Collections.ArrayList
+
+# ---- STAGE: Welcome -- a live 3D jig render + a plain-language process overview --
+# The very first page. It shows a nice-quality 3D render of a finished drill jig via the
+# SAME WebView2 + three.js renderer the Overview stage uses (WebGL, real anti-aliasing +
+# PBR materials - the quality the user approved; WPF Media3D was rejected as "not rendered
+# that well"). The shared HTML (docs\drilljig_3d_preview.html) loads in a dedicated
+# '#welcome' mode: a generic jig WITH seated drill bushings + a chip-relief slot on the
+# bottom, full-bleed, gently auto-orbiting (drag to rotate) - NOT the operator's real
+# layout, which they have not chosen yet. Beside/below it is a numbered "here is what you
+# will do" walkthrough, so an operator opening the tool cold knows what to expect.
+# Purely informational: it touches no Creo, commits nothing, Validate/OnNext always allow
+# (just "Get started"). Placed FIRST so it is the landing screen; the Import stage follows.
+$welcomeStep = New-WizardStep -Key 'welcome' -Title 'Welcome to the Drill Jig Builder' -Stage 'Welcome' -Kind 'info' -PrimaryText 'Get started' `
+    -Validate { param($c) return $true } `
+    -OnNext { param($c, $wiz) return $true } `
+    -Build {
+        param($panel, $c, $wiz)
+
+        # ---- static 3D jig render (top-left): the SAME WebView2 + three.js renderer the
+        # Overview stage uses (WebGL, real anti-aliasing + PBR materials - the quality the
+        # user approved; WPF Media3D was rejected as "not rendered that well"). It loads the
+        # shared HTML in a dedicated '#welcome' mode: full-bleed hero, no sidebar, a generic
+        # jig WITH seated drill bushings + a bottom chip-relief slot, gently auto-orbiting.
+        # Drag to rotate. Sized to the left ~46% so the steps sit alongside on a wide window.
+        $availW = [Math]::Max(360, $panel.Width - 26)
+        $picW = [Math]::Max(300, [int]($availW * 0.46))
+        $picH = [Math]::Max(220, [int]($picW * 0.60))
+        $picBottom = 8 + $picH
+        # HEADLESS GUARD (mirrors the Overview stage): only spin up WebView2 when a live
+        # WinForms message loop is running; the offline fuzz/render tests render this Build
+        # on a detached panel with no loop -> take the note path, no browser instantiated.
+        $wvOk = $false
+        if ([System.Windows.Forms.Application]::MessageLoop) {
+            try { Add-WebView2Assemblies | Out-Null; $wvOk = $true } catch { $wvOk = $false }
+        }
+        if ($wvOk) {
+            $wv = New-Object Microsoft.Web.WebView2.WinForms.WebView2
+            $props = New-Object Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties
+            # DISTINCT UserDataFolder from the Overview stage's WebView2: a shared folder is
+            # LOCKED by whichever browser process is alive, so two WebView2s contending for it
+            # can leave the second blank. (Each control is also disposed on step change - see
+            # lib\wizard.ps1 renderStep - so processes don't leak/freeze.)
+            $props.UserDataFolder = Join-Path $env:TEMP 'drilljig_wv2_welcome'
+            $wv.CreationProperties = $props
+            $wv.Location = New-Object System.Drawing.Point(8, 8)
+            $wv.Size     = New-Object System.Drawing.Size($picW, $picH)
+            $wv.Tag      = 'welcome-render'   # so the offline test can locate it
+            $panel.Controls.Add($wv)
+            $htmlPath = Join-Path $ScriptDir 'docs\drilljig_3d_preview.html'
+            $fileUri = ([System.Uri]$htmlPath).AbsoluteUri + '#welcome'   # hero mode: seated bushings, no sidebar
+            try { $wv.Source = New-Object System.Uri($fileUri) } catch {}
+            $picBottom = $wv.Bottom
+        } else {
+            # WebView2 unavailable (or headless test): a bordered placeholder so the page still reads.
+            $pic = New-Object System.Windows.Forms.Panel
+            $pic.Location    = New-Object System.Drawing.Point(8, 8)
+            $pic.Size        = New-Object System.Drawing.Size($picW, $picH)
+            $pic.BackColor   = [System.Drawing.Color]::FromArgb(16, 24, 42)
+            $pic.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+            $pic.Tag         = 'welcome-render'
+            $lblPh = New-Object System.Windows.Forms.Label
+            $lblPh.Dock = [System.Windows.Forms.DockStyle]::Fill
+            $lblPh.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $lblPh.ForeColor = (Get-UiColor 'gray')
+            $lblPh.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Italic)
+            $lblPh.Text = "[3D drill-jig preview renders here in the live window]"
+            $pic.Controls.Add($lblPh)
+            $panel.Controls.Add($pic)
+            $picBottom = $pic.Bottom
+        }
+
+        $capY = $picBottom + 4
+        $cap = Add-Para $panel ("Illustrative 3D view of a finished jig - a plate with drill bushings seated in the guide holes and a chip-relief slot on the bottom (drag to rotate). Your jig is built from your own choices in the steps that follow.") $capY 0 'gray' $false 8 ($picW)
+        $cap.Font = New-Object System.Drawing.Font('Segoe UI', 8.5, [System.Drawing.FontStyle]::Italic)
+
+        # ---- process overview (right of / below the picture): brief instructions ----
+        # If the window is wide enough, the text column sits to the RIGHT of the picture;
+        # otherwise it flows BELOW it (so nothing is clipped on a narrow window).
+        $wide = ($panel.Width - $picW - 40) -ge 320
+        $tx   = if ($wide) { $picW + 28 } else { 8 }
+        $ty   = if ($wide) { 8 } else { [Math]::Max($cap.Bottom + 14, $pic.Bottom + 14) }
+        $tw   = if ($wide) { $panel.Width - $tx - 26 } else { $availW }
+
+        $ty = (Add-Para $panel "What this tool does" $ty 0 '' $true $tx $tw).Bottom + 4
+        $ty = (Add-Para $panel ("It walks you through building a drill-jig PART in the open Creo model: it sizes a plate, drills a guide hole at each point, rounds the corners, and cuts chip-relief slots - so you don't drive the mapkeys by hand.") $ty 0 'gray' $false $tx $tw).Bottom + 12
+
+        $ty = (Add-Para $panel "What you'll go through" $ty 0 '' $true $tx $tw).Bottom + 4
+        $stepsText = @(
+            "1.  Import (optional) - reuse an existing part's fastener pattern as the hole layout, or skip.",
+            "2.  Bushing & hole size - answer a few questions; the tool picks the bushing and the drilled hole size.",
+            "3.  Slot depth - standard clearance, or a thinner plate for tight/restricted spaces.",
+            "4.  Layout - a regular grid, hand-placed points, or the imported fastener pattern; then pick the index hole.",
+            "5.  Datums - the tool finds the TOP/SIDE/FRONT planes (you confirm, or pick them once).",
+            "6.  Box - it builds the parametric plate (you draw one rough rectangle in Creo).",
+            "7.  Drill - it creates the points, rounds the corners, and drills every guide hole.",
+            "8.  Chip-relief slots - one slot per hole row, drawn once and patterned.",
+            "9.  Done - a summary of what was built."
+        ) -join [Environment]::NewLine
+        $ty = (Add-Para $panel $stepsText $ty 0 '' $false $tx $tw).Bottom + 12
+
+        $ty = (Add-Para $panel ("Before you start: open the jig PART (not an assembly) in Creo, and keep Creo idle - the tool will tell you exactly when to click in the Creo window (draw a rectangle, pick a plane, select the seed slot). You can move Back and jump between stages at any time using the bar at the top.") $ty 0 'yellow' $false $tx $tw).Bottom + 8
+        (Add-Para $panel ("Press 'Get started' to begin.") $ty 0 '' $true $tx $tw) | Out-Null
+    }
+[void]$steps.Add($welcomeStep)
 
 # Initialise the tree cursor at the first root node.
 try {
@@ -1266,9 +1669,17 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
         # 2026-07-21). Fixed sub-stage: a recommended length exists (PreselectIndex>=0).
         # Custom sub-stage: the typed value is valid (BushLenValid). OD tie-break ('od')
         # is NEVER auto-committed -- OD is the drilled hole, so it stays an explicit pick.
-        if ($null -ne $c.PendingSpec -and $c.BushStage -eq 'len' -and $null -ne $c.BushID) {
+        # The length stage exists for BOTH the ID-first (sleeve, keyed on BushID) and the
+        # OD-first (metal removable, keyed on BushOD) flows. Recommend from whichever is set.
+        if ($null -ne $c.PendingSpec -and $c.BushStage -eq 'len') {
+            # Recommend-source: custom OD (typed) first, then metal OD-first, then sleeve ID.
+            $lrv = if ($c.BushCustom -and $null -ne $c.BushCustomOd) { [double]$c.BushCustomOd }
+                   elseif ($c.BushOdFirst -and $null -ne $c.BushOD) { [double]$c.BushOD.OD }
+                   elseif (-not $c.BushOdFirst -and $null -ne $c.BushID) { [double]$c.BushID.ID }
+                   else { $null }
+            if ($null -eq $lrv) { return $false }
             if ($c.BushLenIsCustom) { return [bool]$c.BushLenValid }
-            return ((Get-BushingLengthOptions -Id $c.BushID.ID).PreselectIndex -ge 0)
+            return ((Get-BushingLengthOptions -Id $lrv).PreselectIndex -ge 0)
         }
         return $false
     } `
@@ -1295,6 +1706,88 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                     $y = (Add-Para $panel ("Part number: {0}" -f $active.PartNumber) $y 0 'gray').Bottom + 6
                 }
                 $y = (Add-Para $panel ([char]0x2713 + " Registered. Press Next to continue, or change the selection below.") $y 0 'green' $true).Bottom + 10
+
+                # CUSTOM-OD warning (user 2026-07-23): a typed hole OD has no catalog bushing
+                # behind it -- remind the operator to verify a real drill bushing / sleeve exists.
+                if ([string]$active.BushingID -eq '(custom)') {
+                    $y = (Add-Para $panel ([char]0x26A0 + " Custom hole OD -- verify a drill bushing / bushing sleeve at this OD actually exists before machining.") $y 0 'yellow' $true).Bottom + 10
+                }
+
+                # DISPLAY-ONLY bushing schematic (user 2026-07-22): a GDI+ picture of the
+                # picked bushing (Draw-BushingSchematic, lib\bushing_svg.ps1). No controls,
+                # no save, no selection - just a drawing. OD = the drilled hole; Length =
+                # bushing length; ID = the bore, "(any)" for the METAL removable path where
+                # the bore is operator-chosen (drilled hole IS the OD). Skipped for the
+                # fixed-OD "no bushing" leaf (BushingLength null).
+                $bsOD  = [double]$active.HoleDiameter
+                $bsLen = if ($null -ne $active.BushingLength) { [double]$active.BushingLength } else { 0.0 }
+                $bsIdVal = 0.0; $bsIdLabel = ''; $bsIdNum = 0.0
+                if ($null -ne $active.BushingID -and [double]::TryParse([string]$active.BushingID, [ref]$bsIdNum) -and $bsIdNum -gt 0 -and $bsIdNum -lt $bsOD) {
+                    $bsIdVal = $bsIdNum                                 # a real, known bore (sleeve / ID-first pick)
+                } elseif ($bsOD -gt 0) {
+                    $bsIdVal = $bsOD * 0.5                              # bore indeterminate
+                    # metal removable = '(any)'; custom OD = '(verify)' (no catalog bushing behind it).
+                    $bsIdLabel = if ([string]$active.BushingID -eq '(custom)') { '(verify)' } else { '(any)' }
+                }
+                if ($bsOD -gt 0 -and $bsLen -gt 0 -and $bsIdVal -gt 0) {
+                    $bsLabel = [string]$active.Bushing
+                    # DRILL BUSHINGS are headed; SLEEVES are headless (user 2026-07-22). A
+                    # representative head (no dimension) is drawn so the two are not confused.
+                    $bsHeadDia = Get-BushingHeadDia -EasyName $bsLabel -OD $bsOD
+                    $bsBack  = if ($script:WizTheme) { $script:WizTheme.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+                    # Layout: 2D schematic + 3D model SIDE BY SIDE (aside each other, user
+                    # 2026-07-22); stack them when the canvas is too narrow, or when WPF 3D
+                    # is unavailable show the 2D full-width.
+                    $viewH = 290; $gap = 12
+                    $avail = [Math]::Max(320, $panel.Width - 24)
+                    $sideBySide = ($avail -ge 680) -and $script:Wpf3dOk
+                    if ($sideBySide) {
+                        $cellW = [Math]::Min(440, [int][Math]::Floor(($avail - $gap) / 2))
+                        $x2d = 8; $y2d = $y; $x3d = 8 + $cellW + $gap; $y3d = $y
+                    } else {
+                        $cellW = [Math]::Min(600, $avail)
+                        $x2d = 8; $y2d = $y; $x3d = 8; $y3d = $y + $viewH + 26
+                    }
+                    # 2D schematic panel (GDI+ Draw-BushingSchematic)
+                    $bsPanel = New-Object System.Windows.Forms.Panel
+                    $bsPanel.Size = New-Object System.Drawing.Size($cellW, $viewH)
+                    $bsPanel.Location = New-Object System.Drawing.Point($x2d, $y2d)
+                    $bsPanel.BackColor = $bsBack
+                    try {
+                        $dbp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+                        $dbp.SetValue($bsPanel, $true, $null)
+                    } catch {}
+                    $bsPanel.Add_Paint({
+                        param($snd, $ev)
+                        try {
+                            Draw-BushingSchematic -Graphics $ev.Graphics -OD $bsOD -ID $bsIdVal -Length $bsLen -HeadDia $bsHeadDia `
+                                -ClientW $snd.ClientSize.Width -ClientH $snd.ClientSize.Height `
+                                -ShowEnd $true -ShowDims $true -Background $bsBack -Label $bsLabel -IdLabel $bsIdLabel
+                        } catch { }
+                    }.GetNewClosure())
+                    $panel.Controls.Add($bsPanel)
+                    $lastBottom = $bsPanel.Bottom
+                    # 3D model (WPF Media3D) - a BONUS view beside/below the 2D. Same HeadDia,
+                    # so a sleeve is a headless tube and a drill bushing shows a head. On any
+                    # WPF failure it is simply omitted (the 2D schematic always shows).
+                    $eh3d = $null
+                    if ($script:Wpf3dOk) {
+                        try { $eh3d = New-BushingViewportHost -OD $bsOD -ID $bsIdVal -Length $bsLen -HeadDia $bsHeadDia -Width $cellW -Height $viewH -Background $bsBack } catch { $eh3d = $null }
+                    }
+                    if ($null -ne $eh3d) {
+                        $eh3d.Location = New-Object System.Drawing.Point($x3d, $y3d)
+                        $eh3d.Size = New-Object System.Drawing.Size($cellW, $viewH)
+                        $panel.Controls.Add($eh3d)
+                        $cap = New-Object System.Windows.Forms.Label
+                        $cap.Text = ([char]0x2192 + " 3D: drag to rotate, wheel to zoom")
+                        $cap.AutoSize = $true; $cap.ForeColor = Get-UiColor 'gray'; $cap.BackColor = [System.Drawing.Color]::Transparent
+                        $cap.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+                        $cap.Location = New-Object System.Drawing.Point(($x3d + 2), ($y3d + $viewH + 1))
+                        $panel.Controls.Add($cap)
+                        $lastBottom = [Math]::Max([int]$lastBottom, [int]$cap.Bottom)
+                    }
+                    $y = [int]$lastBottom + 12
+                }
             } else {
                 $y = (Add-Para $panel "Selection complete (no catalog bushing was resolved)." $y 0 'gray').Bottom + 10
             }
@@ -1383,12 +1876,42 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 $c.PendingSpec = $null; $c.TreeDone = $true
                 return
             }
+            # OD-FIRST metal path (user 2026-07-22): METAL -> PFD / Hand Drill is OD-filtered
+            # (only 1/2" & 3/4" ODs). The drilled hole IS the removable bushing's OD, so show
+            # OD cards (no ID question), then the standardized length. Persist the OD groups in
+            # $c.BushOdGroups (never a Build-local -- the captured-variable rule).
+            if ($c.BushOdFirst) {
+                $c.BushOdGroups = Get-OdGroups -Rows $rows
+                if ($c.BushStage -eq 'od1' -or $null -eq $c.BushStage) {
+                    $hdrB = (Add-Para $panel "Select the OD (removable bushing = the drilled hole):" $walkTop 0 $null $true).Bottom
+                    $opts = @()
+                    foreach ($og in $c.BushOdGroups) { $opts += @{ Title = ('OD ' + $og.ODLabel); Subtitle = ("-> hole {0:0.###}`"" -f $og.OD) } }
+                    # trailing "Custom hole OD..." card (user 2026-07-23): type any diameter.
+                    $opts += @{ Title = 'Custom hole OD...'; Subtitle = 'type any diameter' }
+                    Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($hdrB + 10) -CardWidth 200 -CardHeight 96 -OnPick {
+                        param($i,$opt,$cc,$w)
+                        Push-TreeHistory -Context $cc   # snapshot the 'od1' stage so Back returns here
+                        # index-guard: the last card is the custom-OD entry (past the OD groups).
+                        if ($i -ge @($cc.BushOdGroups).Count) {
+                            $cc.BushCustom = $true; $cc.BushOdFirst = $false; $cc.BushOD = $null
+                            $cc.BushStage = 'customod'
+                            $cc.BushCustomOdText = ''; $cc.BushCustomOdValid = $false; $cc.BushCustomOd = $null; $cc.BushCustomOdLabel = $null
+                            return
+                        }
+                        $cc.BushOD = @($cc.BushOdGroups)[$i]
+                        $cc.BushStage = 'len'
+                        $cc.BushLenIsCustom = $false; $cc.BushLenCustomText = ''; $cc.BushLenValid = $true
+                    }
+                    return
+                }
+                # (BushStage 'len' for the OD-first path is handled by the shared 'len' block below.)
+            }
             # Stash the grouped catalog in the PERSISTENT context ($c.Grouped), NOT a
             # Build-local: the OnPick scriptblock fires AFTER Build returns and a plain
             # {..} does not capture Build locals, so a Build-local $grouped would be
             # $null at click time -> "Cannot index into a null array". $cc.Grouped lives.
-            $c.Grouped = Group-CatalogByID -Rows $rows
-            if ($c.BushStage -eq 'id' -or $null -eq $c.BushStage) {
+            if (-not $c.BushOdFirst) { $c.Grouped = Group-CatalogByID -Rows $rows }
+            if (-not $c.BushOdFirst -and ($c.BushStage -eq 'id' -or $null -eq $c.BushStage)) {
                 # ID cards carry the resolved-hole preview now (OD keys on ID, not length).
                 $hdrB = (Add-Para $panel "Select the ID (bore size):" $walkTop 0 $null $true).Bottom
                 $opts = @()
@@ -1397,9 +1920,18 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                     $sub = if (@($ods).Count -eq 1) { ("-> hole {0:0.###}`"" -f $ods[0].OD) } else { ("{0} OD options" -f @($ods).Count) }
                     $opts += @{ Title = ('ID ' + $g.IDLabel); Subtitle = $sub }
                 }
+                # trailing "Custom hole OD..." card (user 2026-07-23): type any diameter.
+                $opts += @{ Title = 'Custom hole OD...'; Subtitle = 'type any diameter' }
                 Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($hdrB + 10) -OnPick {
                     param($i,$opt,$cc,$w)
                     Push-TreeHistory -Context $cc   # snapshot the 'id' stage so Back returns here
+                    # index-guard: the last card is the custom-OD entry (past the ID groups).
+                    if ($i -ge @($cc.Grouped).Count) {
+                        $cc.BushCustom = $true; $cc.BushOdFirst = $false; $cc.BushOD = $null; $cc.BushID = $null; $cc.BushOdOptions = $null
+                        $cc.BushStage = 'customod'
+                        $cc.BushCustomOdText = ''; $cc.BushCustomOdValid = $false; $cc.BushCustomOd = $null; $cc.BushCustomOdLabel = $null
+                        return
+                    }
                     $cc.BushID = $cc.Grouped[$i]
                     $cc.BushOdOptions = Get-IdOdOptions -IdGroup $cc.BushID
                     $cc.BushStage = 'len'
@@ -1407,36 +1939,115 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 }
                 return
             }
+            if ($c.BushStage -eq 'customod') {
+                # CUSTOM-OD sub-state (user 2026-07-23): inline OD textbox + "Use this OD",
+                # mirroring the custom-LENGTH block below (slot-depth pattern, NOT a modal).
+                # A BOLD warning makes clear no catalog bushing backs a typed OD, so the
+                # operator MUST verify a real drill bushing / sleeve exists. Live-validate via
+                # Resolve-CustomOdInput; the commit is gated on BushCustomOdValid. All writes
+                # go to $c.* (never a Build-local -- the captured-variable rule).
+                $y = (Add-Para $panel "Custom hole OD -- type any diameter (NOT limited to the catalog):" $walkTop 0 $null $true).Bottom + 6
+                # Bold warning banner. Use 'yellow' (maps to $warn); 'warn' maps to ink (a latent bug).
+                $y = (Add-Para $panel ([char]0x26A0 + " No catalog bushing backs a typed OD. Verify a drill bushing / bushing") $y 0 'yellow' $true).Bottom
+                $y = (Add-Para $panel "   sleeve at this OD actually EXISTS before machining." $y 0 'yellow' $true).Bottom + 8
+                $lab = New-Object System.Windows.Forms.Label
+                $lab.Text = 'Hole OD (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(94, 20)
+                $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
+                $panel.Controls.Add($lab)
+                $tbOd = New-Object System.Windows.Forms.TextBox
+                $tbOd.Location = New-Object System.Drawing.Point(106, $y); $tbOd.Size = New-Object System.Drawing.Size(90, 24)
+                $tbOd.Text = [string]$c.BushCustomOdText
+                $tbOd.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tbOd.ForeColor = Get-UiColor ''; $tbOd.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+                $panel.Controls.Add($tbOd)
+                $lblOdEcho = New-Object System.Windows.Forms.Label
+                $lblOdEcho.AutoSize = $true; $lblOdEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
+                $lblOdEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblOdEcho.BackColor = [System.Drawing.Color]::Transparent
+                $panel.Controls.Add($lblOdEcho)
+                # Precompute echo colors OUTSIDE the closure (Get-UiColor is NOT global -- calling
+                # it inside a .GetNewClosure() throws "not recognized"; same rule as the length field).
+                $okColOd   = Get-UiColor 'green'
+                $warnColOd = Get-UiColor 'yellow'
+                $updateOdEcho = {
+                    $res = Resolve-CustomOdInput -Text $tbOd.Text
+                    $c.BushCustomOdText = [string]$tbOd.Text
+                    if ($res.Ok) {
+                        $c.BushCustomOd = [double]$res.Value; $c.BushCustomOdLabel = ('{0:0.###}' -f [double]$res.Value); $c.BushCustomOdValid = $true
+                        $lblOdEcho.ForeColor = $okColOd
+                        $lblOdEcho.Text = ("Hole OD {0:0.###}`" -- press Use this OD." -f [double]$res.Value)
+                    } else {
+                        $c.BushCustomOdValid = $false
+                        $lblOdEcho.ForeColor = $warnColOd
+                        $lblOdEcho.Text = $res.Error
+                    }
+                }.GetNewClosure()
+                $tbOd.Add_TextChanged({ param($s,$e) & $updateOdEcho }.GetNewClosure())
+                & $updateOdEcho
+                $y = $lblOdEcho.Bottom + 12
+                $btnUseOd = New-Object System.Windows.Forms.Button
+                $btnUseOd.Text = 'Use this OD'
+                $btnUseOd.Size = New-Object System.Drawing.Size(140, 30)
+                $btnUseOd.Location = New-Object System.Drawing.Point(8, $y)
+                $btnUseOd.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+                $btnUseOd.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(120,170,255)
+                $btnUseOd.BackColor = [System.Drawing.Color]::FromArgb(54,72,112)
+                $btnUseOd.ForeColor = [System.Drawing.Color]::White
+                $btnUseOd.Add_Click({
+                    $old = $ErrorActionPreference
+                    try {
+                        $ErrorActionPreference = 'Continue'
+                        $res = Resolve-CustomOdInput -Text $tbOd.Text
+                        if (-not $res.Ok) { $c.BushCustomOdValid = $false; & $updateOdEcho; try { $wiz.Refresh() } catch {}; return }
+                        Push-TreeHistory -Context $c   # snapshot before advancing so Back returns to the OD field
+                        $c.BushCustomOd = [double]$res.Value; $c.BushCustomOdLabel = ('{0:0.###}' -f [double]$res.Value)
+                        $c.BushStage = 'len'           # proceed to the standard length menu
+                        $c.BushLenIsCustom = $false; $c.BushLenCustomText = ''; $c.BushLenValid = $true
+                        $wiz.Rerender()
+                    } catch { try { $wiz.LogError($_, 'custom OD') } catch {} }
+                    finally { $ErrorActionPreference = $old }
+                }.GetNewClosure())
+                $panel.Controls.Add($btnUseOd)
+                return
+            }
             if ($c.BushStage -eq 'len') {
-                $id = $c.BushID
+                # The length menu serves BOTH the ID-first (sleeve) path and the OD-first
+                # (metal removable) path. For OD-first, recommend the length from the OD value
+                # and label by OD; for ID-first, from the ID value and label by ID. $bushKind
+                # ('ID'/'OD') + $recVal/$recLabel unify the two so the widget code is shared.
+                $isOdFirst = [bool]$c.BushOdFirst
+                # Recommend-source: custom OD (typed) first, else metal OD-first, else sleeve ID.
+                if ($c.BushCustom)  { $id = $null; $bushKind = 'OD'; $recVal = [double]$c.BushCustomOd; $recLabel = [string]$c.BushCustomOdLabel }
+                elseif ($isOdFirst) { $id = $c.BushOD; $bushKind = 'OD'; $recVal = [double]$c.BushOD.OD; $recLabel = [string]$c.BushOD.ODLabel }
+                else                { $id = $c.BushID; $bushKind = 'ID'; $recVal = [double]$c.BushID.ID; $recLabel = [string]$c.BushID.IDLabel }
                 # NB: completion (resolve OD -> tie-break or finish) is INLINED into the
                 # fixed-card OnPick and the custom "Use this length" button. It is NOT
                 # factored into a Build-local scriptblock: a plain {..} OnPick does NOT
                 # capture Build-locals, so a shared local helper would read $null at click
                 # time (the documented captured-variable bug). Both paths use only their
                 # params + $cc.* fields + GLOBAL helpers (Resolve-BushingPickRow etc.).
-                $lenOpt = Get-BushingLengthOptions -Id $id.ID
+                $lenOpt = Get-BushingLengthOptions -Id $recVal
                 $preIdx = [int]$lenOpt.PreselectIndex
                 if (-not $c.BushLenIsCustom) {
-                    # FIXED menu: {1/2, 3/4, 1, Custom...} with the ID recommendation marked.
-                    $recTxt = if ($preIdx -ge 0) { ("recommended for ID {0}" -f $id.IDLabel) } else { '' }
-                    $hdrB = (Add-Para $panel ("ID {0}  ->  select bushing length:" -f $id.IDLabel) $walkTop 0 $null $true).Bottom
-                    if ($preIdx -ge 0) { $hdrB = (Add-Para $panel ([char]0x2713 + (" {0}`" is standard for a {1}`" ID -- recommended." -f $lenOpt.Options[$preIdx].Label, $id.IDLabel)) ($hdrB + 4) 0 'green').Bottom }
+                    # FIXED menu: {1/2, 3/4, 1, Custom...} with the ID/OD recommendation marked.
+                    $recTxt = if ($preIdx -ge 0) { ("recommended for {0} {1}" -f $bushKind, $recLabel) } else { '' }
+                    $hdrB = (Add-Para $panel ("{0} {1}  ->  select bushing length:" -f $bushKind, $recLabel) $walkTop 0 $null $true).Bottom
+                    if ($preIdx -ge 0) { $hdrB = (Add-Para $panel ([char]0x2713 + (" {0}`" is standard for a {1}`" {2} -- recommended." -f $lenOpt.Options[$preIdx].Label, $recLabel, $bushKind)) ($hdrB + 4) 0 'green').Bottom }
                     $opts = @()
                     for ($li = 0; $li -lt @($lenOpt.Options).Count; $li++) {
                         $o = $lenOpt.Options[$li]
                         if ($o.IsCustom) { $opts += @{ Title = 'Custom...'; Subtitle = 'type any length' } }
                         else { $opts += @{ Title = ($o.Label + '" Lg'); Subtitle = $(if ($li -eq $preIdx) { $recTxt } else { '' }) } }
                     }
-                    Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($hdrB + 10) -CardWidth 190 -CardHeight 90 -OnPick {
+                    Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($hdrB + 10) -CardWidth 190 -CardHeight 90 -HighlightIndex $preIdx -OnPick {
                         param($i,$opt,$cc,$w)
                         Push-TreeHistory -Context $cc   # snapshot the 'len' stage so Back returns here
-                        $lopt = (Get-BushingLengthOptions -Id $cc.BushID.ID).Options[$i]
+                        # length menu keys off ID (sleeve) or OD (metal removable) -- same set.
+                        $lrv = if ($cc.BushOdFirst) { [double]$cc.BushOD.OD } else { [double]$cc.BushID.ID }
+                        $lopt = (Get-BushingLengthOptions -Id $lrv).Options[$i]
                         if ($lopt.IsCustom) {
                             $cc.BushLenIsCustom = $true       # reveal the inline custom field
                             return
                         }
-                        # fixed length chosen -> record + resolve OD (unique->finish, else 'od').
+                        # fixed length chosen -> record + resolve (ID-first: OD tie-break; OD-first: finish).
                         [void](Set-BushLengthPick -Context $cc -LenValue ([double]$lopt.Value) -LenLabel ([string]$lopt.Label))
                     }
                     return
@@ -1445,7 +2056,7 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 # NOT a modal). Validate live via Resolve-BushingLengthInput; commit gated on
                 # BushLenValid. Writes go to $c.* (hashtable fields), never a Build-local.
                 $def = if ($preIdx -ge 0) { [double]$lenOpt.Options[$preIdx].Value } else { 0.5 }
-                $y = (Add-Para $panel ("ID {0}  ->  enter a custom bushing length (inches):" -f $id.IDLabel) $walkTop 0 $null $true).Bottom + 8
+                $y = (Add-Para $panel ("{0} {1}  ->  enter a custom bushing length (inches):" -f $bushKind, $recLabel) $walkTop 0 $null $true).Bottom + 8
                 $lab = New-Object System.Windows.Forms.Label
                 $lab.Text = 'Length (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(90, 20)
                 $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
@@ -1537,7 +2148,7 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                     param($i,$opt,$cc,$w)
                     Push-TreeHistory -Context $cc   # snapshot the 'od' stage so Back returns here
                     $pick = Resolve-BushingPickRow -IdGroup $cc.BushID -OdOption (@($cc.BushOdOptions)[$i]) -Length ([double]$cc.BushLenValue) -LenLabel ([string]$cc.BushLenLabel)
-                    [void]$cc.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$cc.TreeNode.label })
+                    [void]$cc.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$cc.TreeNode.label })
                     $cc.PendingSpec = $null; $cc.BushStage = $null; $cc.TreeDone = $true
                 }
                 return
@@ -1562,10 +2173,16 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                     $next = $chosen
                     while ($next.kind -eq 'option' -and @($next.children).Count -ge 1) { $next = @($next.children)[0] }
                     $cc.TreeNode = $next
-                    # if we've reached an outcome, resolve it now.
+                    # if we've reached an outcome, resolve it now. A metal removable-bushing
+                    # (OD-filtered) spec starts the OD-first sub-flow ('od1', no ID question);
+                    # a 3D-print sleeve (ID-filtered) spec starts the ID-first sub-flow ('id').
                     if ($next.kind -eq 'outcome') {
                         $spec = Get-CatalogSpec -Label $next.label
-                        if ($spec) { $cc.PendingSpec = $spec; $cc.BushStage = 'id' }
+                        if ($spec) {
+                            $cc.PendingSpec = $spec
+                            if (Test-OdFirstSpec -Spec $spec) { $cc.BushOdFirst = $true;  $cc.BushStage = 'od1' }
+                            else                              { $cc.BushOdFirst = $false; $cc.BushStage = 'id' }
+                        }
                         else {
                             $fixed = Get-FixedOdSpec -Label $next.label
                             if ($null -ne $fixed) {
@@ -1579,7 +2196,12 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
             }
             'outcome' {
                 $spec = Get-CatalogSpec -Label $node.label
-                if ($spec) { $c.PendingSpec = $spec; $c.BushStage = 'id'; $wiz.Rerender(); return }
+                if ($spec) {
+                    $c.PendingSpec = $spec
+                    if (Test-OdFirstSpec -Spec $spec) { $c.BushOdFirst = $true;  $c.BushStage = 'od1' }
+                    else                              { $c.BushOdFirst = $false; $c.BushStage = 'id' }
+                    $wiz.Rerender(); return
+                }
                 $fixed = Get-FixedOdSpec -Label $node.label
                 if ($null -ne $fixed) {
                     [void]$c.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$fixed; BushingLength=$null; Bushing='(fixed OD, no bushing)'; PartNumber='(n/a)'; Outcome=$node.label })
@@ -1605,7 +2227,9 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
         # through: pick ID -> Next takes the recommended length -> (unique OD) confirmation
         # -> Next advances the wizard. A >1-OD tie-break is NOT auto-committed (Set-BushLengthPick
         # routes it to 'od'); the operator picks the OD, since OD is the drilled hole.
-        if (-not $c.TreeDone -and $null -ne $c.PendingSpec -and $c.BushStage -eq 'len' -and $null -ne $c.BushID) {
+        $lenReady = ($null -ne $c.PendingSpec -and $c.BushStage -eq 'len' -and
+                     (($c.BushCustom -and $null -ne $c.BushCustomOd) -or ($c.BushOdFirst -and $null -ne $c.BushOD) -or (-not $c.BushOdFirst -and $null -ne $c.BushID)))
+        if (-not $c.TreeDone -and $lenReady) {
             Push-TreeHistory -Context $c
             if ($c.BushLenIsCustom) {
                 $res = Resolve-BushingLengthInput -Text $c.BushLenCustomText -Default 0.5
@@ -1613,7 +2237,9 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 $c.BushLenIsCustom = $false
                 [void](Set-BushLengthPick -Context $c -LenValue ([double]$res.Value) -LenLabel ('{0:0.###}' -f [double]$res.Value))
             } else {
-                $lenOpt = Get-BushingLengthOptions -Id $c.BushID.ID
+                # recommend from the custom OD (typed), else metal OD, else sleeve ID
+                $lrv = if ($c.BushCustom) { [double]$c.BushCustomOd } elseif ($c.BushOdFirst) { [double]$c.BushOD.OD } else { [double]$c.BushID.ID }
+                $lenOpt = Get-BushingLengthOptions -Id $lrv
                 $pre = [int]$lenOpt.PreselectIndex
                 if ($pre -lt 0) { return $false }      # no recommendation -> require a click
                 $lopt = $lenOpt.Options[$pre]
@@ -1635,6 +2261,154 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
         return $true
     }
 [void]$steps.Add($treeStep)
+
+# ---- STAGE: Bushing -- HOLE-TO-EDGE MARGIN (optional smaller wall) --------------
+# Asked RIGHT AFTER the bushing decision tree and BEFORE the slot-depth step (user
+# 2026-07-23). The edge margin is the wall from a BORDER hole's EDGE to the part edge.
+# The standard/default wall is one full hole DIAMETER (the 2026-07-21 rule); this step
+# lets the operator dial a SMALLER wall so the border holes sit closer to the edge and
+# the plate shrinks (a tight-job option). The value lands in $c.EdgeMargin (a CONTEXT
+# field, mutable across steps) which every layout site reads via Get-EffectiveEdgeMargin
+# ($null -> default = hole dia). Same 'Bushing' stage as the tree/slot-depth, so the
+# breadcrumb gains no new pill. Mirrors the slot-depth step's shape (cards + editable
+# field + Change + BoxBuilt guard). The custom field is live-validated by the GLOBAL
+# Resolve-EdgeMarginInput (a closure can only resolve global functions -- the "textbox
+# error that pops up" if it were script-scope).
+$edgeMarginStep = New-WizardStep -Key 'edge-margin' -Title 'Hole-to-edge margin' -Stage 'Bushing' -Kind 'choice' -PrimaryText 'Next' `
+    -Validate {
+        param($c)
+        # Build auto-sets a mode for the dia-unknown case, so Next only needs a mode; the
+        # custom branch additionally needs a valid (>= 0) entered wall.
+        if ($null -eq $c.EdgeMarginMode) { return $false }
+        if ($c.EdgeMarginMode -eq 'custom') { return [bool]$c.EdgeMarginValid }
+        return $true
+    } `
+    -Build {
+        param($panel, $c, $wiz)
+        $hd = if ($null -ne $c.HoleDia -and [double]$c.HoleDia -gt 0) { [double]$c.HoleDia } else { 0.0 }
+
+        # BOX ALREADY BUILT (operator jumped back via the breadcrumb): the plate was sized
+        # with the edge margin at layout time, so re-editing here can NOT resize the
+        # committed plate (it would only desync the display). Say so; do NOT offer editing.
+        # Validate still passes because a mode was chosen on the first pass. Clear any stale
+        # invalid flag so a leftover EdgeMarginValid=$false can't dead-end Next.
+        if ($c.BoxBuilt) {
+            $c.EdgeMarginValid = $true
+            $shown = if ($null -ne $c.EdgeMargin) { [double]$c.EdgeMargin } elseif ($hd -gt 0) { $hd } else { 0.0 }
+            Add-Para $panel ([char]0x2713 + (" The plate is already built with edge margin {0:0.###}`". Re-editing here will NOT resize the committed plate -- re-run the tool to change it. Press Next." -f $shown)) 8 0 'warn' $true
+            $wiz.SetChip('edgemargin', ("edge {0:0.###}`" (built)" -f $shown), 'set')
+            return
+        }
+
+        # Hole dia not known yet (e.g. jumped back before the tree resolved it): can't
+        # default to a diameter, so leave EdgeMargin unset (layout falls back to the legacy
+        # one-radius rule) and pass through. Auto-set a mode so Validate/Next work.
+        if ($hd -le 0) {
+            if ($null -eq $c.EdgeMarginMode) { $c.EdgeMarginMode = 'standard'; $c.EdgeMargin = $null }
+            Add-Para $panel "The hole diameter is not known yet, so the edge margin uses the default (one hole radius). Press Next." 8 0 'gray'
+            return
+        }
+
+        $thm = $script:WizTheme
+        # NOT DECIDED yet -> two cards: Standard (one diameter) vs Smaller (own wall).
+        if ($null -eq $c.EdgeMarginMode) {
+            $y = (Add-Para $panel "Hole-to-edge margin (wall from a border hole's edge to the part edge):" 8 0 $null $true).Bottom + 6
+            $y = (Add-Para $panel ("The standard margin is one full hole diameter ({0:0.###}"") on every side. For a tight part you can choose a SMALLER wall -- the border holes sit closer to the part edge, shrinking the plate. 0"" puts a border hole edge right on the part edge (tangent)." -f $hd) $y 0 'gray').Bottom + 12
+            $stdSub = ("Wall = one hole diameter ({0:0.###}"")." -f $hd)
+            $opts = @(
+                @{ Title = 'Standard margin'; Subtitle = $stdSub },
+                @{ Title = 'Smaller margin';  Subtitle = 'Enter my own (smaller) hole-to-edge wall.' }
+            )
+            Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($y + 4) -CardWidth 250 -CardHeight 86 -AfterPick 'rerender' -OnPick {
+                param($i, $opt, $cc, $w)
+                if ($i -eq 0) {
+                    $cc.EdgeMarginMode = 'standard'; $cc.EdgeMargin = $null; $cc.EdgeMarginValid = $true
+                    $w.SetChip('edgemargin', 'edge = dia', 'set')
+                } else {
+                    $cc.EdgeMarginMode = 'custom'
+                    # seed at a radius (half the hole dia) -- a sensible smaller wall -- when
+                    # nothing is set yet, so the default custom layout is valid out of the box.
+                    if ($null -eq $cc.EdgeMargin) { $cc.EdgeMargin = [math]::Round(([double]$cc.HoleDia) / 2.0, 4) }
+                    $cc.EdgeMarginValid = ([double]$cc.EdgeMargin -ge 0)
+                    $w.SetChip('edgemargin', ('edge {0:0.###}"' -f [double]$cc.EdgeMargin), 'set')
+                }
+            }
+            return
+        }
+        # DECIDED. A "Change" button re-picks (interwoven navigation).
+        if ($c.EdgeMarginMode -eq 'standard') {
+            $y = (Add-Para $panel ([char]0x2713 + (" Standard margin: one hole diameter ({0:0.###}"") of wall on every side." -f $hd)) 8 0 'green' $true).Bottom + 10
+            $c.EdgeMargin = $null
+            $wiz.SetChip('edgemargin', 'edge = dia', 'set')
+        } else {
+            # SMALLER: an editable wall field, live-validated via Resolve-EdgeMarginInput.
+            $y = (Add-Para $panel ("Smaller margin -- enter the hole-to-edge wall (inches). Standard is one diameter ({0:0.###}""); a smaller wall shrinks the plate. 0 = tangent to the edge." -f $hd) 8 0 $null $true).Bottom + 8
+            $lab = New-Object System.Windows.Forms.Label
+            $lab.Text = 'Edge margin (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(120, 20)
+            $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
+            $panel.Controls.Add($lab)
+            $tb = New-Object System.Windows.Forms.TextBox
+            $tb.Location = New-Object System.Drawing.Point(132, $y); $tb.Size = New-Object System.Drawing.Size(90, 24)
+            $defWall = [math]::Round($hd / 2.0, 4)
+            $tb.Text = if ($null -ne $c.EdgeMargin) { [string]$c.EdgeMargin } else { [string]$defWall }
+            $tb.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tb.ForeColor = Get-UiColor ''; $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+            $panel.Controls.Add($tb)
+            $lblEcho = New-Object System.Windows.Forms.Label
+            $lblEcho.AutoSize = $true; $lblEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
+            $lblEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblEcho.BackColor = [System.Drawing.Color]::Transparent
+            $panel.Controls.Add($lblEcho)
+            # Precompute echo colors HERE (Build body resolves script-local functions) and
+            # CAPTURE them in the closure -- Get-UiColor is NOT global, so calling it inside
+            # the .GetNewClosure() below would throw "not recognized" (the closure-only-sees-
+            # global-functions rule; Resolve-EdgeMarginInput IS global, so it is safe there).
+            $okCol   = Get-UiColor 'green'
+            $warnCol = Get-UiColor 'warn'
+            $stdWall = $hd
+            $updateEcho = {
+                $res = Resolve-EdgeMarginInput -Text $tb.Text -Default ([double]$c.EdgeMargin)
+                if ($res.Ok) {
+                    $c.EdgeMargin = [double]$res.Value; $c.EdgeMarginValid = $true
+                    $delta = if ($res.Value -lt $stdWall) { (" ({0:0.###}"" less wall than standard per side)" -f ($stdWall - $res.Value)) } elseif ($res.Value -gt $stdWall) { ' (larger than the standard wall)' } else { ' (= the standard wall)' }
+                    $lblEcho.ForeColor = $okCol
+                    $lblEcho.Text = ("Edge margin {0:0.###}`"{1}" -f [double]$c.EdgeMargin, $delta)
+                    $wiz.SetChip('edgemargin', ('edge {0:0.###}"' -f [double]$c.EdgeMargin), 'set')
+                } else {
+                    $c.EdgeMarginValid = $false
+                    $lblEcho.ForeColor = $warnCol
+                    $lblEcho.Text = $res.Error
+                }
+                try { $wiz.Refresh() } catch {}
+            }.GetNewClosure()
+            $tb.Add_TextChanged({ param($s,$e) & $updateEcho }.GetNewClosure())
+            & $updateEcho
+            $y = $lblEcho.Bottom + 12
+        }
+        # Change button (re-pick standard vs smaller).
+        $btnChange = New-Object System.Windows.Forms.Button
+        $btnChange.Text = 'Change'
+        $btnChange.Size = New-Object System.Drawing.Size(120, 30)
+        $btnChange.Location = New-Object System.Drawing.Point(8, $y)
+        $btnChange.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $btnChange.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90,104,132)
+        $btnChange.BackColor = if ($thm) { $thm.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+        $btnChange.ForeColor = Get-UiColor ''
+        $btnChange.Add_Click({
+            $old = $ErrorActionPreference
+            try { $ErrorActionPreference = 'Continue'; $c.EdgeMarginMode = $null; $wiz.Rerender() }
+            catch { try { $wiz.LogError($_, 'edge-margin change') } catch {} }
+            finally { $ErrorActionPreference = $old }
+        }.GetNewClosure())
+        $panel.Controls.Add($btnChange)
+    } `
+    -OnNext {
+        param($c, $wiz)
+        $wall = if ($null -ne $c.EdgeMargin) { [double]$c.EdgeMargin } elseif ($null -ne $c.HoleDia -and [double]$c.HoleDia -gt 0) { [double]$c.HoleDia } else { $null }
+        $desc = if ($c.EdgeMarginMode -eq 'custom') { 'smaller/custom' } else { 'standard (one hole diameter)' }
+        if ($null -ne $wall) { $wiz.Log(("Hole-to-edge margin = {0:0.###}`" ({1}). Every border hole keeps this wall to the part edge." -f $wall, $desc)) }
+        else { $wiz.Log("Hole-to-edge margin = default (one hole radius; hole dia not known yet).") }
+        return $true
+    }
+[void]$steps.Add($edgeMarginStep)
 
 # ---- STAGE: Bushing -- SLOT / GUIDE DEPTH (tight/restricted space) --------------
 # Asked RIGHT AFTER the bushing decision tree (user 2026-07-21). The chip-relief
@@ -1663,6 +2437,11 @@ $slotDepthStep = New-WizardStep -Key 'slot-depth' -Title 'Chip-relief slot depth
         # NOT resize the committed plate (it would only desync the display). Say so, and do
         # NOT offer editing; Validate still passes because a mode was chosen on the first pass.
         if ($c.BoxBuilt) {
+            # Clear any stale invalid-entry flag: the plate is committed and this branch shows
+            # no editable field, so a leftover SlotDepthValid=$false (from a prior tight-mode
+            # typo before the jump-back) would leave Validate returning false with NO way to fix
+            # it -> a dead-end Next. The committed pad is authoritative here, so the depth IS valid.
+            $c.SlotDepthValid = $true
             $builtDepth = if ([double]$c.ReliefPad -gt 0) { [double]$c.ReliefPad } else { [double]$c.SlotDepth }
             Add-Para $panel ([char]0x2713 + (" The plate is already built with slot depth {0}`". Re-editing here will NOT resize the committed plate -- re-run the tool to change the plate thickness. Press Next." -f $builtDepth)) 8 0 'warn' $true
             $wiz.SetChip('slotdepth', ("slot {0:0.###}`" (built)" -f $builtDepth), 'set')
@@ -1786,9 +2565,12 @@ $slotDepthStep = New-WizardStep -Key 'slot-depth' -Title 'Chip-relief slot depth
 $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defined?' -Stage 'Layout' -Kind 'choice' -PrimaryText 'Next' `
     -Validate {
         param($c)
-        # orthogrid/custom require a valid layout; predefined is ready once chosen.
+        # orthogrid/custom/fastener require a valid layout; predefined is ready once chosen.
         if ($c.PointMode -eq 'orthogrid' -or $c.PointMode -eq 'custom' -or $c.PointMode -eq 'fastener') { return [bool]$c.OrthoValid }
-        return [bool]$c.LayoutPicked
+        # predefined (picked) OR the BARE tiles (nothing clicked): Next is ENABLED.
+        # On the bare tiles it activates the RECOMMENDED default (Fastener-Driven Model)
+        # via OnNext, so the green-highlighted card and the Next button agree (user 2026-07-22).
+        return $true
     } `
     -Build {
         param($panel, $c, $wiz)
@@ -1800,19 +2582,29 @@ $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defin
         # and pass -EdgeMargin = the hole dia so every border wall is one full diameter.
         if ($null -ne $c.FastenerRawPoints -and @($c.FastenerRawPoints).Count -gt 0 -and $c.LayoutMode -ne 'orthogrid' -and $c.LayoutMode -ne 'custom') {
             $hd = if ($null -ne $c.HoleDia -and [double]$c.HoleDia -gt 0) { [double]$c.HoleDia } else { 0.25 }
+            # EDGE MARGIN = the chosen wall (default one hole dia, or a smaller wall from the
+            # edge-margin step). Re-anchor the near corner so the nearest hole CENTER sits a
+            # bore radius + the wall in from the corner (pure translation, pattern unchanged);
+            # pass -EdgeMargin = the same wall so the derived far edge + the check agree.
+            $wallReq = Get-EffectiveEdgeMargin -ChosenMargin $c.EdgeMargin -HoleDia $hd
             $pts = $c.FastenerRawPoints
-            try { $ra = Set-LayoutMargin -Points $pts -Margin ($hd * 1.5); if ($ra.Valid) { $pts = $ra.Points } } catch {}
+            try { $ra = Set-LayoutMargin -Points $pts -Margin ((0.5 * $hd) + $wallReq); if ($ra.Valid) { $pts = $ra.Points } } catch {}
             $geo = $null
-            try { $geo = Get-CustomPointsGeometry -Points $pts -ClearDia $hd -HoleDia $hd -EdgeMargin $hd } catch { $geo = $null }
+            try { $geo = Get-CustomPointsGeometry -Points $pts -ClearDia $hd -HoleDia $hd -EdgeMargin $wallReq } catch { $geo = $null }
             if ($null -ne $geo -and $geo.Valid) {
                 $c.OrthoGeo = $geo; $c.OrthoValid = $true; $c.PointMode = 'fastener'; $c.LayoutPicked = $true
                 $y = 8
                 $y = (Add-Para $panel "Fastener layout (imported first) applied to the plate." $y 0 'gray').Bottom + 6
                 $y = (Add-Para $panel (("{0} hole(s), plate {1:0.00} x {2:0.00}. The pattern is fixed; the plate is sized around it at the {3}"" hole. Press Next." -f $geo.Count, $geo.Width, $geo.Height, $hd)) $y 0 'DarkGreen' $true).Bottom + 10
                 $wiz.SetChip('layout', ("layout: fastener ({0})" -f $geo.Count), 'set')
+                # SLOT DIRECTION (user 2026-07-23): X/Z toggle ABOVE the preview so the
+                # operator sees which way the chip-relief slots run in the image below.
+                Add-SlotDirToggle -Panel $panel -Context $c -Wizard $wiz -Top $y | Out-Null
+                $y = (Get-StackTop $panel 6)
                 # PREVIEW IMAGE (user 2026-07-21: the fastener layout should show how it looks,
                 # like the orthogrid/custom editors) -- the same numbered dot preview the index
-                # step uses, rendering $c.OrthoGeo (plate + to-scale holes + relief bands).
+                # step uses, rendering $c.OrthoGeo (plate + to-scale holes + relief bands in the
+                # chosen slot direction).
                 [void](Add-LayoutPreview -Panel $panel -Context $c -Top $y -Left 8 -Width 320 -Height 172)
                 $y = (Get-StackTop $panel 8)
                 $btnRedo = New-Object System.Windows.Forms.Button
@@ -1828,7 +2620,20 @@ $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defin
                 return
             } else {
                 Add-Para $panel "The imported fastener layout did not form a valid plate; pick a layout below." 4 40 'goldenrod' $true
+                # RESET the layout state fully to the bare-tiles baseline. Clearing ONLY
+                # FastenerRawPoints left PointMode='fastener' with OrthoValid=$false, so the
+                # layout Validate (PointMode in orthogrid/custom/fastener -> return OrthoValid)
+                # kept Next DISABLED while the tiles were showing, AND OnNext's tile-commit
+                # branch (requires PointMode 'predefined') could not fire -> the Next button
+                # "bugged out" and clicking a tile did nothing (user 2026-07-23). Fall back to
+                # the tiles invariant (predefined + no layout + no committed mode) so Next
+                # gates on the tiles and OnNext commits the picked tile normally.
                 $c.FastenerRawPoints = $null
+                $c.PointMode   = 'predefined'
+                $c.LayoutMode  = $null
+                $c.OrthoGeo    = $null
+                $c.OrthoValid  = $false
+                $c.LayoutPicked = $false
             }
         }
 
@@ -1852,20 +2657,28 @@ $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defin
                 # diameter wall), so the border WALL is one full hole diameter (user
                 # 2026-07-21) and Get-CustomPointsGeometry's edge-margin check passes. Pure
                 # translation -> the drilled pattern is unchanged.
+                # EDGE MARGIN = the chosen wall (default one hole dia, or a smaller wall from
+                # the edge-margin step); re-anchor to a bore radius + that wall.
+                $wallReqLoc = Get-EffectiveEdgeMargin -ChosenMargin $c.EdgeMargin -HoleDia $holeDiaLoc
                 $impPts = $peek.Points
-                try { $ra = Set-LayoutMargin -Points $peek.Points -Margin ($holeDiaLoc * 1.5); if ($ra.Valid) { $impPts = $ra.Points } } catch {}
+                try { $ra = Set-LayoutMargin -Points $peek.Points -Margin ((0.5 * $holeDiaLoc) + $wallReqLoc); if ($ra.Valid) { $impPts = $ra.Points } } catch {}
                 # build the plate geometry from the (re-anchored) points (same path as custom);
-                # -EdgeMargin = the hole dia so the derived far edge + the check use one-dia wall.
+                # -EdgeMargin = the chosen wall so the derived far edge + the check agree.
                 $geo = $null
-                try { $geo = Get-CustomPointsGeometry -Points $impPts -ClearDia $holeDiaLoc -HoleDia $holeDiaLoc -EdgeMargin $holeDiaLoc } catch { $geo = $null }
+                try { $geo = Get-CustomPointsGeometry -Points $impPts -ClearDia $holeDiaLoc -HoleDia $holeDiaLoc -EdgeMargin $wallReqLoc } catch { $geo = $null }
                 if ($null -ne $geo -and $geo.Valid) {
                     $c.OrthoGeo = $geo; $c.OrthoValid = $true; $c.PointMode = 'fastener'; $c.FastenerLayoutPath = $layoutFile
                     $unitNote = if ($peek.Units -ne 'unknown') { ("  (units: {0} - match the jig part)" -f $peek.Units) } else { '' }
                     $y = (Add-Para $panel ("Loaded {0} hole(s) from '{1}'  -  axes {2}/{3}, plate {4:0.00} x {5:0.00}.{6}  Points are created in the drill step (3-plane intersections, no picks). Press Next." -f `
                         $geo.Count, $peek.SourceModel, $peek.AxisX, $peek.AxisZ, $geo.Width, $geo.Height, $unitNote) $y 0 'DarkGreen' $true).Bottom + 10
                     $wiz.SetChip('layout', ("layout: fastener ({0})" -f $geo.Count), 'set')
+                    # SLOT DIRECTION (user 2026-07-23): X/Z toggle ABOVE the preview so the
+                    # operator sees which way the chip-relief slots run in the image below.
+                    Add-SlotDirToggle -Panel $panel -Context $c -Wizard $wiz -Top $y | Out-Null
+                    $y = (Get-StackTop $panel 6)
                     # PREVIEW IMAGE (user 2026-07-21): show how the imported layout looks,
-                    # like the orthogrid/custom editors (same numbered dot preview as the index step).
+                    # like the orthogrid/custom editors (same numbered dot preview as the index step),
+                    # with the relief bands drawn in the chosen slot direction.
                     [void](Add-LayoutPreview -Panel $panel -Context $c -Top $y -Left 8 -Width 320 -Height 172)
                     $y = (Get-StackTop $panel 8)
                 } else {
@@ -1912,7 +2725,10 @@ $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defin
             $btnBackType2.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90,104,132)
             $btnBackType2.BackColor = if ($script:WizTheme) { $script:WizTheme.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
             $btnBackType2.ForeColor = Get-UiColor ''
-            $btnBackType2.Add_Click({ $c.LayoutMode = $null; $c.PointMode='predefined'; $c.OrthoValid=$false; $c.OrthoGeo=$null; $wiz.Rerender() }.GetNewClosure())
+            # Return to the tiles with NOTHING selected: reset LayoutPicked so the stray
+            # "Selected: Skeleton Model" echo (gated on LayoutPicked && predefined) does NOT
+            # fire on the bare tiles (user 2026-07-22).
+            $btnBackType2.Add_Click({ $c.LayoutMode = $null; $c.PointMode='predefined'; $c.OrthoValid=$false; $c.OrthoGeo=$null; $c.LayoutPicked=$false; $wiz.Rerender() }.GetNewClosure())
             $panel.Controls.Add($btnBackType2)
             return
         }
@@ -1944,7 +2760,13 @@ $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defin
             $btnBackType.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90,104,132)
             $btnBackType.BackColor = if ($script:WizTheme) { $script:WizTheme.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
             $btnBackType.ForeColor = Get-UiColor ''
-            $btnBackType.Add_Click({ $c.LayoutMode = $null; $c.PointMode='predefined'; $c.OrthoValid=$false; $wiz.Rerender() }.GetNewClosure())
+            # Return to the tiles with NOTHING selected: reset LayoutPicked so the stray
+            # "Selected: Skeleton Model" echo (gated on LayoutPicked && predefined) does NOT
+            # fire on the bare tiles (user 2026-07-22). Also clear OrthoGeo (match the fastener
+            # VIEW 3 button) so no STALE geometry leaks back to the tiles / index-choice; the
+            # inline editor re-derives OrthoGeo from the KEPT OrthoFields/CustomRows on re-entry,
+            # so the operator's typed points are preserved (adversarial-review fix 2026-07-22).
+            $btnBackType.Add_Click({ $c.LayoutMode = $null; $c.PointMode='predefined'; $c.OrthoValid=$false; $c.OrthoGeo=$null; $c.LayoutPicked=$false; $wiz.Rerender() }.GetNewClosure())
             $panel.Controls.Add($btnBackType)
             return
         }
@@ -1952,44 +2774,58 @@ $layoutStep = New-WizardStep -Key 'layout' -Title 'How are the hole points defin
         # VIEW 0: the four tiles. Start below any prior content (e.g. the invalid-import
         # fallback message that falls through to here) so nothing overlaps.
         $y = Get-StackTop $panel 8
-        $y = (Add-Para $panel "Pick how the hole points are defined." $y 0 'Gray').Bottom + 8
+        $y = (Add-Para $panel "Pick how the hole points are defined." $y 0 'Gray').Bottom + 4
+        # RECOMMENDED default = import fastener layout (index 3). Mirrors the bushing-length
+        # "recommended" pattern: a green note here + a persistent green highlight box on the
+        # card via -HighlightIndex. Visual only -- every card is still fully clickable, so the
+        # operator can pick any layout mode (user 2026-07-22).
+        $y = (Add-Para $panel (([char]0x2713) + " Fastener-Driven Model is recommended -- reuse an existing part's fastener pattern. (Any option still works.)") $y 0 'green' $true).Bottom + 8
         $opts = @(
-            @{ Title = 'Predefined'; Subtitle = 'datum points already in the part - select them in Creo later' },
-            @{ Title = 'Orthogrid';  Subtitle = 'a regular Nx x Nz grid - edited right here in the window' },
-            @{ Title = 'Custom';     Subtitle = 'type each point''s X / Z offset - edited right here too' },
-            @{ Title = 'Import fastener layout'; Subtitle = 'read fastener centers live from an open Creo model (or load a saved layout file)' }
+            @{ Title = 'Skeleton Model';    Subtitle = 'Hole layout determined from a Skeleton Model with datum points that drive hole location' },
+            @{ Title = 'Orthogrid Model (rectangular pattern)'; Subtitle = 'Hole layout determined from a regular rectangular Nx x Nz grid - edited right here in the window' },
+            @{ Title = 'User Generated Model'; Subtitle = 'Hole layout generated point-by-point by the user - type each hole''s X / Z offset, edited right here in the window' },
+            @{ Title = 'Fastener-Driven Model'; Subtitle = 'Hole layout determined from an existing part''s fastener pattern - fastener centers read live from an open Creo model (or a saved layout file)' }
         )
-        Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top $y -CardHeight 110 -AfterPick 'rerender' -OnPick {
+        # RADIO-SELECT (user 2026-07-22): the recommended tile is auto-SELECTED (green, via
+        # HighlightIndex = $c.LayoutSel; default 3 = Fastener). Clicking a tile only MOVES the
+        # selection -- OnPick sets LayoutSel and the rerender re-draws VIEW 0 with the new card
+        # green; LayoutMode stays null so the tiles STAY PUT (no sub-view opens on click). Next
+        # COMMITS the selection (OnNext). So: the recommended is preselected + Next registers it;
+        # clicking another option just highlights it green; the user presses NEXT to open it.
+        $selIdx = if ($null -ne $c.LayoutSel) { [int]$c.LayoutSel } else { 3 }
+        if ($selIdx -lt 0 -or $selIdx -ge $opts.Count) { $selIdx = 3 }
+        Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top $y -CardHeight 110 -HighlightIndex $selIdx -AfterPick 'rerender' -OnPick {
             param($i,$opt,$cc,$w)
-            # Switching layout TYPE away from custom clears any auto-set index-first pick
-            # (the custom editor auto-engages index-first; a different type must start fresh
-            # so a stale index does not linger). Custom (i==2) keeps it -- the editor resets
-            # it on recompute anyway.
+            # SELECT ONLY -- move the green highlight; do NOT commit PointMode/LayoutMode (that
+            # is Next's job in OnNext), so clicking never opens the sub-view. Moving away from
+            # Custom clears any auto-set index-first pick (custom re-engages it on recompute).
             if ($i -ne 2 -and $cc.IndexFirst) { $cc.IndexFirst = $false; $cc.IndexKey = $null; $cc.IndexGridX = $null; $cc.IndexGridZ = $null }
-            if ($i -eq 0) {
-                $cc.PointMode = 'predefined'; $cc.OrthoGeo = $null; $cc.OrthoValid = $false; $cc.LayoutMode = $null
-                $w.SetChip('layout', 'layout: predefined', 'set')
-            } elseif ($i -eq 1) {
-                # switch to the EMBEDDED grid editor view (no popup)
-                $cc.PointMode = 'orthogrid'; $cc.LayoutMode = 'orthogrid'; $cc.OrthoValid = $false
-            } elseif ($i -eq 2) {
-                # switch to the EMBEDDED custom-points editor view (no popup)
-                $cc.PointMode = 'custom'; $cc.LayoutMode = 'custom'; $cc.OrthoValid = $false
-            } else {
-                # switch to the fastener-import view (loads fastener_layout.json).
-                # The VIEW 3 branch does the load + validation on rerender.
-                $cc.PointMode = 'fastener'; $cc.LayoutMode = 'fastener'; $cc.OrthoValid = $false; $cc.OrthoGeo = $null
-            }
-            $cc.LayoutPicked = $true
+            $cc.LayoutSel = $i
         }
-        # echo for predefined (the editors show their own readout). Flow it BELOW the
-        # tile cards (Get-StackTop = lowest existing control) so it never lands on a card.
-        if ($c.LayoutPicked -and $c.PointMode -eq 'predefined') {
-            $ey = Get-StackTop $panel 8
-            Add-Para $panel (([char]0x2713) + " Selected: Predefined - you will pick the points in Creo    (press Next)") $ey 0 'DarkGreen' $true
-        }
+        # SELECTED-tile hint (the green card is the primary cue; this restates it in words for
+        # EVERY option, not just Skeleton). Flowed BELOW the cards so it never lands on one.
+        $selTitle = [string]$opts[$selIdx].Title
+        $ey = Get-StackTop $panel 8
+        Add-Para $panel (([char]0x2713) + (" Selected: {0}. Press NEXT to use it, or click another option to change." -f $selTitle)) $ey 0 'DarkGreen' $true
     } `
-    -OnNext { param($c,$wiz) return $true }
+    -OnNext {
+        param($c,$wiz)
+        # COMMIT the selected tile (user 2026-07-22 radio-select). Fires ONLY on the tiles
+        # (LayoutMode null AND PointMode still 'predefined' -- the tiles invariant -- AND no
+        # up-front fastener import). It maps $c.LayoutSel to the mode and either advances
+        # (predefined) or opens the sub-view (return $false -> the engine re-renders THIS step,
+        # which now shows the editor / fastener-import; Next there advances once OrthoValid).
+        if ($null -eq $c.LayoutMode -and $c.PointMode -eq 'predefined' -and $null -eq $c.FastenerRawPoints) {
+            $sel = if ($null -ne $c.LayoutSel) { [int]$c.LayoutSel } else { 3 }
+            switch ($sel) {
+                0 { $c.PointMode = 'predefined'; $c.OrthoGeo = $null; $c.OrthoValid = $false; $c.LayoutMode = $null; $c.LayoutPicked = $true; $wiz.SetChip('layout', 'layout: predefined', 'set'); return $true }
+                1 { $c.PointMode = 'orthogrid'; $c.LayoutMode = 'orthogrid'; $c.OrthoValid = $false; $c.LayoutPicked = $true; return $false }
+                2 { $c.PointMode = 'custom';    $c.LayoutMode = 'custom';    $c.OrthoValid = $false; $c.LayoutPicked = $true; return $false }
+                default { $c.PointMode = 'fastener'; $c.LayoutMode = 'fastener'; $c.OrthoValid = $false; $c.OrthoGeo = $null; $c.LayoutPicked = $true; return $false }
+            }
+        }
+        return $true
+    }
 [void]$steps.Add($layoutStep)
 
 # ---- STAGE: Layout -- INDEX-HOLE choice (index-first mode; ALWAYS set) -------
@@ -2070,11 +2906,19 @@ $indexChoiceStep = New-WizardStep -Key 'index-choice' -Title 'Index hole' -Stage
             $ijTxt = if ($null -ne $cd.I -and $null -ne $cd.J) { ("  (I={0},J={1})" -f $cd.I, $cd.J) } else { "" }
             $opts += @{ Title = ("Hole #" + ($cd.Key + 1)); Subtitle = ("X={0:0.###}  Z={1:0.###}{2}" -f $cd.X, $cd.Z, $ijTxt) }
         }
-        Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($y + 4) -CardWidth 200 -CardHeight 84 -AfterPick 'rerender' -OnPick {
+        # GREEN card border on the currently-selected index (matches the ring on the preview
+        # + the green text above). $cands and $opts are the same order, so the card index is
+        # the position of the IndexKey in $cands (user 2026-07-22: selected option shown green).
+        $selCard = -1
+        for ($ci = 0; $ci -lt @($cands).Count; $ci++) { if ([int]$cands[$ci].Key -eq [int]$c.IndexKey) { $selCard = $ci; break } }
+        Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($y + 4) -CardWidth 200 -CardHeight 84 -HighlightIndex $selCard -AfterPick 'rerender' -OnPick {
             param($i,$opt,$cc,$w)
             # every card is an index pick (no "None"); card $i maps straight to Candidates[$i].
             $plan = Get-IndexHolePlan -Points $cc.OrthoGeo.Points
             $cand = @($plan.Candidates)[$i]
+            # guard an out-of-range index (the layout could have changed since the cards were
+            # laid out): $cand would be $null and $cand.Key would silently no-op. Bail cleanly.
+            if ($null -eq $cand) { return }
             $chosen = Get-IndexHolePlan -Points $cc.OrthoGeo.Points -IndexKey $cand.Key
             if ($chosen.HasIndex) {
                 $cc.IndexFirst = $true; $cc.IndexKey = $cand.Key
@@ -2085,6 +2929,101 @@ $indexChoiceStep = New-WizardStep -Key 'index-choice' -Title 'Index hole' -Stage
     } `
     -OnNext { param($c,$wiz) return $true }
 [void]$steps.Add($indexChoiceStep)
+
+# ---- STAGE: Overview -- rough 3D look of the jig (WebView2 + three.js) ------
+# A view-only "model overview" page between Layout and Datums: the operator can
+# ROTATE the plate + drilled holes + chip-relief slots to sanity-check the shape
+# before any Creo work. NO controls beyond orbit (the embedded HTML's slider panel
+# is hidden via the #embed hash); it is explicitly labelled a GENERAL, approximate
+# view. Renders the EXACT current layout by pushing $c.OrthoGeo to the three.js
+# scene (docs\drilljig_3d_preview.html) over the WebView2 bridge. Lazy-loads
+# WebView2; degrades to a plain note if it (or a layout) is unavailable. Purely
+# informational -> Validate/OnNext always allow; nothing is committed here.
+$overviewStep = New-WizardStep -Key 'overview' -Title '3D overview (rough)' -Stage 'Overview' -Kind 'info' -PrimaryText 'Continue to datums' `
+    -Validate { param($c) return $true } `
+    -OnNext { param($c, $wiz) return $true } `
+    -Build {
+        param($panel, $c, $wiz)
+        $note = Add-Para $panel ("General view - APPROXIMATE, not exact. Rotate (drag) to inspect the rough shape of the plate, drilled holes, and chip-relief slots. The built jig may differ in detail.") 8 0 'yellow' $true
+        $y = $note.Bottom + 8
+
+        # need a computed layout (orthogrid / custom / imported). Predefined points
+        # have no plate/hole model to preview -> show a note and let Next proceed.
+        if ($null -eq $c.OrthoGeo -or -not $c.OrthoGeo.Valid) {
+            Add-Para $panel ("No computed layout to preview (predefined points, or the layout is not yet valid). The 3D overview needs an orthogrid / custom / imported layout. Press Continue.") $y 0 'gray'
+            return
+        }
+
+        # HEADLESS GUARD: only spin up a WebView2 when a WinForms message loop is
+        # actually running (the live GUI). Headless render tests (fuzz_gui.ps1 /
+        # run_wizard_tests.ps1) call this Build on a detached panel with NO message
+        # loop, where WebView2 cannot init anyway -> skip it and just show a note, so
+        # the tests exercise the Build path without instantiating a browser control.
+        if (-not [System.Windows.Forms.Application]::MessageLoop) {
+            Add-Para $panel ("[3D overview renders here in the live GUI window - headless render skipped]") $y 0 'gray'
+            return
+        }
+
+        # lazy-load the WebView2 SDK; if unavailable, the jig still builds fine.
+        try { Add-WebView2Assemblies | Out-Null }
+        catch {
+            Add-Para $panel ("3D overview unavailable - WebView2 could not load ({0}). This does not affect building the jig; press Continue. (A zero-dependency 3D window is available separately: drilljig-3d-preview.cmd.)" -f $_.Exception.Message) $y 0 'gray'
+            return
+        }
+
+        # ---- build the geometry payload from the CURRENT layout ----
+        $inv = [System.Globalization.CultureInfo]::InvariantCulture
+        $holeDia = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal }
+                   elseif ($null -ne $c.HoleDia -and [double]$c.HoleDia -gt 0) { [double]$c.HoleDia } else { 0.25 }
+        $slotDepth = if ($null -ne $c.SlotDepth -and [double]$c.SlotDepth -gt 0) { [double]$c.SlotDepth } else { 0.25 }
+        $bushingLen = if ($null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) { [double]$c.BushingLen } else { 0.5 }
+        $thickness = $bushingLen + $slotDepth
+        # points JSON built by hand so it is ALWAYS a JS array (PS ConvertTo-Json drops
+        # the brackets for a single element) and numbers use InvariantCulture (period
+        # decimal) so the JSON is valid regardless of the machine's locale.
+        $ptsJson = (@($c.OrthoGeo.Points) | ForEach-Object {
+            '{"X":' + (([double]$_.X).ToString($inv)) + ',"Z":' + (([double]$_.Z).ToString($inv)) + '}'
+        }) -join ','
+        # slot removal-path direction (fastener X/Z toggle from the Layout stage) so the
+        # 3D preview's chip-relief bands run the SAME way the operator chose; default X.
+        $rowAxisJson = if ($c.SlotRowAxis -eq 'Z') { 'Z' } else { 'X' }
+        $json = '{"valid":' + $(if ($c.OrthoGeo.Valid) { 'true' } else { 'false' }) +
+            ',"width":'    + (([double]$c.OrthoGeo.Width).ToString($inv)) +
+            ',"height":'   + (([double]$c.OrthoGeo.Height).ToString($inv)) +
+            ',"holeDia":'  + (([double]$holeDia).ToString($inv)) +
+            ',"thickness":'+ (([double]$thickness).ToString($inv)) +
+            ',"slotDepth":'+ (([double]$slotDepth).ToString($inv)) +
+            ',"rowAxis":"' + $rowAxisJson + '"' +
+            ',"points":['  + $ptsJson + ']}'
+        $c.Wv3dPayload = $json   # stashed in the persistent context so the NavigationCompleted closure reads it by reference
+
+        # ---- the WebView2 control, filling the canvas below the note ----
+        $wv = New-Object Microsoft.Web.WebView2.WinForms.WebView2
+        $props = New-Object Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties
+        # DISTINCT UserDataFolder from the Welcome stage's WebView2 (shared folder = lock
+        # contention -> a blank second view). Each is disposed on step change (wizard.ps1).
+        $props.UserDataFolder = Join-Path $env:TEMP 'drilljig_wv2_overview'
+        $wv.CreationProperties = $props
+        $cw = [Math]::Max(420, $panel.ClientSize.Width  - 16)
+        $ch = [Math]::Max(320, $panel.ClientSize.Height - $y - 12)
+        $wv.Location = New-Object System.Drawing.Point(8, $y)
+        $wv.Size = New-Object System.Drawing.Size($cw, $ch)
+        $wv.Anchor = ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right)
+        $panel.Controls.Add($wv)
+
+        # push the layout to the three.js scene once the page has loaded (setJigGeometry
+        # stashes + applies whether it arrives before or after three.js finishes loading).
+        $wv.add_NavigationCompleted({
+            param($s, $e)
+            try { $null = $s.ExecuteScriptAsync("setJigGeometry(" + $c.Wv3dPayload + ")") } catch {}
+        }.GetNewClosure())
+
+        # navigate to the shared HTML scene in EMBED mode (#embed hides its slider panel)
+        $htmlPath = Join-Path $ScriptDir 'docs\drilljig_3d_preview.html'
+        $fileUri = ([System.Uri]$htmlPath).AbsoluteUri + '#embed'
+        try { $wv.Source = New-Object System.Uri($fileUri) } catch {}
+    }
+[void]$steps.Add($overviewStep)
 
 # ---- STAGE: Datums -- capture the 3 base datums (auto / pick) --------------
 $datumStep = New-WizardStep -Key 'datums' -Title 'Base datum planes' -Stage 'Datums' -Kind 'pick' -PrimaryText 'Continue to box' `
@@ -2432,8 +3371,11 @@ $boxStepB = New-WizardStep -Key 'box-b' -Title 'Finish the box' -Stage 'Box' -Ki
                 -ResetFlags @('BoxBuilt','BoxArmed') -GoToKey 'box-a'
             return
         }
-        $armB = Add-ArmBanner $panel ("In Creo's sketcher: click one corner of the rectangle, then the opposite corner." + [Environment]::NewLine +
-                              "Size doesn't matter. Press Esc to finish the rectangle.") 8
+        $armB = Add-ArmBanner $panel ("In Creo's sketcher, draw the plate rectangle:" + [Environment]::NewLine +
+                              "To snap the second corner of the rectangle in the intersection point of the newly created planes, hold CTRL + ALT, and then select the 2 planes. " +
+                              "If done correctly, there should be dotted blue lines that form the rectangle shape. " +
+                              "Then draw the rectangle from corner to corner." + [Environment]::NewLine +
+                              "Press Esc to finish the rectangle.") 8
         Add-Para $panel ("When the rectangle is drawn, press 'Finish + extrude' - Creo finishes the sketch and " +
                          "extrudes up to the SIDE offset plane automatically.") ($armB + 12) 0 'Gray'
     } `
@@ -2441,6 +3383,17 @@ $boxStepB = New-WizardStep -Key 'box-b' -Title 'Finish the box' -Stage 'Box' -Ki
         param($c, $wiz)
         if ($c.BoxBuilt) { return $true }   # idempotent: revisited after build -> don't re-extrude (no duplicate)
         $script:GuiWiz = $wiz
+        # LIVE-HANDLE REBIND (fastener-import reconnect fix): read session/model/type from
+        # the shared context ($c), NOT the top-level bare $session/$model. The Datums stage
+        # may RECONNECT after an up-front fastener import and update $c.Session/$c.Model, but
+        # a `$script:session =` write there does NOT reach a bare $session read in this OnNext
+        # (proven: under the hybrid-.cmd `& ([scriptblock]::Create(...))` runtime, a sibling
+        # plain-block's $script:/$global: write does not rebind another block's bare-var read;
+        # only the $c hashtable, passed by reference, reliably carries the update). This makes
+        # the macros below always fire into the LIVE handles; a no-op when no reconnect happened.
+        if ($null -ne $c.Session) { $session = $c.Session }
+        if ($null -ne $c.Model)   { $model   = $c.Model }
+        if ($null -ne $c.Type)    { $pfcType = $c.Type }
         $wiz.BeginRun('Finishing the sketch + extruding...')
         $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
         # MACRO B: finish the sketch, extrude up to the SIDE offset plane, confirm.
@@ -2459,6 +3412,13 @@ $boxStepB = New-WizardStep -Key 'box-b' -Title 'Finish the box' -Stage 'Box' -Ki
         if ($null -ne $stamp) { for ($i=0; $i -lt 100; $i++) { try { if ($model.VersionStamp -ne $stamp) { break } } catch {}; Start-Sleep -Milliseconds 50 } }
 
         $c.BoxBuilt = $true
+        # SNAPSHOT what the committed plate was sized for, so a LATER upstream change (jump
+        # back to Bushing -> different OD, or edit the layout) can be DETECTED and warned about:
+        # the plate + drilled holes are frozen, but $c.HoleDia / $c.OrthoGeo keep recomputing, so
+        # they'd silently diverge from the committed geometry (agent-flagged C2 -- a wrong-size
+        # plate makes bad hardware). The drill Build + done summary compare against these.
+        $c.BuiltHoleDia = if ($null -ne $c.HoleDia) { [double]$c.HoleDia } else { $null }
+        if ($null -ne $c.OrthoGeo) { $c.BuiltPlateW = [double]$c.OrthoGeo.Width; $c.BuiltPlateH = [double]$c.OrthoGeo.Height }
         $wiz.MarkCommitted()    # geometry now exists; no Back past here
         $wiz.SetChip('box', 'box: built', 'built')
         $wiz.Log('Box built.')
@@ -2515,12 +3475,35 @@ $drillStep = New-WizardStep -Key 'drill' -Title 'Create points, round corners, a
         if (-not $noCornerRound)   { $msg += ("- auto-round the box corner edges at radius {0}" -f $cornerRadius) + [Environment]::NewLine }
         $msg += ("- drill {0} through-hole(s) at diameter {1}`"" -f $n, $dia) + [Environment]::NewLine
         $msg += "- chip-relief SLOTS follow as the next step (draw one seed, then pattern)." + [Environment]::NewLine
-        Add-Para $panel $msg 8 200 'Gray'
+        $y2 = (Add-Para $panel $msg 8 200 'Gray').Bottom + 6
+        # STALE-PLATE WARNING (C2): the box is built to a FROZEN size. If the operator jumped
+        # back and changed the bushing OD or the layout AFTER the box was built, the committed
+        # plate no longer matches the current hole dia / plate footprint, but the holes below
+        # WILL be drilled at the (new) $c.HoleDia into the (old) plate. Warn so they re-run
+        # rather than make a mismatched jig. Only when a real divergence is detected.
+        if ($c.BoxBuilt) {
+            $warn = @()
+            if ($null -ne $c.BuiltHoleDia -and $null -ne $c.HoleDia -and [Math]::Abs([double]$c.BuiltHoleDia - [double]$c.HoleDia) -gt 1e-6) {
+                $warn += ("the hole diameter changed to {0}`" AFTER the box was built at {1}`"" -f [double]$c.HoleDia, [double]$c.BuiltHoleDia)
+            }
+            if ($null -ne $c.BuiltPlateW -and $null -ne $c.OrthoGeo -and ([Math]::Abs([double]$c.BuiltPlateW - [double]$c.OrthoGeo.Width) -gt 1e-6 -or [Math]::Abs([double]$c.BuiltPlateH - [double]$c.OrthoGeo.Height) -gt 1e-6)) {
+                $warn += ("the layout footprint changed to {0:0.00} x {1:0.00} AFTER the box was built at {2:0.00} x {3:0.00}" -f [double]$c.OrthoGeo.Width, [double]$c.OrthoGeo.Height, [double]$c.BuiltPlateW, [double]$c.BuiltPlateH)
+            }
+            if ($warn.Count -gt 0) {
+                Add-Para $panel (([char]0x26A0) + " WARNING: " + ($warn -join '; ') + ". The committed plate is FROZEN at the old size, so drilling now makes a MISMATCHED jig. Re-run the tool (or Rebuild the box) to resize the plate to match.") $y2 0 'warn' $true
+            }
+        }
     } `
     -OnNext {
         param($c, $wiz)
         if ($c.Drilled -or @($c.GridPointIDs).Count -gt 0) { return $true }   # idempotent: revisited after drilling -> don't re-create points/holes
         $script:GuiWiz = $wiz
+        # LIVE-HANDLE REBIND (fastener-import reconnect fix): use $c.Session/$c.Model/$c.Type
+        # (reliably updated by the Datums reconnect) instead of the bare top-level handles a
+        # `$script:session =` write there can't reach. No-op when no reconnect happened.
+        if ($null -ne $c.Session) { $session = $c.Session }
+        if ($null -ne $c.Model)   { $model   = $c.Model }
+        if ($null -ne $c.Type)    { $pfcType = $c.Type }
         $wiz.BeginRun('Drilling...')
 
         # ---- STAGE 2.5: create datum points from the layout ----
@@ -2782,7 +3765,13 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
         param($panel, $c, $wiz)
         if ($noSlotRelief) { Add-Para $panel "Chip-relief slots are disabled (--no-slot-relief). Press Next to finish." 8 60 'gray'; return }
         if ($null -eq $c.OrthoGeo) { Add-Para $panel ("No grid/custom layout was entered (predefined points). Chip-relief slots group holes into rows from the layout, so they need an orthogrid/custom run. Press Next to skip.") 8 60 'gray'; return }
-        if ($c.SlotArmed) { Add-Para $panel ("The seed sketcher is open in Creo. Draw ONE rectangle over the first hole row, then press Next.") 8 60 'DarkGreen' $true; return }
+        if ($c.SlotArmed) {
+            $yA = (Add-Para $panel ("The seed sketcher is open in Creo. Draw ONE rectangle over the first hole row, then press Next.") 8 60 'DarkGreen' $true).Bottom + 8
+            if ($c.SlotHasPlanes) {
+                Add-Para $panel ("To snap the rectangular chip-relief slot in place, hold both CTRL + ALT, then click the two planes spanning across the LENGTH of the part (X direction) and also the RIGHT-SIDE EDGE of the drill jig. If done correctly, dotted blue lines will form the rectangle shape. Then snap the corners of the rectangle tool onto each corner.") $yA 0 'Gray'
+            }
+            return
+        }
         $slotW = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal } elseif ($null -ne $c.HoleDia) { [double]$c.HoleDia } else { 0 }
         $gate = if ($c.WillSlot -eq $false) { 'not adding (decided earlier)' } elseif ($c.Is3dPrint) { 'added automatically (3D print)' } else { 'confirmed earlier' }
         # show the depth that will ACTUALLY be cut = the pad baked into the plate ($c.ReliefPad),
@@ -2807,9 +3796,13 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
             } else { $c.WillSlot = $true }
         }
         if (-not $c.WillSlot) { $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'set'); return $true }
-        # compute the slot plan from the SAME layout the holes came from
+        # compute the slot plan from the SAME layout the holes came from. Direction from
+        # the 'slot-dir' step ($c.SlotRowAxis): 'X' for orthogrid/custom, or the operator's
+        # X/Z choice for an imported fastener layout (defaults to 'X' if the step was skipped).
+        # CrossAxis + the direction datum below derive from it, so a 'Z' pick flows through.
         $slotW = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal } else { 0.25 }
-        $slots = Get-RowSlots -Points $c.OrthoGeo.Points -SlotWidth $slotW -Width $c.OrthoGeo.Width -Height $c.OrthoGeo.Height -RowAxis 'X'
+        $rowAx = if ($c.SlotRowAxis -eq 'Z') { 'Z' } else { 'X' }
+        $slots = Get-RowSlots -Points $c.OrthoGeo.Points -SlotWidth $slotW -Width $c.OrthoGeo.Width -Height $c.OrthoGeo.Height -RowAxis $rowAx
         if (-not $slots.Valid -or @($slots.Rows).Count -lt 1) {
             $wiz.Log('The layout produced no valid slot rows - skipping chip-relief slots.')
             $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'warning'); return $true
@@ -2838,21 +3831,46 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
             $wiz.Log('The SIDE datum was not captured - cannot sketch the slots. Skipping.')
             $c.SlotSkip = $true; $wiz.SetChip('slots', 'slots: skipped', 'warning'); return $true
         }
-        $patPlan = Get-SlotPatternPlan -Rows $slots.Rows
-        $usePattern = ($patPlan.CanPattern -and -not $slotNoPattern -and @($slots.Rows).Count -ge 2 -and $null -ne $dirId)
-        $c.SlotPlan = @{ Rows=$slots.Rows; SlotWidth=$slots.SlotWidth; RowAxis=$slots.RowAxis; CrossAxis=$slots.CrossAxis
-                         Depth=$slotDepth; FaceId=$faceId; DirDatumId=$dirId; DirName=$dirName; PatPlan=$patPlan; UsePattern=$usePattern }
-        $c.SlotFlip = $slotFlipDefault
+        # SINGLE SEED, MANY PATTERNS (user 2026-07-23: "you dont actually need to do a 2nd
+        # seed sketch. just do as many patterns until all rows have a slot"). Draw ONE seed
+        # slot (the lowest-cross row); every OTHER row is reached by patterning THAT SAME
+        # seed again (the user confirmed re-patterning yields a "new sketch + new slot" on
+        # this build). Get-SlotSeedPatterns decomposes the other rows into arithmetic-from-
+        # seed groups -> one ProCmdGeomPattern per group. Manual draws = 1 (always).
+        $canPattern = (-not $slotNoPattern -and $null -ne $dirId)
+        $c.SlotRunIndex = 0
+        $c.SlotAnyCut   = $false
+        $c.SlotWarn     = $false
+        $c.SeedCut      = $false
+        $c.SlotFlip     = $slotFlipDefault
+        if ($canPattern) {
+            $seedPlan = Get-SlotSeedPatterns -Rows $slots.Rows
+            $c.SlotPlan = @{ Mode='pattern'; SeedRow=$seedPlan.SeedRow; Patterns=@($seedPlan.Patterns)
+                             SlotWidth=$slots.SlotWidth; RowAxis=$slots.RowAxis; CrossAxis=$slots.CrossAxis
+                             Depth=$slotDepth; FaceId=$faceId; DirDatumId=$dirId; DirName=$dirName }
+            $wiz.Log(("{0}" -f $seedPlan.Reason))
+            $guideRows = @($seedPlan.SeedRow)      # only the seed is drawn -> guide the seed
+        } else {
+            # PER-ROW fallback (--no-pattern, or no TOP/FRONT direction datum): no patterning
+            # available, so every row is drawn by hand (the pre-multi-pattern behavior).
+            $c.SlotPlan = @{ Mode='perrow'; SeedRow=$slots.Rows[0]; Rows=@($slots.Rows)
+                             SlotWidth=$slots.SlotWidth; RowAxis=$slots.RowAxis; CrossAxis=$slots.CrossAxis
+                             Depth=$slotDepth; FaceId=$faceId; DirDatumId=$dirId; DirName=$dirName }
+            $reasonWhy = if ($slotNoPattern) { '--no-pattern' } else { "no $dirName direction datum" }
+            $wiz.Log(("Patterning off ({0}) - each of the {1} row(s) will be drawn by hand." -f $reasonWhy, @($slots.Rows).Count))
+            $guideRows = @($slots.Rows)            # every row is drawn -> guide them all
+        }
         $wiz.BeginRun('Creating slot-edge guide planes + opening the seed sketcher...')
-        # GUIDE PLANES: the 2+ slot-edge datum planes slotinator makes, so the operator
-        # draws the seed rectangle to the right size. Pattern mode -> first row's edges
-        # only. Needs the TOP + FRONT bases; best-effort (freehand if not captured).
+        # GUIDE PLANES: the slot-edge datum planes slotinator makes, so the operator draws
+        # the seed rectangle to the right size. Pattern mode draws ONLY the seed, so guide
+        # just the seed row; per-row mode guides every row. Needs the TOP + FRONT bases.
         $topBaseIdN   = if ($null -ne $topB   -and $null -ne $topB.BaseId)   { [int]$topB.BaseId }   else { 0 }
         $frontBaseIdN = if ($null -ne $frontB -and $null -ne $frontB.BaseId) { [int]$frontB.BaseId } else { 0 }
+        $c.SlotHasPlanes = $false
         if ($topBaseIdN -gt 0 -and $frontBaseIdN -gt 0) {
             $wiz.Log('Creating the slot-edge guide planes (draw references)...')
-            $gp = New-SlotGuidePlanes -Rows $slots.Rows -TopBaseId $topBaseIdN -FrontBaseId $frontBaseIdN -UsePattern:$usePattern -Log { param($m) $wiz.Log($m) }
-            if (@($gp.Ids).Count -gt 0) { $wiz.Log(("{0} slot-edge guide plane(s) created + shown." -f @($gp.Ids).Count)) }
+            $gp = New-SlotGuidePlanes -Rows $guideRows -TopBaseId $topBaseIdN -FrontBaseId $frontBaseIdN -Log { param($m) $wiz.Log($m) }
+            if (@($gp.Ids).Count -gt 0) { $c.SlotHasPlanes = $true; $wiz.Log(("{0} slot-edge guide plane(s) created + shown." -f @($gp.Ids).Count)) }
             else { $wiz.Log('No new guide planes needed (edges lie on base datums).') }
         } else {
             $wiz.Log('TOP/FRONT base datums not both captured - skipping guide planes (draw freehand).')
@@ -2861,8 +3879,14 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
         $mkArm = (Get-SelectByIdMacro -FeatId ([int]$faceId)) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
         Invoke-Macro "arm seed slot sketch" $mkArm
         $c.SlotArmed = $true
-        $wiz.SetChip('slots', 'slots: sketcher open', 'set')
-        $wiz.Log(("Seed slot sketcher open ({0} row(s), width {1}, depth {2}). Draw the seed rectangle, then press Next." -f @($slots.Rows).Count, $slots.SlotWidth, $(if ($slotDepth -gt 0) { $slotDepth } else { 'Creo default' })))
+        if ($c.SlotPlan.Mode -eq 'pattern') {
+            $np = @($c.SlotPlan.Patterns).Count
+            $wiz.SetChip('slots', 'slots: seed armed', 'set')
+            $wiz.Log(("Seed slot sketcher open ({0} row(s), width {1}, depth {2}). Draw the ONE seed rectangle; {3} pattern(s) then cover the rest hands-free. Press Next." -f @($slots.Rows).Count, $slots.SlotWidth, $(if ($slotDepth -gt 0) { $slotDepth } else { 'Creo default' }), $np))
+        } else {
+            $wiz.SetChip('slots', ("slots: row 1/{0}" -f @($slots.Rows).Count), 'set')
+            $wiz.Log(("Seed slot sketcher open ({0} row(s), width {1}, depth {2}). Draw each row's rectangle. Press Next." -f @($slots.Rows).Count, $slots.SlotWidth, $(if ($slotDepth -gt 0) { $slotDepth } else { 'Creo default' })))
+        }
         return $true
     }
 [void]$steps.Add($slotArmStep)
@@ -2877,75 +3901,172 @@ $slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + 
         param($panel, $c, $wiz)
         if ($c.SlotsDone) {
             Add-RebuiltNotice -Panel $panel -Context $c -Wizard $wiz -Message 'Chip-relief slots are already cut.' `
-                -ResetFlags @('SlotsDone','SlotArmed') -GoToKey 'slot-a'
+                -ResetFlags @('SlotsDone','SlotArmed','SeedCut') -ResetValues @{ SlotRunIndex = 0; SlotAnyCut = $false; SlotWarn = $false } -GoToKey 'slot-a'
             return
         }
         if ($c.SlotSkip) { Add-Para $panel "Chip-relief slots were skipped. Press Next to finish." 8 60 'gray'; return }
-        Add-ArmBanner $panel ("In Creo's sketcher: draw the seed rectangle over the FIRST hole row (one corner, opposite corner), Esc to finish." + [Environment]::NewLine +
-                              "Then press 'Finish the seed slot' - Creo cuts it, you confirm the direction, and the rest are patterned.") 8
+        # mode-aware banner. PATTERN mode: draw ONE seed, patterns cover the rest.
+        # PER-ROW mode: draw every row (which one is next).
+        $mode = if ($null -ne $c.SlotPlan) { [string]$c.SlotPlan.Mode } else { 'pattern' }
+        if ($mode -eq 'perrow') {
+            $rTotB = if ($null -ne $c.SlotPlan) { @($c.SlotPlan.Rows).Count } else { 1 }
+            $rNowB = [int]$c.SlotRunIndex + 1
+            $armB = Add-ArmBanner $panel ("In Creo's sketcher: draw the slot rectangle for ROW $rNowB of $rTotB over its hole row (one corner, opposite corner), Esc to finish." + [Environment]::NewLine +
+                                  "Then press 'Finish the seed slot' - Creo cuts it$(if ($rNowB -eq 1) { ', you confirm the direction' } else { '' }). Each row is drawn (patterning is off).") 8
+        } else {
+            $np = if ($null -ne $c.SlotPlan) { @($c.SlotPlan.Patterns).Count } else { 0 }
+            $armB = Add-ArmBanner $panel ("In Creo's sketcher: draw the ONE seed rectangle over the first hole row (one corner, opposite corner), Esc to finish." + [Environment]::NewLine +
+                                  "Then press 'Finish the seed slot' - Creo cuts it, you confirm the direction, then $np pattern(s) copy it onto every remaining row hands-free (you'll click the seed in the tree once per pattern - no more drawing).") 8
+        }
+        if ($c.SlotHasPlanes) {
+            Add-Para $panel ("To snap the rectangular chip-relief slot in place, hold both CTRL + ALT, then click the two planes spanning across the LENGTH of the part (X direction) and also the RIGHT-SIDE EDGE of the drill jig. If done correctly, dotted blue lines will form the rectangle shape. Then snap the corners of the rectangle tool onto each corner.") ($armB + 12) 0 'Gray'
+        }
     } `
     -OnNext {
         param($c, $wiz)
         if ($c.SlotsDone) { return $true }   # idempotent: revisited after the cut -> don't re-cut (no duplicate)
         if ($c.SlotSkip) { return $true }
         $script:GuiWiz = $wiz
+        # LIVE-HANDLE REBIND (fastener-import reconnect fix): use $c.Session/$c.Model (reliably
+        # updated by the Datums reconnect) instead of the bare top-level handles a `$script:session =`
+        # write there can't reach. No-op when no reconnect happened.
+        if ($null -ne $c.Session) { $session = $c.Session }
+        if ($null -ne $c.Model)   { $model   = $c.Model }
+        if ($null -ne $c.Type)    { $pfcType = $c.Type }
         $plan = $c.SlotPlan
-        $wiz.BeginRun('Cutting the seed slot...')
-        $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
-        $changed = $false
-        try {
-            $session.RunMacro((Build-CutFinishMacro -Depth ([double]$plan.Depth) -BodyIndex ([int]$c.BodyIndex) -Flip $c.SlotFlip))
-            if ($null -ne $stamp) { $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
-        } catch { $wiz.Log("  seed cut error: $($_.Exception.Message)") }
-        if (-not $changed) {
-            $wiz.Log('The seed slot cut did not modify the model (rectangle not a closed loop?).')
-            $wiz.SetChip('slots', 'slots: no change', 'unverified')
+        # DEFENSIVE (SUSPECTED S1): slot-b's Validate admits SlotArmed OR SlotSkip, but only
+        # slot-a's OnNext sets $c.SlotPlan. If a future path sets SlotArmed without SlotPlan,
+        # $plan would be $null and the cut below would throw on $plan.Depth. Guard it.
+        if ($null -eq $plan) {
+            $wiz.Log('Slot plan missing (slot-a did not run) - skipping chip-relief slots.')
+            $wiz.SetChip('slots', 'slots: skipped', 'warning')
             return $true
         }
-        # VERIFY direction with the operator (in-canvas; the operator only needs to LOOK
-        # at Creo to answer, so the wizard may come to the front to show the overlay).
-        $ans = $wiz.AskInline('Verify slot', 'Did the seed slot cut INTO the plate at the right depth?', 'YesNo')
-        if ($ans -ne 'Yes') {
-            # undo, flip, re-arm the sketcher, and STAY so the operator redraws
-            $wiz.Log('Wrong direction - undoing, flipping, and reopening the sketcher to redraw.')
-            try { $session.RunMacro("~ Command ``ProCmdEditUndo``;") } catch {}
-            $c.SlotFlip = -not $c.SlotFlip
-            $mkArm = (Get-SelectByIdMacro -FeatId ([int]$plan.FaceId)) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
-            Invoke-Macro "re-arm seed slot sketch (flipped)" $mkArm
-            $wiz.SetChip('slots', 'slots: redraw', 'unverified')
-            # -NoActivate: the operator redraws the seed rectangle in Creo's sketcher next,
-            # so the wizard must NOT steal focus from Creo.
-            [void]$wiz.AskInline('Chip-relief slots', ("Flipped the direction and reopened the sketcher. If the wrong slot is still in Creo, press Ctrl+Z. Redraw the seed rectangle, then press 'Finish the seed slot' again."), 'OK', $true)
-            return $false   # stay on slot-b; operator redraws
+        $armMacro = (Get-SelectByIdMacro -FeatId ([int]$plan.FaceId)) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
+
+        if ([string]$plan.Mode -eq 'perrow') {
+            # ---- PER-ROW mode (--no-pattern / no direction datum): draw EVERY row. ----
+            # One pass per row: cut this row's seed, verify direction on row 0 only (reuse
+            # the flip), then advance -> re-arm the next row + return $false (stay), or finish.
+            $rows = @($plan.Rows)
+            $rn   = [int]$c.SlotRunIndex
+            $rTot = @($rows).Count
+            if ($rn -ge $rTot) { $c.SlotsDone = $true; $wiz.MarkCommitted(); return $true }
+            $wiz.BeginRun(("Cutting slot row {0}/{1}..." -f ($rn + 1), $rTot))
+            $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
+            $changed = $false
+            try {
+                $session.RunMacro((Build-CutFinishMacro -Depth ([double]$plan.Depth) -BodyIndex ([int]$c.BodyIndex) -Flip $c.SlotFlip))
+                if ($null -ne $stamp) { $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
+            } catch { $wiz.Log("  row cut error: $($_.Exception.Message)") }
+            if (-not $changed) {
+                $wiz.Log(("Row {0}/{1} did not cut (rectangle not a closed loop?) - reopening the sketcher to redraw." -f ($rn + 1), $rTot))
+                Invoke-Macro "re-arm slot row sketch (no change)" $armMacro
+                $wiz.SetChip('slots', ("slots: row {0}/{1} redraw" -f ($rn + 1), $rTot), 'unverified')
+                [void]$wiz.AskInline('Chip-relief slots', ("The slot did not cut. The sketcher is reopened - redraw row {0}/{1}'s rectangle, then press 'Finish the seed slot' again." -f ($rn + 1), $rTot), 'OK', $true)
+                return $false
+            }
+            if ($rn -eq 0) {
+                $ans = $wiz.AskInline('Verify slot', 'Did the slot cut INTO the plate at the right depth?', 'YesNo')
+                if ($ans -ne 'Yes') {
+                    $wiz.Log('Wrong direction - undoing, flipping, and reopening the sketcher to redraw.')
+                    try { $session.RunMacro("~ Command ``ProCmdEditUndo``;") } catch {}
+                    $c.SlotFlip = -not $c.SlotFlip
+                    Invoke-Macro "re-arm slot row sketch (flipped)" $armMacro
+                    $wiz.SetChip('slots', 'slots: redraw', 'unverified')
+                    [void]$wiz.AskInline('Chip-relief slots', ("Flipped the direction and reopened the sketcher. If the wrong slot is still in Creo, press Ctrl+Z. Redraw the rectangle, then press 'Finish the seed slot' again."), 'OK', $true)
+                    return $false
+                }
+                $wiz.Log('Direction confirmed - reusing it for the remaining rows.')
+            }
+            $c.SlotAnyCut = $true
+            $c.SlotRunIndex = $rn + 1
+            if ($c.SlotRunIndex -lt $rTot) {
+                $nextN = $c.SlotRunIndex + 1
+                Invoke-Macro ("arm slot row sketch (row $nextN)") $armMacro
+                $wiz.SetChip('slots', ("slots: row {0}/{1}" -f $nextN, $rTot), 'set')
+                [void]$wiz.AskInline('Chip-relief slots', ("Row {0}/{1} done. The sketcher is reopened for row {2}/{1} - draw its rectangle over the next hole row, then press 'Finish the seed slot' again." -f ($rn + 1), $rTot, $nextN), 'OK', $true)
+                return $false
+            }
+            $wiz.SetChip('slots', ("slots: {0} row(s) cut" -f $rTot), 'built')
+            $c.SlotsDone = $true; $wiz.MarkCommitted(); return $true
         }
-        $wiz.SetChip('slots', 'slots: seed built', 'set')
-        $wiz.Log('Seed slot confirmed.')
-        # PATTERN the seed to the remaining rows (if applicable)
-        if ($plan.UsePattern) {
-            # -NoActivate: the operator must click the seed slot in CREO's model tree WHILE
-            # this prompt is up, then press OK; a focus-stealing overlay would block that
-            # tree pick. Read-SelectedId reads the buffer synchronously right after OK.
-            [void]$wiz.AskInline('Chip-relief slots', ("Select the SEED SLOT CUT in Creo's model tree (the remove-material extrude you just cut), then press OK."), 'OK', $true)
+
+        # ---- PATTERN mode: ONE seed, then many patterns (user 2026-07-23). ----
+        # Step 1 (once): cut the seed the operator drew + verify direction. Step 2: fire ALL
+        # the from-seed patterns inline -- each re-selects the SAME seed in the tree (FIX 1:
+        # a search-buffer select does NOT register as a pattern target) and fires one
+        # ProCmdGeomPattern. Re-patterning the seed makes a "new sketch + new slot" (operator-
+        # confirmed on this build). No 2nd seed is ever drawn.
+        if (-not $c.SeedCut) {
+            $wiz.BeginRun('Cutting the seed slot...')
+            $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
+            $changed = $false
+            try {
+                $session.RunMacro((Build-CutFinishMacro -Depth ([double]$plan.Depth) -BodyIndex ([int]$c.BodyIndex) -Flip $c.SlotFlip))
+                if ($null -ne $stamp) { $changed = Wait-ModelModified -Model $model -PreviousStamp $stamp -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
+            } catch { $wiz.Log("  seed cut error: $($_.Exception.Message)") }
+            if (-not $changed) {
+                $wiz.Log('The seed slot cut did not modify the model (rectangle not a closed loop?) - reopening the sketcher to redraw.')
+                Invoke-Macro "re-arm seed slot sketch (no change)" $armMacro
+                $wiz.SetChip('slots', 'slots: seed redraw', 'unverified')
+                [void]$wiz.AskInline('Chip-relief slots', ("The seed slot did not cut (the rectangle may not have been a closed loop). The sketcher is reopened - redraw the seed rectangle, then press 'Finish the seed slot' again."), 'OK', $true)
+                return $false
+            }
+            $ans = $wiz.AskInline('Verify slot', 'Did the seed slot cut INTO the plate at the right depth?', 'YesNo')
+            if ($ans -ne 'Yes') {
+                $wiz.Log('Wrong direction - undoing, flipping, and reopening the sketcher to redraw.')
+                try { $session.RunMacro("~ Command ``ProCmdEditUndo``;") } catch {}
+                $c.SlotFlip = -not $c.SlotFlip
+                Invoke-Macro "re-arm seed slot sketch (flipped)" $armMacro
+                $wiz.SetChip('slots', 'slots: seed redraw', 'unverified')
+                [void]$wiz.AskInline('Chip-relief slots', ("Flipped the direction and reopened the sketcher. If the wrong slot is still in Creo, press Ctrl+Z. Redraw the seed rectangle, then press 'Finish the seed slot' again."), 'OK', $true)
+                return $false
+            }
+            $c.SeedCut = $true
+            $c.SlotAnyCut = $true
+            $wiz.Log('Seed slot confirmed - patterning it onto every remaining row (no more drawing).')
+        }
+
+        # fire ALL from-seed patterns inline (tree-select the seed once per pattern).
+        $pats = @($plan.Patterns)
+        $np = @($pats).Count
+        if ($np -eq 0) {
+            $wiz.SetChip('slots', 'slots: 1 cut', 'built')
+            $wiz.Log('Single-row layout - the seed cut IS the only slot (no pattern needed).')
+            $c.SlotsDone = $true; $wiz.MarkCommitted(); return $true
+        }
+        $accTot = @($pats | Where-Object { $_.Kind -eq 'accommodation' }).Count
+        $wiz.BeginRun(("Patterning: 1 regular pattern + {0} accommodation pattern(s) from the one seed..." -f $accTot))
+        $donePat = 0
+        for ($k = 0; $k -lt $np; $k++) {
+            $p = $pats[$k]
+            # label the regular pattern vs the per-stray accommodations (user's model:
+            # "the regular pattern" + "a second pattern to accommodate" each off-pattern row).
+            $kindWord = if ([string]$p.Kind -eq 'regular') { ("REGULAR pattern ({0} slots at pitch {1:0.###})" -f $p.Count, $p.Increment) } else { ("accommodation pattern (stray row at +{0:0.###})" -f $p.Increment) }
+            # -NoActivate: the operator clicks the seed slot in CREO's model tree WHILE this
+            # prompt is up, then presses OK; a focus-stealing overlay would block that pick.
+            [void]$wiz.AskInline('Chip-relief slots', ("Pattern {0} of {1} - {2}: select the SEED SLOT CUT in Creo's model tree (the remove-material extrude), then press OK. (Same seed every time - Creo makes a new slot each pattern.)" -f ($k + 1), $np, $kindWord), 'OK', $true)
             $selSeed = Read-SelectedId
             if ($null -eq $selSeed) {
-                $wiz.Log('Nothing selected - the seed slot IS cut; pattern by hand or re-run with --no-pattern.')
-                $wiz.SetChip('slots', 'slots: seed only', 'unverified')
-            } else {
-                $wiz.Log(("Patterning {0} copies at pitch {1}, direction = the {2} datum (by ID)..." -f $plan.PatPlan.Count, $plan.PatPlan.Increment, $plan.DirName))
-                $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
-                $patChanged = $false
-                try {
-                    $session.RunMacro((Build-SlotPatternMacro -DirDatumId ([int]$plan.DirDatumId) -Count ([int]$plan.PatPlan.Count) -Spacing ([double]$plan.PatPlan.Increment) -Flip:$slotPatternFlip))
-                    if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
-                } catch { $wiz.Log("  pattern error: $($_.Exception.Message)") }
-                if ($patChanged) { $wiz.SetChip('slots', ("slots: {0} (patterned)" -f $plan.PatPlan.Count), 'built'); $wiz.Log('Seed slot patterned to the remaining rows.') }
-                else { $wiz.SetChip('slots', 'slots: seed only', 'unverified'); $wiz.Log('Pattern did not change the model - seed IS cut; finish by hand or re-run with --no-pattern.') }
+                $wiz.Log(("Pattern {0}/{1} ({2}): nothing selected - skipped. Select the seed and re-run, or pattern by hand." -f ($k + 1), $np, $p.Kind))
+                $c.SlotWarn = $true
+                continue
             }
-        } else {
-            $wiz.SetChip('slots', 'slots: 1 cut', 'built')
+            $wiz.Log(("Pattern {0}/{1} - {2} along the {3} datum (by ID)..." -f ($k + 1), $np, $kindWord, $plan.DirName))
+            $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
+            $patChanged = $false
+            try {
+                $session.RunMacro((Build-SlotPatternMacro -DirDatumId ([int]$plan.DirDatumId) -Count ([int]$p.Count) -Spacing ([double]$p.Increment) -Flip:$slotPatternFlip))
+                if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
+            } catch { $wiz.Log("  pattern error: $($_.Exception.Message)") }
+            if ($patChanged) { $donePat++; $wiz.Log(("Pattern {0}/{1} placed its slot(s)." -f ($k + 1), $np)) }
+            else { $c.SlotWarn = $true; $wiz.Log(("Pattern {0}/{1} did NOT change the model - the seed IS cut; pattern this group by hand." -f ($k + 1), $np)) }
+            $wiz.SetChip('slots', ("slots: seed + {0}/{1} patterns" -f $donePat, $np), $(if ($donePat -eq ($k + 1)) { 'built' } else { 'unverified' }))
         }
         $c.SlotsDone = $true
         $wiz.MarkCommitted()
+        $wiz.SetChip('slots', ("slots: seed + {0}/{1} patterns" -f $donePat, $np), $(if ($c.SlotWarn -eq $true) { 'unverified' } else { 'built' }))
         return $true
     }
 [void]$steps.Add($slotFinishStep)
@@ -2962,12 +4083,18 @@ $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' 
         }
         if (@($c.PointIDs).Count -gt 0) { $msg += ("  Points: {0}" -f @($c.PointIDs).Count) + [Environment]::NewLine }
         if ($c.Drilled) { $msg += "  Holes: drilled (verify visually in Creo)." + [Environment]::NewLine }
-        if ($c.SlotsDone) { $msg += "  Chip-relief slots: cut (verify each spans its row, correct depth + face)." + [Environment]::NewLine }
+        if ($c.SlotsDone) {
+            $msg += "  Chip-relief slots: cut (verify each spans its row, correct depth + face)." + [Environment]::NewLine
+            if ($c.SlotWarn -eq $true) { $msg += "    NOTE: at least one run's pattern did not verify - check every hole row has its slot." + [Environment]::NewLine }
+        }
+        elseif ($c.SlotAnyCut -eq $true) { $msg += "  Chip-relief slots: PARTIALLY cut (the run loop did not finish - verify which hole rows have slots)." + [Environment]::NewLine }
         elseif ($c.SlotSkip) { $msg += "  Chip-relief slots: skipped." + [Environment]::NewLine }
-        # HONESTY GUARD: if relief was intended ($c.WillSlot, so the plate was PADDED by
-        # the slot depth) but NO slot was cut (skipped / no-change / aborted), the guide is
-        # LEFT TOO THICK by exactly the pad. Warn so the operator cuts it by hand or re-runs.
-        if ($c.WillSlot -eq $true -and -not $c.SlotsDone -and $null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) {
+        # HONESTY GUARD: if relief was intended ($c.WillSlot, so the plate was PADDED by the
+        # slot depth) but NOTHING was cut (skipped / no-change / aborted before ANY seed), the
+        # guide is LEFT TOO THICK by exactly the pad. Warn so the operator cuts it by hand or
+        # re-runs. A PARTIAL cut ($c.SlotAnyCut) means the plate is at least partly relieved,
+        # so this full-oversize warning does not apply (the partial-cut note above covers it).
+        if ($c.WillSlot -eq $true -and -not $c.SlotsDone -and -not $c.SlotAnyCut -and $null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) {
             $padAmt = [double]$c.SlotDepth
             $msg += [Environment]::NewLine + ("  *** WARNING: the plate was PADDED by {0}`" for chip relief that was NOT cut, so the" -f $padAmt) + [Environment]::NewLine
             $msg += ("  bushing guide is OVERSIZED by {0}`" (it is {1}`", not the intended {2}`"). Cut the relief" -f $padAmt, [Math]::Round([double]$c.BushingLen+[double]$c.SlotDepth,4), [Math]::Round([double]$c.BushingLen,4)) + [Environment]::NewLine
@@ -2984,7 +4111,7 @@ $doneStep = New-WizardStep -Key 'done' -Title 'Done' -Stage 'Done' -Kind 'info' 
 # ============================================================================
 # RUN THE WIZARD
 # ============================================================================
-$stages = @('Import','Bushing','Layout','Datums','Box','Drill','Relief','Done')
+$stages = @('Welcome','Import','Bushing','Layout','Overview','Datums','Box','Drill','Relief','Done')
 $subtitle = "Connected: $([System.IO.Path]::GetFileName($modelFile))"
 
 try {
@@ -3000,6 +4127,21 @@ try {
         if ($null -ne $origDynamicPreview)  { $session.SetConfigOption("dynamic_preview",  $origDynamicPreview)  | Out-Null }
     } catch {}
     try { $connection.Disconnect($null) } catch {}
+    # RELEASE every COM handle + force GC so this process holds NOTHING against
+    # Creo's async slot once it parks at "Press any key to exit". Without this the
+    # parked shell keeps the connection alive (RCWs live until GC), and the NEXT
+    # launch faults on Connect() -- exactly the recurring 0x80010105 loop. The
+    # preflight self-heal above is the belt; this is the suspenders (a clean exit
+    # leaves no orphan to clear next time).
+    foreach ($h in @('model','session','connection','async')) {
+        try {
+            $obj = Get-Variable -Name $h -ValueOnly -ErrorAction SilentlyContinue
+            if ($null -ne $obj -and [System.Runtime.InteropServices.Marshal]::IsComObject($obj)) {
+                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($obj) | Out-Null
+            }
+        } catch {}
+    }
+    try { [GC]::Collect(); [GC]::WaitForPendingFinalizers() } catch {}
 }
 
 Write-Host ""

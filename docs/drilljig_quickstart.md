@@ -56,7 +56,10 @@ Double-click the `.cmd`, or run it from a terminal.
    **offsets from that csys** (+ an axis), so the grid can later be re-referenced onto
    the index hole. The box itself is **sketched on the SIDE default datum** and extruded
    up to the SIDE csys plane (the proven, well-behaved build).
-   **PAUSE:** draw a rough rectangle in the sketcher (2 clicks); the tool finishes it.
+   **PAUSE:** draw the plate rectangle in the sketcher, then the tool finishes it. To
+   snap the second corner to the intersection of the newly created planes, hold
+   **CTRL + ALT** and select the 2 planes — done correctly, dotted blue lines form the
+   rectangle shape — then draw the rectangle from corner to corner.
 5. **(Orthogrid/Custom) Points** — every target point is created automatically as the
    intersection of 3 planes. No clicks.
 6. **Corner round** — the plate's vertical corner edges are rounded (hands-free).

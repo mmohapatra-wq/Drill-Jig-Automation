@@ -162,6 +162,218 @@ $rAllDup = ConvertTo-LayoutXZ -Centers $stack -AxisX 'X' -AxisZ 'Z' -Margin 0.5 
 Assert-True "over-large dedup: collapses toward few + still valid if >=1" ($rAllDup.Count -ge 1)
 
 # ----------------------------------------------------------------------------
+# FL-BestFitNormal + Get-FastenerPlaneFrame - panel frame from the HOLE POSITIONS
+# (best-fit plane), with the fastener axes as a fallback for < 3 / collinear holes.
+# ----------------------------------------------------------------------------
+Write-Host "  -- FL-BestFitNormal / Get-FastenerPlaneFrame --" -ForegroundColor White
+
+# best-fit normal of points in the Y=5 plane -> normal ~ +/-Y, flatness ~ 0
+$bf = FL-BestFitNormal -Points @(@(0,5,0), @(2,5,0), @(0,5,3), @(2,5,3))
+Assert-True "bestfit: coplanar -> normal ~ +/-Y" ($null -ne $bf -and [math]::Abs([double]$bf.Normal[1]) -gt 0.999)
+Assert-True "bestfit: flatness ~ 0 for coplanar points" ($null -ne $bf -and [double]$bf.Flatness -lt 1e-9)
+Assert-True "bestfit: < 3 points -> null" ($null -eq (FL-BestFitNormal -Points @(@(0,0,0), @(1,1,1))))
+Assert-True "bestfit: collinear points -> null (normal indeterminate)" ($null -eq (FL-BestFitNormal -Points @(@(0,0,0), @(1,0,0), @(2,0,0), @(3,0,0))))
+
+# parallel axes (all +Y) + coplanar points -> normal ~ +Y from the POINTS
+$fpAxes = @(@(0,1,0), @(0,1,0), @(0,1,0), @(0,1,0))
+$fpCtr  = @(@(0,5,0), @(2,5,0), @(0,5,3), @(2,5,3))
+$fr = Get-FastenerPlaneFrame -Centers $fpCtr -Axes $fpAxes -AxisX 'X' -AxisZ 'Z'
+Assert-True "frame: valid for coplanar points" ($fr.Valid) (($fr.Errors) -join '; ')
+Assert-True "frame: normal ~ +/-Y" ([math]::Abs([double]$fr.N[1]) -gt 0.999)
+Assert-True "frame: normal came from the POINTS" ($fr.NormalSource -eq 'points')
+Assert-True "frame: Xhat unit" (Approx ([math]::Sqrt($fr.Xhat[0]*$fr.Xhat[0]+$fr.Xhat[1]*$fr.Xhat[1]+$fr.Xhat[2]*$fr.Xhat[2])) 1.0 1e-9)
+Assert-True "frame: Xhat . Zhat ~ 0 (orthonormal)" ([math]::Abs($fr.Xhat[0]*$fr.Zhat[0]+$fr.Xhat[1]*$fr.Zhat[1]+$fr.Xhat[2]*$fr.Zhat[2]) -lt 1e-9)
+Assert-True "frame: axis spread ~ 0 (axes match the point normal here)" ([double]$fr.AxisSpreadDeg -lt 1e-6)
+
+# NO axes but >=3 coplanar points -> STILL valid, from the points (the key upgrade:
+# the plane no longer needs the fastener axes at all)
+$frNoAx = Get-FastenerPlaneFrame -Centers $fpCtr -Axes @($null,$null,$null,$null) -AxisX 'X' -AxisZ 'Z'
+Assert-True "frame: no axes but coplanar points -> valid from points" ($frNoAx.Valid -and $frNoAx.NormalSource -eq 'points')
+
+# COLLINEAR points + axes -> best-fit indeterminate -> FALL BACK to the axis normal
+$frCol = Get-FastenerPlaneFrame -Centers @(@(0,5,0), @(1,5,0), @(2,5,0)) -Axes @(@(0,1,0), @(0,1,0), @(0,1,0)) -AxisX 'X' -AxisZ 'Z'
+Assert-True "frame: collinear holes -> axis-fallback normal" ($frCol.Valid -and $frCol.NormalSource -eq 'axis')
+
+# layout X axis parallel to the panel normal -> AUTO-SUBSTITUTED with an in-plane axis
+# (the operator need not know the panel orientation). Panel normal here is Y; asking for
+# AxisX='Y' is degenerate, so Xhat becomes an in-plane axis (X or Z) -> still valid.
+$frBadX = Get-FastenerPlaneFrame -Centers $fpCtr -Axes $fpAxes -AxisX 'Y' -AxisZ 'Z'
+Assert-True "frame: AxisX along normal -> auto-substituted, still valid" ($frBadX.Valid)
+Assert-True "frame: auto-substituted Xhat is in-plane (perp to normal Y)" ([math]::Abs($frBadX.Xhat[1]) -lt 1e-9)
+
+# never throws on junk
+$frJunk = Get-FastenerPlaneFrame -Centers $null -Axes $null
+Assert-True "frame: null in -> invalid, no throw" (-not $frJunk.Valid)
+
+# ----------------------------------------------------------------------------
+# ConvertTo-LayoutXZ - PANEL-PLANE projection (the tilted-panel fix)
+# ----------------------------------------------------------------------------
+Write-Host "  -- ConvertTo-LayoutXZ panel-plane projection --" -ForegroundColor White
+
+# AXIS-ALIGNED panel (normal +Y): plane mode must MATCH the legacy global drop.
+$aaCtr  = @(@(0,5,0), @(2,5,0), @(0,5,3), @(2,5,3))
+$aaAxes = @(@(0,1,0), @(0,1,0), @(0,1,0), @(0,1,0))
+$rGlobal = ConvertTo-LayoutXZ -Centers $aaCtr -AxisX 'X' -AxisZ 'Z' -Margin 0.5
+$rPlane  = ConvertTo-LayoutXZ -Centers $aaCtr -Axes $aaAxes -AxisX 'X' -AxisZ 'Z' -Margin 0.5
+Assert-True "plane: axis-aligned uses plane frame" ($rPlane.Frame -eq 'plane')
+Assert-True "plane: legacy fallback when no axes" ($rGlobal.Frame -eq 'global')
+Assert-True "plane: axis-aligned spanX matches legacy (2)" ((Approx $rPlane.SpanX 2.0) -and (Approx $rGlobal.SpanX 2.0))
+Assert-True "plane: axis-aligned spanZ matches legacy (3)" ((Approx $rPlane.SpanZ 3.0) -and (Approx $rGlobal.SpanZ 3.0))
+
+# TILTED panel: the SAME 2x3 grid rotated 45 deg about global X. True in-plane
+# spacing is still 2 x 3, but the GLOBAL drop distorts Z to 3*cos45 = 2.121.
+# Plane projection must RECOVER the true 3.0. c = s = cos(45).
+# NOTE: precompute every product into a scalar -- PS 5.1 mis-parses a comma
+# @(literal, number*var, ...) literal (the file's documented COM-array trap).
+$c45 = 0.70710678118
+$p3  = 3.0 * $c45                       # 2.1213...  the tilted Y/Z component
+$negC = -1.0 * $c45
+$tiltCtr = @(
+    (@(0.0, 0.0, 0.0)),
+    (@(2.0, 0.0, 0.0)),
+    (@(0.0, $p3, $p3)),
+    (@(2.0, $p3, $p3))
+)
+$tiltNrm = @(0.0, $negC, $c45)          # (0,0,1) rotated 45 deg about X
+$tiltAxes = @($tiltNrm, $tiltNrm, $tiltNrm, $tiltNrm)
+$rTiltGlobal = ConvertTo-LayoutXZ -Centers $tiltCtr -AxisX 'X' -AxisZ 'Z' -Margin 0.5
+$rTiltPlane  = ConvertTo-LayoutXZ -Centers $tiltCtr -Axes $tiltAxes -AxisX 'X' -AxisZ 'Z' -Margin 0.5
+Assert-True "tilt: global drop DISTORTS spanZ (2.121, not 3)" (Approx $rTiltGlobal.SpanZ $p3 1e-3)
+Assert-True "tilt: plane projection RECOVERS true spanZ = 3.0" (Approx $rTiltPlane.SpanZ 3.0 1e-6)
+Assert-True "tilt: plane preserves spanX = 2.0" (Approx $rTiltPlane.SpanX 2.0 1e-6)
+Assert-True "tilt: plane keeps all 4 distinct holes (no false collapse)" ($rTiltPlane.Count -eq 4)
+
+# Points COINCIDENT in 3D (a re-selected same instance) merge in plane mode too --
+# stack-merging via best-fit is NOT guaranteed (a stack's axis can be in-plane), so
+# genuine coincidence, not "coaxial", is what DedupTol collapses.
+$dupCtr = @(
+    (@(0.0, 5.0, 0.0)),
+    (@(0.0, 5.0, 0.0)),                                    # exact duplicate
+    (@(2.0, 5.0, 0.0)),
+    (@(0.0, 5.0, 3.0))
+)
+$dupAx = @(@(0,1,0), @(0,1,0), @(0,1,0), @(0,1,0))
+$rDupPlane = ConvertTo-LayoutXZ -Centers $dupCtr -Axes $dupAx -AxisX 'X' -AxisZ 'Z' -Margin 0.5 -DedupTol 1e-3
+Assert-True "plane: exact-coincident points merge -> 3 holes" ($rDupPlane.Count -eq 3)
+
+# a null axis entry is tolerated; the plane still comes from the POINTS
+$rMixedAxes = ConvertTo-LayoutXZ -Centers $aaCtr -Axes @(@(0,1,0), $null, @(0,1,0), @(0,1,0)) -AxisX 'X' -AxisZ 'Z' -Margin 0.5
+Assert-True "plane: null axis entry tolerated, still plane mode" ($rMixedAxes.Frame -eq 'plane' -and $rMixedAxes.Count -eq 4)
+
+# ----------------------------------------------------------------------------
+# REAL DATA regression: the operator's 22-fastener higher-level assembly. The
+# holes are coplanar on Z - Y = 0.6194 (normal ~ (0,-1,1)); the fastener axis
+# read (1,0,0) LIES IN that plane. The old global (X,Z) drop compresses the row
+# spacing by sqrt(2) and coincides rows; best-fit-plane projection must keep all
+# 22 distinct with true spacing (columns span 3.75, rows span 7.5).
+# ----------------------------------------------------------------------------
+Write-Host "  -- real 22-fastener assembly regression --" -ForegroundColor White
+$realCtr = @(
+ (@(107.381,22.9859,23.6053)),(@(104.881,23.693,24.3125)),(@(107.381,23.693,24.3125)),
+ (@(104.881,25.6376,26.257)),(@(107.381,25.6376,26.257)),(@(104.881,26.5215,27.1409)),
+ (@(108.631,26.5215,27.1409)),(@(106.131,23.693,24.3125)),(@(106.131,24.4001,25.0196)),
+ (@(107.381,24.4001,25.0196)),(@(104.881,24.4001,25.0196)),(@(106.131,26.5215,27.1409)),
+ (@(106.131,27.4053,28.0248)),(@(107.381,26.5215,27.1409)),(@(107.381,27.4053,28.0248)),
+ (@(106.131,25.6376,26.257)),(@(108.631,27.4053,28.0248)),(@(106.131,22.9859,23.6053)),
+ (@(104.881,22.9859,23.6053)),(@(108.631,28.2892,28.9086)),(@(107.381,28.2892,28.9086)),
+ (@(106.131,28.2892,28.9086)))
+$realAxV = @(1.0, 0.0, 0.0)                                # the (misleading) fastener axis (1,0,0)
+$realAxes = @(); foreach ($i in 0..21) { $realAxes += ,$realAxV }
+$rReal = ConvertTo-LayoutXZ -Centers $realCtr -Axes $realAxes -AxisX 'X' -AxisZ 'Z' -Margin 0.375 -DedupTol 1e-3
+Assert-True "real: plane frame from the POINTS (axis was in-plane)" ($rReal.Frame -eq 'plane' -and $rReal.NormalSource -eq 'points')
+Assert-True "real: holes are coplanar (flatness ~ 0)" ($null -ne $rReal.Flatness -and [double]$rReal.Flatness -lt 1e-6)
+Assert-True "real: ALL 22 holes kept (no false collapse)" ($rReal.Count -eq 22)
+Assert-True "real: column span ~ 3.75" (Approx $rReal.SpanX 3.75 1e-2)
+Assert-True "real: row span ~ 7.5 (true, not sqrt2-compressed)" (Approx $rReal.SpanZ 7.5 1e-2)
+# the OLD global (X,Z) drop compresses the rows -> smaller Z span (the bug)
+$rRealGlobal = ConvertTo-LayoutXZ -Centers $realCtr -AxisX 'X' -AxisZ 'Z' -Margin 0.375
+Assert-True "real: OLD global drop compressed the row span (< true 7.5)" ([double]$rRealGlobal.SpanZ -lt 7.0)
+# COUNT-PRESERVATION (user 2026-07-23: picked count = hole count): with DedupTol=0 the
+# 22 distinct fasteners must stay 22 -- NO proximity merge ever reduces distinct holes.
+$rReal0 = ConvertTo-LayoutXZ -Centers $realCtr -Axes $realAxes -AxisX 'X' -AxisZ 'Z' -Margin 0.375 -DedupTol 0
+Assert-True "real: DedupTol=0 keeps all 22 (no merge)" ($rReal0.Count -eq 22 -and $rReal0.Dropped -eq 0)
+Assert-True "real: SpanRatio exposed + well-conditioned" ($null -ne $rReal0.SpanRatio -and [double]$rReal0.SpanRatio -gt 0.06)
+
+# REAL DATA #2 (150-110-0030-101.asm, 8 fasteners nas6405a9): the panel normal is
+# GLOBAL X (all 8 share X=109.444; a 2x4 grid in Y-Z). The default AxisX='X' is now the
+# NORMAL -> the layout must AUTO-SUBSTITUTE in-plane axes (Y,Z) instead of failing, and
+# keep all 8 holes at true spacing (Y span 1.5, Z span 6.0). Fastener Zaxis=(0,0,1) is
+# again IN-plane, not the normal.
+Write-Host "  -- real 8-fastener assembly (panel normal = global X) --" -ForegroundColor White
+$real2Ctr = @(
+ (@(109.444,25.9269,16.75)),(@(109.444,24.4269,16.75)),(@(109.444,24.4269,15.25)),(@(109.444,25.9269,15.25)),
+ (@(109.444,25.9269,12.25)),(@(109.444,24.4269,12.25)),(@(109.444,24.4269,10.75)),(@(109.444,25.9269,10.75)))
+$real2AxV = @(0.0, 0.0, 1.0)                               # the fastener Zaxis (0,0,1), in-plane
+$real2Axes = @(); foreach ($i in 0..7) { $real2Axes += ,$real2AxV }
+$rReal2 = ConvertTo-LayoutXZ -Centers $real2Ctr -Axes $real2Axes -AxisX 'X' -AxisZ 'Z' -Margin 0.375 -DedupTol 0
+Assert-True "real2: normal = X panel -> plane frame from points" ($rReal2.Frame -eq 'plane' -and $rReal2.NormalSource -eq 'points')
+Assert-True "real2: default AxisX=X (the normal) auto-substituted -> Valid, all 8 kept" ($rReal2.Valid -and $rReal2.Count -eq 8)
+Assert-True "real2: coplanar (flatness ~ 0)" ($null -ne $rReal2.Flatness -and [double]$rReal2.Flatness -lt 1e-6)
+# true in-plane spans (Y=1.5, Z=6.0) preserved, in some axis order
+$sp = @([double]$rReal2.SpanX, [double]$rReal2.SpanZ) | Sort-Object
+Assert-True "real2: true spans 1.5 & 6.0 preserved (no distortion)" ((Approx $sp[0] 1.5 1e-2) -and (Approx $sp[1] 6.0 1e-2))
+
+# ----------------------------------------------------------------------------
+# CONDITIONING GATE: a selection that cannot define the panel plane FAILS LOUD
+# (Valid=$false) instead of silently distorting via the legacy global drop.
+# ----------------------------------------------------------------------------
+Write-Host "  -- conditioning gate (fail loud, no silent distortion) --" -ForegroundColor White
+
+# a single COLUMN of the real panel (3 holes sharing (Y,Z), differ only in X) is
+# collinear -> best-fit null -> with -Axes (plane requested) it must NOT silently
+# fall back; it must return Valid=$false with a collinear/line message.
+$colCtr = @( (@(107.381,22.9859,23.6053)), (@(106.131,22.9859,23.6053)), (@(104.881,22.9859,23.6053)) )
+$colAx  = @( (@(1.0,0.0,0.0)), (@(1.0,0.0,0.0)), (@(1.0,0.0,0.0)) )
+$rCol = ConvertTo-LayoutXZ -Centers $colCtr -Axes $colAx -AxisX 'X' -AxisZ 'Z' -Margin 0.375 -DedupTol 0
+Assert-True "gate: collinear column -> Valid=false (no silent global fallback)" (-not $rCol.Valid)
+Assert-True "gate: collinear column -> message names line/collinear" ((($rCol.Errors) -join ' ') -match '(?i)collinear|line')
+Assert-True "gate: collinear column -> Frame plane, NormalSource none" ($rCol.Frame -eq 'plane' -and $rCol.NormalSource -eq 'none')
+
+# '3->2' REPRODUCED-then-BLOCKED: 3 real holes collinear along the YZ diagonal.
+# Old behaviour merged the middle one (global 1/sqrt2 shrink). These 3 share X=104.881
+# (a row in the X=const plane) and the fastener axis (1,0,0) is PERPENDICULAR to that
+# row, so the axis-fallback legitimately lays them out as a valid row of 3 at TRUE
+# spacing -- no 3->2 merge (the old compression bug is gone; distances 2.0 & 1.75 > tol).
+$diagCtr = @( (@(104.881,22.9859,23.6053)), (@(104.881,24.4001,25.0196)), (@(104.881,25.6376,26.257)) )
+$diagAx  = @( (@(1.0,0.0,0.0)), (@(1.0,0.0,0.0)), (@(1.0,0.0,0.0)) )
+$rDiag = ConvertTo-LayoutXZ -Centers $diagCtr -Axes $diagAx -AxisX 'X' -AxisZ 'Z' -Margin 0.375 -DedupTol 1.0
+Assert-True "gate: 3 collinear row (axis perp) -> valid row of 3, NO 3->2 merge" ($rDiag.Valid -and $rDiag.Count -eq 3)
+# add ONE off-line helper -> now spans 2D -> Valid, all 4 kept, no merge.
+# (unary-comma append: PS 5.1 $a + @(@(x,y,z)) FLATTENS the inner 3-array to scalars)
+$diag4Ctr = $diagCtr + (,@(107.381,24.4001,25.0196))
+$diag4Ax  = $diagAx  + (,@(1.0,0.0,0.0))
+$rDiag4 = ConvertTo-LayoutXZ -Centers $diag4Ctr -Axes $diag4Ax -AxisX 'X' -AxisZ 'Z' -Margin 0.375 -DedupTol 0
+Assert-True "gate: +1 off-line helper -> Valid, all 4 kept (2D restored)" ($rDiag4.Valid -and $rDiag4.Count -eq 4 -and $rDiag4.Frame -eq 'plane')
+
+# ----------------------------------------------------------------------------
+# AXIS-FALLBACK GUARD: the axis is a valid normal only if the points have ~zero
+# spread along it. In-plane axis -> rejected; perpendicular-to-row axis -> allowed.
+# ----------------------------------------------------------------------------
+Write-Host "  -- axis-fallback guard --" -ForegroundColor White
+
+# 3 collinear points along X, axis ALSO (1,0,0) -> axis lies along the spread ->
+# variance-along-axis = 1.0 -> REJECT (would collapse the row).
+$rowX = @( (@(0.0,0.0,0.0)), (@(1.0,0.0,0.0)), (@(2.0,0.0,0.0)) )
+$axInPlane = @( (@(1.0,0.0,0.0)), (@(1.0,0.0,0.0)), (@(1.0,0.0,0.0)) )
+$frInPlane = Get-FastenerPlaneFrame -Centers $rowX -Axes $axInPlane -AxisX 'Y' -AxisZ 'Z'
+Assert-True "guard: axis along the row spread -> axis-rejected, invalid" (-not $frInPlane.Valid -and $frInPlane.NormalSource -eq 'axis-rejected')
+
+# same collinear row, axis (0,1,0) PERPENDICULAR to it -> variance-along-axis 0 ->
+# legitimate single-row fallback stays VALID (NormalSource='axis').
+$axPerp = @( (@(0.0,1.0,0.0)), (@(0.0,1.0,0.0)), (@(0.0,1.0,0.0)) )
+$frPerp = Get-FastenerPlaneFrame -Centers $rowX -Axes $axPerp -AxisX 'X' -AxisZ 'Z'
+Assert-True "guard: axis perpendicular to the row -> axis-fallback stays valid" ($frPerp.Valid -and $frPerp.NormalSource -eq 'axis')
+
+# ----------------------------------------------------------------------------
+# NON-COPLANAR GATE: holes spanning two faces -> Flatness high -> Valid=false.
+# ----------------------------------------------------------------------------
+$twoFace = @( (@(0.0,0.0,0.0)), (@(2.0,0.0,0.0)), (@(0.0,2.0,0.0)), (@(1.0,1.0,3.0)) )  # last point far off the Z=0 plane
+$twoFaceAx = @( (@(0.0,0.0,1.0)), (@(0.0,0.0,1.0)), (@(0.0,0.0,1.0)), (@(0.0,0.0,1.0)) )
+$rTwoFace = ConvertTo-LayoutXZ -Centers $twoFace -Axes $twoFaceAx -AxisX 'X' -AxisZ 'Y' -Margin 0.375 -DedupTol 0
+Assert-True "gate: non-coplanar selection -> Valid=false (two surfaces)" (-not $rTwoFace.Valid)
+Assert-True "gate: non-coplanar -> message names coplanar/surface" ((($rTwoFace.Errors) -join ' ') -match '(?i)coplanar|surface')
+
+# ----------------------------------------------------------------------------
 # Integration: fastener Points feed Get-CustomPointsGeometry unchanged
 # ----------------------------------------------------------------------------
 Write-Host "  -- integration with Get-CustomPointsGeometry --" -ForegroundColor White

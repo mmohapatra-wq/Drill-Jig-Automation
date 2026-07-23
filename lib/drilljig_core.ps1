@@ -102,6 +102,78 @@ function global:Resolve-SlotDepthInput {
     return $r
 }
 
+# Validate an operator-entered HOLE-TO-EDGE MARGIN (inches) -- the wall from a border
+# hole's EDGE to the nearest part edge (user 2026-07-23: an option for SMALLER edge
+# margins so a border hole can sit closer to the part edge, shrinking the plate in
+# tight jobs). The standard/default wall is one full hole DIAMETER; this lets the
+# operator dial it down. Rules (mirror Resolve-SlotDepthInput):
+#   * blank / whitespace / $null  -> Ok, Value = $Default (accept the default).
+#   * not a number                -> Error.
+#   * < 0                         -> Error (a negative wall = the bore runs off the
+#                                    part edge). 0 IS allowed = a border hole edge
+#                                    exactly on the part edge (tangent), which the
+#                                    orthogrid/custom geometry accepts.
+#   * otherwise                   -> Ok, Value = the number rounded to 4 dp.
+# Returns @{ Ok = [bool]; Value = [double]; Error = [string]|$null }.
+# MUST be `function global:` -- the GUI's edge-margin step calls it from a TextBox
+# TextChanged .GetNewClosure() handler, and a closure module can ONLY resolve GLOBAL
+# functions (a plain script-scope function throws "not recognized" at keystroke time,
+# the "textbox error that pops up"). Same reason Resolve-SlotDepthInput is global.
+function global:Resolve-EdgeMarginInput {
+    param([string]$Text, [double]$Default = 0.25)
+    $r = @{ Ok = $false; Value = [double]$Default; Error = $null }
+    if ($null -eq $Text -or [string]::IsNullOrWhiteSpace($Text)) { $r.Ok = $true; $r.Value = [double]$Default; return $r }
+    $v = 0.0
+    if (-not [double]::TryParse($Text.Trim(), [ref]$v)) { $r.Error = ("Not a number: '{0}'" -f $Text.Trim()); return $r }
+    if ($v -lt 0) { $r.Error = 'Edge margin must be >= 0 (0 = a border hole edge on the part edge).'; return $r }
+    $r.Ok = $true; $r.Value = [math]::Round($v, 4)
+    return $r
+}
+
+# Normalize an operator-entered / flag CHIP-RELIEF SLOT DIRECTION to 'X' or 'Z' -- the
+# removal-path axis Get-RowSlots groups holes into rows along (user 2026-07-23: an option
+# for which way the slots run when the hole layout was IMPORTED from a fastener pattern;
+# an imported pattern has no operator-laid primary axis, unlike an orthogrid/custom grid).
+# 'X' (default) = slots run along X, holes grouped into rows by Z; 'Z' = the swap. The
+# STAGE-4 pattern-direction datum is picked from the DERIVED CrossAxis, so threading this
+# through Get-RowSlots -RowAxis is sufficient -- both directions are fully supported
+# downstream (guide planes + pattern datum auto-adapt). Rules (mirror the resolvers above,
+# NEVER throws): blank / whitespace / $null / anything-not-X/Z -> $Default (a stray typo
+# falls back to the default rather than erroring); a trimmed 'Z'/'z' -> 'Z'; 'X'/'x' -> 'X'.
+# Returns the 1-char axis string ('X' or 'Z'). `function global:` for the same closure-
+# resolution reason as the other Resolve-* helpers (a GUI .GetNewClosure() handler may call it).
+function global:Resolve-SlotRowAxis {
+    param([string]$Text, [string]$Default = 'X')
+    $d = if (("$Default").Trim().ToUpper() -eq 'Z') { 'Z' } else { 'X' }
+    if ($null -eq $Text) { return $d }
+    $t = ("$Text").Trim().ToUpper()
+    if ($t -eq '')  { return $d }
+    if ($t -eq 'Z') { return 'Z' }
+    if ($t -eq 'X') { return 'X' }
+    return $d
+}
+
+# Resolve the EFFECTIVE hole-to-edge margin (the required wall) to hand to
+# Get-OrthogridGeometry / Get-CustomPointsGeometry / Get-IndexRelativeCustomGeometry
+# as -EdgeMargin, given the operator's chosen value + the drilled hole diameter. PURE.
+#   * HoleDia <= 0 (dia not known)    -> -1.0 = the LEGACY one-radius rule (the geometry
+#                                        functions' -EdgeMargin sentinel), so the flow
+#                                        behaves exactly as before the dia is resolved.
+#   * ChosenMargin is a number >= 0   -> that value (the operator dialed a smaller/other
+#                                        wall in the edge-margin step).
+#   * ChosenMargin is $null / bad     -> HoleDia = one full hole diameter (the standard
+#                                        default, user 2026-07-21). So a caller that never
+#                                        sets a chosen margin gets byte-identical behaviour.
+# `function global:` for the same closure-resolution reason as above (the inline layout
+# editors call it from .GetNewClosure() recompute blocks).
+function global:Get-EffectiveEdgeMargin {
+    param($ChosenMargin, [double]$HoleDia)
+    if ($HoleDia -le 0) { return -1.0 }
+    $m = 0.0
+    if ($null -ne $ChosenMargin -and [double]::TryParse([string]$ChosenMargin, [ref]$m) -and $m -ge 0) { return [double]$m }
+    return [double]$HoleDia
+}
+
 # Pull the machinist-fraction label ("3/4", "1 3/8") for OD, ID or Lg out of an
 # EasyName "<tag> | OD <od> x ID <id> x <len> Lg"; falls back to $Fallback.
 # The 'ID' branch (added for the ID-first pick flow) reads the middle "x ID <id> x"
@@ -250,6 +322,137 @@ function Group-CatalogByID {
         }
     }
     return ,@($out)
+}
+
+# ============================================================================
+# OD-FIRST (METAL removable-bushing) PICK (user 2026-07-22): for METAL parts the
+# decision tree resolves to "removable bushings" filtered by OD (metal->PFD = 3/4 OD;
+# metal->Hand Drill = 3/4 OD + 1/2 OD). For those leaves the technician does NOT care
+# about the bore ID -- the drilled jig hole IS the removable bushing's OD, and only
+# 1/2" or 3/4" ODs are on offer. So the metal path DISPLAYS THE OD (never the ID),
+# skips the ID question entirely, then asks the standardized length (which sets the
+# plate thickness). The 3D-print SLEEVE path is unchanged (ID-first).
+# The two PURE helpers below drive that branch and are mirrored into jiginator.cmd /
+# jiginator.ps1 (which dot-source no lib). global: so the GUI closures resolve them.
+# ============================================================================
+
+# Is this catalog spec the METAL removable-bushing (OD-first) path? TRUE when the spec
+# carries an OD-column filter -- Get-CatalogSpec emits an OD filter ONLY for the metal
+# "3/4 OD"/"1/2 OD removable" leaves; the 3D-print sleeve leaves filter on ID. So the
+# presence of an OD filter is the exact, robust discriminator (no label re-parsing).
+# Pure. Safe on $null / filter-less specs (returns $false).
+function global:Test-OdFirstSpec {
+    param($Spec)
+    if ($null -eq $Spec -or $null -eq $Spec.Filters) { return $false }
+    foreach ($f in @($Spec.Filters)) {
+        if ($null -ne $f -and ([string]$f.Column).ToUpper() -eq 'OD') { return $true }
+    }
+    return $false
+}
+
+# Distinct OD groups from raw catalog rows, ascending -- the OD-first analog of
+# Get-IdOdOptions. Each -> @{ OD; ODLabel; Rows = @(all SKU rows at that OD) }. Rows
+# span every ID/length at that OD; sorted (Length, ID, PartNumber) for a deterministic
+# order. Pure. global: so a GUI OnPick .GetNewClosure() can call it.
+function global:Get-OdGroups {
+    param([array]$Rows)
+    $byOd = @{}
+    if ($null -ne $Rows) {
+        foreach ($r in @($Rows)) {
+            $key = ('{0:0.######}' -f [double]$r.OD)
+            if (-not $byOd.ContainsKey($key)) {
+                $odLabel = Get-FracLabel $r.EasyName 'OD' ([string]$r.OD)
+                $byOd[$key] = [pscustomobject]@{ OD = [double]$r.OD; ODLabel = [string]$odLabel; Rows = @() }
+            }
+            $byOd[$key].Rows += @($r)
+        }
+    }
+    $out = @($byOd.Values | Sort-Object { [double]$_.OD })
+    foreach ($o in $out) { $o.Rows = @($o.Rows | Sort-Object { [double]$_.Length }, { [double]$_.ID }, PartNumber) }
+    return ,@($out)
+}
+
+# Resolve the final pick from (chosen OD group, chosen length) for the OD-FIRST metal
+# path -- the OD analog of Resolve-BushingPickRow. The ID is left UNSPECIFIED (the metal
+# operator did not choose one; the removable bushing's OD is the whole point). If an
+# exact-length SKU exists at this OD, borrow its EasyName tag / PartNumber; otherwise
+# synthesize. CRITICAL: .OD is the (real) drilled hole diameter; .Length is ALWAYS the
+# chosen double (drives the STAGE-2 SIDE offset = plate thickness); .ID = '(any)'. Pure.
+# global: so the GUI's OD-card OnPick / "Use this length" closures resolve it.
+function global:Resolve-OdBushingPick {
+    param($OdGroup, [double]$Length, [string]$LenLabel)
+    $tag = 'Bushing'
+    if (@($OdGroup.Rows).Count -gt 0 -and $OdGroup.Rows[0].EasyName) {
+        $tag = ($OdGroup.Rows[0].EasyName -split '\|')[0].Trim()
+    }
+    # Prefer a real SKU at the chosen (OD, length) for a truthful PartNumber; else '(any ID)'.
+    $exact = @($OdGroup.Rows | Where-Object { [math]::Abs([double]$_.Length - $Length) -lt 1e-6 } | Select-Object -First 1)
+    $pn = if ($exact.Count -gt 0) { [string]$exact[0].PartNumber } else { '(ID unspecified)' }
+    return [pscustomobject]@{
+        EasyName   = ("{0} | OD {1} x ID (any) x {2} Lg" -f $tag, $OdGroup.ODLabel, $LenLabel)
+        OD         = [double]$OdGroup.OD
+        ID         = '(any)'
+        Length     = [double]$Length
+        PartNumber = $pn
+    }
+}
+
+# ============================================================================
+# CUSTOM HOLE OD (user 2026-07-23): let the operator type an ARBITRARY hole
+# diameter at the hole-diameter level of EITHER chain (metal removable OD list
+# OR 3D-print sleeve ID list) instead of only catalog ODs. There is no catalog
+# SKU behind a typed OD, so nothing can auto-check it -- the caller shows a bold
+# warning that the operator MUST verify a real drill bushing / bushing sleeve
+# exists at that OD before machining. The length menu still runs afterward (it
+# sets the plate thickness / SIDE plane). These two PURE helpers drive that
+# branch and are mirrored into jiginator.cmd / jiginator.ps1 (which dot-source
+# no lib). global: so the GUI's textbox .GetNewClosure() handlers resolve them.
+# ============================================================================
+
+# Validate an operator-typed CUSTOM hole OD (inches). Mirrors Resolve-BushingLengthInput
+# (decimal "0.6" / simple fraction "3/8" / mixed "1 3/8"; reject NaN/Inf and <= 0), with
+# ONE deliberate difference: BLANK / $null is an ERROR, not an accepted default -- there is
+# no sensible default hole diameter (a length can fall back to the recommendation, an OD
+# cannot). Returns @{ Ok = [bool]; Value = [double]; Error = [string]|$null }. `function
+# global:` for the same reason as Resolve-BushingLengthInput (called from a GUI TextBox
+# TextChanged .GetNewClosure(), which resolves GLOBAL functions only).
+function global:Resolve-CustomOdInput {
+    param([string]$Text)
+    $r = @{ Ok = $false; Value = 0.0; Error = $null }
+    if ($null -eq $Text -or [string]::IsNullOrWhiteSpace($Text)) { $r.Error = 'Enter a hole diameter.'; return $r }
+    $t = $Text.Trim()
+    $v = $null
+    # mixed number: "<whole> <num>/<den>"
+    if ($t -match '^\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s*$') {
+        $den = [double]$matches[3]
+        if ($den -ne 0) { $v = [double]$matches[1] + ([double]$matches[2] / $den) }
+    } else {
+        $v = ConvertTo-Decimal $t
+    }
+    if ($null -eq $v) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ([double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $r.Error = ("Not a number: '{0}'" -f $t); return $r }
+    if ($v -le 0) { $r.Error = 'Hole diameter must be greater than 0.'; return $r }
+    $r.Ok = $true; $r.Value = [math]::Round([double]$v, 4)
+    return $r
+}
+
+# Build the pick object for a typed custom OD + chosen length. The OD analog of
+# Resolve-OdBushingPick / Resolve-BushingPickRow, but NO catalog row is consulted -- the
+# operator typed a diameter the catalog does not necessarily carry. .OD is the (typed)
+# drilled hole; .Length is ALWAYS the chosen double (-> STAGE 2 SIDE offset = plate
+# thickness); .ID = '(custom)'; PartNumber flags that the bushing must be verified. The
+# EasyName format "<tag> | OD <od> x ID (custom) x <len> Lg" keeps Get-FracLabel's OD/ID/Lg
+# parse (used by the GUI schematic) working. Pure. global: so the GUI closures resolve it.
+function global:Resolve-CustomOdPick {
+    param([double]$OD, [double]$Length, [string]$LenLabel, [string]$OdLabel = $null)
+    $odLbl = if ([string]::IsNullOrWhiteSpace($OdLabel)) { ('{0:0.###}' -f [double]$OD) } else { [string]$OdLabel }
+    return [pscustomobject]@{
+        EasyName   = ("Bushing | OD {0} x ID (custom) x {1} Lg" -f $odLbl, $LenLabel)
+        OD         = [double]$OD
+        ID         = '(custom)'
+        Length     = [double]$Length
+        PartNumber = '(verify bushing exists)'
+    }
 }
 
 # ============================================================================
@@ -1040,7 +1243,11 @@ function Invoke-VerifiedSeedCut {
         Write-Host "  MANUAL STEP - draw the rectangle over $RowLabel's holes:" -ForegroundColor Magenta
         Write-Host ("    target: {0:0.###} long (along {1}) x {2:0.###} wide (along {3}), centered on {3}~{4:0.###}" -f `
             $DrawInfo.SlotLen, $DrawInfo.RowAxis, $DrawInfo.SlotWidth, $DrawInfo.CrossAxis, $DrawInfo.CrossCoord) -ForegroundColor White
-        if ($DrawInfo.HasPlanes) { Write-Host "    Snap the rectangle edges to the visible slot-edge planes." -ForegroundColor White }
+        if ($DrawInfo.HasPlanes) {
+            Write-Host "    To snap the slot in place: hold CTRL + ALT, then click the two planes spanning" -ForegroundColor White
+            Write-Host "    across the LENGTH of the part (X direction) and the RIGHT-SIDE EDGE of the jig." -ForegroundColor White
+            Write-Host "    Dotted blue lines should form the rectangle; then snap each rectangle corner to it." -ForegroundColor White
+        }
         Write-Host "    Click one corner then the opposite corner (ONE closed rectangle). Esc drops the tool." -ForegroundColor White
         Write-Host "    Leave the rectangle drawn + sketch OPEN, then press ENTER here." -ForegroundColor Yellow
         Read-Host

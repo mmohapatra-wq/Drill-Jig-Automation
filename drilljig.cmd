@@ -83,6 +83,82 @@ trap {
 
 $dataDir = Join-Path $ScriptDir 'data'
 
+# CUSTOM HOLE OD (user 2026-07-23): prompt for an ARBITRARY hole diameter (not limited to
+# the catalog), print a BOLD warning that a real drill bushing / bushing sleeve must be
+# verified (nothing in the catalog backs a typed OD), then run the standard length menu
+# (recommended from the typed OD). Returns the synthesized pick (Resolve-CustomOdPick) or
+# $null on cancel. Shared by BOTH the OD-first (metal) and ID-first (sleeve) menus, so the
+# custom option is reachable from the hole-diameter level of either chain.
+function Invoke-CustomOdPick {
+    while ($true) {
+        # --- enter the custom OD ---
+        Write-Host ""
+        Write-Host "  Custom hole OD (type any diameter -- NOT limited to the catalog):" -ForegroundColor Cyan
+        $odVal = $null; $odLabel = $null
+        while ($true) {
+            $raw = Read-Host "  Enter hole diameter in inches (e.g. 0.6, 3/8, 1 3/8; Q to cancel)"
+            if ($raw -match '^[Qq]$') { return $null }
+            $res = Resolve-CustomOdInput -Text $raw
+            if ($res.Ok) { $odVal = [double]$res.Value; $odLabel = ('{0:0.###}' -f $odVal); break }
+            Write-Host "  $($res.Error)" -ForegroundColor Yellow
+        }
+        # --- bold warning: nothing in the catalog backs a typed OD ---
+        Write-Host ""
+        Write-Host ("  ** WARNING: custom hole OD {0}`" has NO catalog bushing behind it.  **" -f $odLabel) -ForegroundColor Yellow
+        Write-Host   "  ** Verify a drill bushing / bushing sleeve at this OD actually       **" -ForegroundColor Yellow
+        Write-Host   "  ** EXISTS before machining -- double-check against your supplier.     **" -ForegroundColor Yellow
+
+        # --- standard length menu (recommended from the typed OD) ---
+        $backToOd = $false
+        while (-not $backToOd) {
+            $lenOpt = Get-BushingLengthOptions -Id $odVal
+            $opts   = @($lenOpt.Options)
+            $preIdx = [int]$lenOpt.PreselectIndex
+            Write-Host ""
+            Write-Host ("  Select length (custom OD {0}`"):" -f $odLabel) -ForegroundColor Cyan
+            for ($i = 0; $i -lt $opts.Count; $i++) {
+                $o = $opts[$i]
+                $tag = if ($i -eq $preIdx) { "   <- recommended" } elseif ($o.IsCustom) { "   (type any length)" } else { '' }
+                $lbl = if ($o.IsCustom) { 'Custom' } else { ("{0}`" Lg" -f $o.Label) }
+                Write-Host ("    {0,3}) {1,-10}{2}" -f ($i + 1), $lbl, $tag) -ForegroundColor White
+            }
+            $recNote = if ($preIdx -ge 0) { "ENTER = recommended ($($opts[$preIdx].Label)`"), " } else { '' }
+            Write-Host ""
+            $chosenLen = $null; $chosenLabel = $null
+            while ($true) {
+                $raw = Read-Host "  Pick length (1-$($opts.Count), ${recNote}B to change OD, or Q to skip)"
+                if ($raw -match '^[Qq]$') { return $null }
+                if ($raw -match '^[Bb]$') { $backToOd = $true; break }
+                if ([string]::IsNullOrWhiteSpace($raw) -and $preIdx -ge 0) {
+                    $chosenLen = [double]$opts[$preIdx].Value; $chosenLabel = $opts[$preIdx].Label; break
+                }
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $opts.Count) {
+                    $o = $opts[$n - 1]
+                    if ($o.IsCustom) {
+                        $def = if ($preIdx -ge 0) { [double]$opts[$preIdx].Value } else { 0.5 }
+                        while ($true) {
+                            $ctxt = Read-Host "    Enter custom length in inches (e.g. 0.9, 3/8, 1 3/8; Q to cancel)"
+                            if ($ctxt -match '^[Qq]$') { break }
+                            $lres = Resolve-BushingLengthInput -Text $ctxt -Default $def
+                            if ($lres.Ok) { $chosenLen = [double]$lres.Value; $chosenLabel = ('{0:0.###}' -f $chosenLen); break }
+                            Write-Host "    $($lres.Error)" -ForegroundColor Yellow
+                        }
+                        if ($null -ne $chosenLen) { break }
+                        continue
+                    }
+                    $chosenLen = [double]$o.Value; $chosenLabel = $o.Label; break
+                }
+                Write-Host "  Enter a number between 1 and $($opts.Count) (or ENTER / B / Q)." -ForegroundColor Yellow
+            }
+            if ($backToOd) { break }          # re-enter the OD
+            if ($null -eq $chosenLen) { continue }
+            Write-Host ("  Custom hole diameter = {0}`"; length = {1}`" (verify bushing exists)." -f $odLabel, $chosenLabel) -ForegroundColor Green
+            return (Resolve-CustomOdPick -OD $odVal -Length $chosenLen -LenLabel $chosenLabel -OdLabel $odLabel)
+        }
+    }
+}
+
 # Load + filter the catalog and let the user pick one row.
 # Returns the chosen row (PSCustomObject) or $null on quit / no matches.
 function Invoke-BushingPick {
@@ -111,6 +187,98 @@ function Invoke-BushingPick {
         return $null
     }
 
+    # OD-FIRST metal path (user 2026-07-22): for METAL -> PFD / Hand Drill the tree gives a
+    # removable-bushing spec filtered by OD (only 1/2" and 3/4" ODs). The technician does
+    # not care about the bore ID -- the drilled jig hole IS the removable bushing's OD --
+    # so DISPLAY THE OD, skip the ID question, then ask the standardized length only. The
+    # length is recommended from the OD value (0.5 OD -> 1/2" Lg, 0.75 OD -> 3/4" Lg). The
+    # 3D-print SLEEVE path (ID-filtered spec) falls through to the ID-first flow below.
+    if (Test-OdFirstSpec -Spec $Spec) {
+        $odGroups = Get-OdGroups -Rows $rows
+        while ($true) {
+            # --- stage 1: distinct ODs (= the drilled hole), ascending; plus a trailing
+            #     "Custom hole OD" entry so the operator can type any diameter. ---
+            Write-Host ""
+            Write-Host "  Select OD (removable bushing = the drilled hole diameter):" -ForegroundColor Cyan
+            for ($i = 0; $i -lt $odGroups.Count; $i++) {
+                $og = $odGroups[$i]
+                Write-Host ("    {0,3}) OD {1,-7}   (-> hole {2:0.###}`")" -f ($i + 1), $og.ODLabel, $og.OD) -ForegroundColor White
+            }
+            $customIdx = $odGroups.Count + 1
+            Write-Host ("    {0,3}) Custom hole OD... (type any diameter)" -f $customIdx) -ForegroundColor Yellow
+            Write-Host ""
+
+            $odPick = $null
+            while ($true) {
+                $raw = Read-Host "  Pick OD (1-$customIdx, or Q to skip)"
+                if ($raw -match '^[Qq]$') { return $null }
+                $n = 0
+                if ([int]::TryParse($raw, [ref]$n) -and $n -eq $customIdx) {
+                    $cpick = Invoke-CustomOdPick
+                    if ($null -ne $cpick) { return $cpick }
+                    break   # custom cancelled -> re-show the OD menu
+                }
+                if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $odGroups.Count) {
+                    $odPick = $odGroups[$n - 1]; break
+                }
+                Write-Host "  Enter a number between 1 and $customIdx." -ForegroundColor Yellow
+            }
+            if ($null -eq $odPick) { continue }   # custom was cancelled; re-show the OD menu
+
+            # --- stage 2: STANDARDIZED length menu {1/2, 3/4, 1} + Custom, OD-recommended ---
+            $backToOd = $false
+            while (-not $backToOd) {
+                $lenOpt = Get-BushingLengthOptions -Id $odPick.OD   # recommend length from the OD value
+                $opts   = @($lenOpt.Options)
+                $preIdx = [int]$lenOpt.PreselectIndex
+                Write-Host ""
+                Write-Host ("  Select length (OD {0}):" -f $odPick.ODLabel) -ForegroundColor Cyan
+                for ($i = 0; $i -lt $opts.Count; $i++) {
+                    $o = $opts[$i]
+                    $tag = if ($i -eq $preIdx) { "   <- recommended for OD $($odPick.ODLabel)" } elseif ($o.IsCustom) { "   (type any length)" } else { '' }
+                    $lbl = if ($o.IsCustom) { 'Custom' } else { ("{0}`" Lg" -f $o.Label) }
+                    Write-Host ("    {0,3}) {1,-10}{2}" -f ($i + 1), $lbl, $tag) -ForegroundColor White
+                }
+                $recNote = if ($preIdx -ge 0) { "ENTER = recommended ($($opts[$preIdx].Label)`"), " } else { '' }
+                Write-Host ""
+
+                $chosenLen = $null; $chosenLabel = $null
+                while ($true) {
+                    $raw = Read-Host "  Pick length (1-$($opts.Count), ${recNote}B to change OD, or Q to skip)"
+                    if ($raw -match '^[Qq]$') { return $null }
+                    if ($raw -match '^[Bb]$') { $backToOd = $true; break }
+                    if ([string]::IsNullOrWhiteSpace($raw) -and $preIdx -ge 0) {
+                        $chosenLen = [double]$opts[$preIdx].Value; $chosenLabel = $opts[$preIdx].Label; break
+                    }
+                    $n = 0
+                    if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $opts.Count) {
+                        $o = $opts[$n - 1]
+                        if ($o.IsCustom) {
+                            $def = if ($preIdx -ge 0) { [double]$opts[$preIdx].Value } else { 0.5 }
+                            while ($true) {
+                                $ctxt = Read-Host "    Enter custom length in inches (e.g. 0.9, 3/8, 1 3/8; Q to cancel)"
+                                if ($ctxt -match '^[Qq]$') { break }
+                                $res = Resolve-BushingLengthInput -Text $ctxt -Default $def
+                                if ($res.Ok) { $chosenLen = [double]$res.Value; $chosenLabel = ('{0:0.###}' -f $chosenLen); break }
+                                Write-Host "    $($res.Error)" -ForegroundColor Yellow
+                            }
+                            if ($null -ne $chosenLen) { break }
+                            continue   # custom cancelled -> re-show the length menu
+                        }
+                        $chosenLen = [double]$o.Value; $chosenLabel = $o.Label; break
+                    }
+                    Write-Host "  Enter a number between 1 and $($opts.Count) (or ENTER / B / Q)." -ForegroundColor Yellow
+                }
+                if ($backToOd) { break }          # back to stage 1 (change OD)
+                if ($null -eq $chosenLen) { continue }
+
+                # OD is chosen (= the hole); no ID stage, no OD tie-break. Resolve + return.
+                Write-Host ("  Hole diameter = {0:0.###}`" (OD {1}); length = {2}`" (ID unspecified)." -f $odPick.OD, $odPick.ODLabel, $chosenLabel) -ForegroundColor Green
+                return (Resolve-OdBushingPick -OdGroup $odPick -Length $chosenLen -LenLabel $chosenLabel)
+            }
+        }
+    }
+
     # ID-FIRST staged pick (user 2026-07-21): ID first, then a STANDARDIZED length menu
     # {1/2, 3/4, 1} + Custom with a length RECOMMENDED from the chosen ID (a 1/2" ID
     # sleeve is normally 1/2" long, a 3/4" ID 3/4" long -- technician rule of thumb).
@@ -122,7 +290,8 @@ function Invoke-BushingPick {
 
     while ($true) {
 
-        # --- stage 1: distinct IDs (bore size), ascending ---
+        # --- stage 1: distinct IDs (bore size), ascending; plus a trailing "Custom hole
+        #     OD" entry so the operator can type any diameter instead of a catalog bore. ---
         # The resolved-hole preview lives on the ID card now (OD no longer keys on length).
         Write-Host ""
         Write-Host "  Select ID (bore size):" -ForegroundColor Cyan
@@ -133,18 +302,26 @@ function Invoke-BushingPick {
             $bit = if ($g.Lengths[0].ODs[0].Rows[0].PSObject.Properties.Name -contains 'DrillBitSize' -and $g.Lengths[0].ODs[0].Rows[0].DrillBitSize) { "  ($($g.Lengths[0].ODs[0].Rows[0].DrillBitSize))" } else { '' }
             Write-Host ("    {0,3}) ID {1,-7}{2}   ({3})" -f ($i + 1), $g.IDLabel, $bit, $hole) -ForegroundColor White
         }
+        $customIdx = $byId.Count + 1
+        Write-Host ("    {0,3}) Custom hole OD... (type any diameter)" -f $customIdx) -ForegroundColor Yellow
         Write-Host ""
 
         $idPick = $null
         while ($true) {
-            $raw = Read-Host "  Pick ID (1-$($byId.Count), or Q to skip)"
+            $raw = Read-Host "  Pick ID (1-$customIdx, or Q to skip)"
             if ($raw -match '^[Qq]$') { return $null }
             $n = 0
+            if ([int]::TryParse($raw, [ref]$n) -and $n -eq $customIdx) {
+                $cpick = Invoke-CustomOdPick
+                if ($null -ne $cpick) { return $cpick }
+                break   # custom cancelled -> re-show the ID menu
+            }
             if ([int]::TryParse($raw, [ref]$n) -and $n -ge 1 -and $n -le $byId.Count) {
                 $idPick = $byId[$n - 1]; break
             }
-            Write-Host "  Enter a number between 1 and $($byId.Count)." -ForegroundColor Yellow
+            Write-Host "  Enter a number between 1 and $customIdx." -ForegroundColor Yellow
         }
+        if ($null -eq $idPick) { continue }   # custom was cancelled; re-show the ID menu
         $odOptions = Get-IdOdOptions -IdGroup $idPick
 
         # --- stage 2: STANDARDIZED length menu {1/2, 3/4, 1} + Custom, ID-recommended ---
@@ -482,8 +659,9 @@ function Get-FastenerLayoutRawPoints {
         # ASSEMBLY reads need the components SELECTED first (the buffer is the read
         # path); prompt, then hand off to the ONE shared reader used by fastenator.cmd.
         if ($fIsAsm) {
-            Write-Host ("  ASSEMBLY: {0}. SELECT the fastener components in Creo (Ctrl-click them)," -f $fName) -ForegroundColor Cyan
-            Write-Host "  then press ENTER here." -ForegroundColor Cyan
+            Write-Host ("  ASSEMBLY: {0}. SELECT the fastener components in Creo (Ctrl-click them)." -f $fName) -ForegroundColor Cyan
+            Write-Host "  Select ONE component per hole -- the BOLT SHANKS only, NOT their washers/nuts" -ForegroundColor Cyan
+            Write-Host "  (a bolt+washer+nut stack reads as 2-3 holes at the same spot). Then press ENTER." -ForegroundColor Cyan
             Read-Host "  Press ENTER once the fasteners are selected" | Out-Null
         } else {
             Write-Host ("  Reading fastener bores from PART: {0}" -f $fName) -ForegroundColor DarkGray
@@ -497,6 +675,13 @@ function Get-FastenerLayoutRawPoints {
         $centers = $read.Centers
         $readMethodLbl = $read.ReadMethod
         Write-Host ("  Read {0} fastener {1}." -f $centers.Count, $(if ($fIsAsm) { 'component location(s)' } else { 'bore center(s)' })) -ForegroundColor Green
+        # COUNT FEEDBACK: surface the selection accounting so a wrong count is visible.
+        if ($fIsAsm) {
+            Write-Host ("  Selection: {0} picked -> {1} location(s) read." -f $read.RawSelected, $centers.Count) -ForegroundColor DarkGray
+            if ($read.SkippedNoPath   -gt 0) { Write-Host ("    - skipped {0} pick(s) with no component (surface/edge? select whole instances)." -f $read.SkippedNoPath) -ForegroundColor Yellow }
+            if ($read.SkippedNoXform  -gt 0) { Write-Host ("    - skipped {0} component(s) whose location was unreadable." -f $read.SkippedNoXform) -ForegroundColor Yellow }
+            if ($read.MergedDuplicate -gt 0) { Write-Host ("    - merged {0} duplicate pick(s) of the same component." -f $read.MergedDuplicate) -ForegroundColor DarkGray }
+        }
 
         # axis mapping (user picks which model axes map to layout X / Z)
         function Read-Ax { param($P,$D) while ($true) { $a = Read-Host ("  $P (X/Y/Z, default $D)"); if ([string]::IsNullOrWhiteSpace($a)) { return $D }; $u=$a.Trim().ToUpper(); if (@('X','Y','Z') -contains $u) { return $u }; Write-Host "    Enter X, Y, or Z." -ForegroundColor Yellow } }
@@ -506,13 +691,29 @@ function Get-FastenerLayoutRawPoints {
         # the jig hole dia is not known yet (tree not walked) -> use a nominal margin;
         # the plate is RE-ANCHORED to the real jig hole dia after the tree.
         $mg = 0.25
-        $dt = if ($fIsAsm) { 1e-3 } else { $mg }
+        # ASSEMBLY: NO proximity merge (user 2026-07-23: "the amount picked = the amount
+        # of fasteners" -- one selected fastener is one hole). DedupTol=0 so distinct
+        # fasteners can NEVER be collapsed; the reader already removed exact same-instance
+        # re-picks by component path, and two genuinely-coincident holes surface via the
+        # collision check, not a silent merge. (PART mode keeps $mg to merge a bolt's
+        # several swept bore-cylinders.)
+        $dt = if ($fIsAsm) { 0.0 } else { $mg }
 
-        $layout = ConvertTo-LayoutXZ -Centers $centers -AxisX $axX -AxisZ $axZ -Margin $mg -DedupTol $dt
+        # -Axes = each fastener's own bore axis (parallel to $centers) => project onto
+        # the fastener PANEL plane so true hole spacing survives a tilted panel (the fix
+        # for "only some register" / "holes too close" on higher-level assemblies).
+        $fastAxes = if ($null -ne $read) { $read.Axes } else { $null }
+        $layout = ConvertTo-LayoutXZ -Centers $centers -Axes $fastAxes -AxisX $axX -AxisZ $axZ -Margin $mg -DedupTol $dt
         if (-not $layout.Valid) {
             Write-Host "  Could not build a valid layout:" -ForegroundColor Red
             foreach ($e in $layout.Errors) { Write-Host ("    - $e") -ForegroundColor Red }
+            Write-Host "  (Select at least 3 fasteners spanning the panel in 2 directions -- not all in one row/column; one flat panel at a time.)" -ForegroundColor Yellow
             return $null
+        }
+        if ($layout.Frame -eq 'plane') {
+            Write-Host ("  Projected onto the fastener PANEL plane (axis spread {0:0.##} deg)." -f [double]$layout.AxisSpreadDeg) -ForegroundColor DarkGray
+        } else {
+            Write-Host "  NOTE: fastener axes not readable -- used global-axis projection (may distort a tilted panel)." -ForegroundColor Yellow
         }
         $sane = Test-FastenerLayoutSane -Layout $layout
         if (-not $sane.Ok) {
@@ -816,6 +1017,37 @@ if ($pointMode -eq 'predefined') {
 }
 }   # end: point-source menu (only shown when no up-front fastener layout)
 Write-Host ""
+
+# ============================================================================
+# CHIP-RELIEF SLOT DIRECTION (X or Z) -- offered for an IMPORTED FASTENER layout
+# ============================================================================
+# STAGE 4 cuts one blind chip-relief slot per hole ROW. The removal-path DIRECTION
+# decides how holes group into rows: 'X' (default) = slots run along X (rows grouped by
+# Z); 'Z' = slots run along Z (rows grouped by X). Get-RowSlots -RowAxis already supports
+# both, and STAGE 4's pattern-direction datum is picked from the DERIVED CrossAxis, so
+# threading this one axis is enough -- the guide planes + pattern datum auto-adapt.
+# Orthogrid/custom layouts keep the 'X' default (the operator laid those out with X as the
+# natural row axis, so the direction is not re-asked); an IMPORTED FASTENER pattern comes
+# from an arbitrary source part with no operator-chosen primary axis, so the operator is
+# ASKED which way the slots should run (user 2026-07-23). --slot-dir X|Z pins it (skips
+# the prompt) for any mode / for scripted runs. Resolved here (once $pointMode is final)
+# and reused verbatim by STAGE 4 -- $slotRowAxis defaults to 'X' so every non-fastener
+# path is byte-identical to before.
+$slotRowAxis = 'X'
+$mSlotDir = [regex]::Match($ScriptArgs, '(?i)--slot-dir\s+([XZxz])')
+if ($mSlotDir.Success) {
+    $slotRowAxis = Resolve-SlotRowAxis -Text $mSlotDir.Groups[1].Value
+    Write-Host ("  Chip-relief slot direction = {0} (from --slot-dir): slots run along {0}." -f $slotRowAxis) -ForegroundColor DarkGray
+} elseif ($pointMode -eq 'fastener' -and $null -ne $orthoGeo) {
+    Write-Host "  The hole layout was imported from a fastener pattern. Chip-relief slots are cut" -ForegroundColor Cyan
+    Write-Host "  one per hole ROW -- choose which direction they run:" -ForegroundColor Cyan
+    Write-Host "    X = slots run along X (rows grouped by Z)   [default]" -ForegroundColor White
+    Write-Host "    Z = slots run along Z (rows grouped by X)" -ForegroundColor White
+    $sdRaw = Read-Host "  Slot direction - X (default) or Z (blank -> X)"
+    $slotRowAxis = Resolve-SlotRowAxis -Text $sdRaw
+    Write-Host ("  Chip-relief slot direction: {0}." -f $slotRowAxis) -ForegroundColor Green
+    Write-Host ""
+}
 
 # ============================================================================
 # INDEX-FIRST CHOICE (2026-07-15) -- pick the index hole UP FRONT (before Creo)
@@ -1452,8 +1684,11 @@ if ($null -ne $sketchPlaneId) {
         Invoke-Macro "select sketch plane (id $sketchPlaneId) + extrude + arm rectangle" $mkArm
 
         Write-Host ""
-        Write-Host "  In Creo (internal sketcher): click one corner of the rectangle, then" -ForegroundColor White
-        Write-Host "  the opposite corner. Size doesn't matter. Press Esc to finish the" -ForegroundColor White
+        Write-Host "  In Creo (internal sketcher): draw the plate rectangle." -ForegroundColor White
+        Write-Host "  To snap the second corner of the rectangle in the intersection point of the" -ForegroundColor White
+        Write-Host "  newly created planes, hold CTRL + ALT, and then select the 2 planes." -ForegroundColor White
+        Write-Host "  If done correctly, there should be dotted blue lines that form the rectangle" -ForegroundColor White
+        Write-Host "  shape. Then draw the rectangle from corner to corner. Press Esc to finish the" -ForegroundColor White
         Write-Host "  rectangle, then press ENTER here." -ForegroundColor White
         Read-Host
 
@@ -2198,7 +2433,10 @@ if (-not $doSlots) {
 
 if ($doSlots) {
     # --- rows from the SAME layout the holes came from (NO re-entry) ---
-    $slots = Get-RowSlots -Points $orthoGeo.Points -SlotWidth $holeDiaFinal -Width $orthoGeo.Width -Height $orthoGeo.Height -RowAxis 'X'
+    # $slotRowAxis (resolved up front): 'X' for orthogrid/custom, or the operator's X/Z
+    # choice for an imported fastener layout (--slot-dir pins it). CrossAxis + the pattern
+    # datum below derive from it, so a 'Z' choice flows through the whole slot build.
+    $slots = Get-RowSlots -Points $orthoGeo.Points -SlotWidth $holeDiaFinal -Width $orthoGeo.Width -Height $orthoGeo.Height -RowAxis $slotRowAxis
     if (-not $slots.Valid -or @($slots.Rows).Count -lt 1) {
         Write-Host "  The layout produced no valid slot rows -- skipping chip-relief slots." -ForegroundColor Yellow
         foreach ($er in @($slots.Errors)) { Write-Host "    - $er" -ForegroundColor Yellow }
@@ -2295,6 +2533,10 @@ if ($doSlots) {
                     $mkOpenR = (Get-SelectByIdMacro -FeatId $slotFaceId) + "~ Command ``ProCmdFtExtrude``;" + "~ Command ``ProCmdViewSketchView``;" + "~ Command ``ProCmdSketRectangle`` 1;"
                     try { $session.RunMacro($mkOpenR) } catch { Write-Host "    open error: $($_.Exception.Message)" -ForegroundColor Red; continue }
                     Write-Host ("    Draw this row's slot rectangle ({0:0.###} long x {1:0.###} wide), then press ENTER." -f $row.SlotLen, $slots.SlotWidth) -ForegroundColor Magenta
+                    if ($slotHasPlanes) {
+                        Write-Host "    To snap it: hold CTRL + ALT, click the two planes spanning the LENGTH of the part" -ForegroundColor White
+                        Write-Host "    (X direction) and the RIGHT-SIDE EDGE of the jig; dotted blue lines form the rectangle." -ForegroundColor White
+                    }
                     Read-Host
                     $stampR = $null; try { $stampR = $model.VersionStamp } catch {}
                     $chgR = $false

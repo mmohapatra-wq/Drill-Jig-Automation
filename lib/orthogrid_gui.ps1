@@ -687,7 +687,7 @@ function Show-CustomPointsDialog {
     $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::CenterScreen
     $form.MaximizeBox     = $false
     $form.MinimizeBox     = $false
-    $form.ClientSize      = New-Object System.Drawing.Size(620, 524)
+    $form.ClientSize      = New-Object System.Drawing.Size(620, 528)
 
     # --- Instructions -------------------------------------------------------
     $lblHelp = New-Object System.Windows.Forms.Label
@@ -841,16 +841,20 @@ function Show-CustomPointsDialog {
     # --- Live readout + error labels ----------------------------------------
     # 2 lines: the index-relative readout (Part .. | index @ (..) + N more = M | K slots)
     # is long enough to wrap, so a 1-line box clipped its second line.
+    # POSITION FIX (2026-07-22): the readout was at y=372 (full width, h40 -> 372-412),
+    # which OVERLAPPED the part-size row (rbExplicit + W/H boxes at y=364-386) -- the bold
+    # readout drew ON TOP of the "Specify part size" radio + W/H fields. Moved below the
+    # size row (which ends at y=386) so they never collide.
     $lblReadout = New-Object System.Windows.Forms.Label
-    $lblReadout.Location = New-Object System.Drawing.Point(12, 372)
+    $lblReadout.Location = New-Object System.Drawing.Point(12, 392)
     $lblReadout.Size     = New-Object System.Drawing.Size(596, 40)
     $lblReadout.Font     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($lblReadout)
 
     # 3 lines + word-wrap so a long / combined validation message is shown in full.
     $lblError = New-Object System.Windows.Forms.Label
-    $lblError.Location  = New-Object System.Drawing.Point(12, 416)
-    $lblError.Size      = New-Object System.Drawing.Size(596, 48)
+    $lblError.Location  = New-Object System.Drawing.Point(12, 436)
+    $lblError.Size      = New-Object System.Drawing.Size(596, 44)
     $lblError.ForeColor = [System.Drawing.Color]::Firebrick
     $form.Controls.Add($lblError)
 
@@ -858,13 +862,13 @@ function Show-CustomPointsDialog {
     $btnOk = New-Object System.Windows.Forms.Button
     $btnOk.Text     = 'OK'
     $btnOk.Size     = New-Object System.Drawing.Size(90, 28)
-    $btnOk.Location = New-Object System.Drawing.Point(420, 484)
+    $btnOk.Location = New-Object System.Drawing.Point(420, 488)
     $form.Controls.Add($btnOk)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text     = 'Cancel'
     $btnCancel.Size     = New-Object System.Drawing.Size(90, 28)
-    $btnCancel.Location = New-Object System.Drawing.Point(518, 484)
+    $btnCancel.Location = New-Object System.Drawing.Point(518, 488)
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($btnCancel)
     $form.CancelButton = $btnCancel

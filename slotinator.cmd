@@ -833,7 +833,9 @@ if ($go -notmatch '^[Yy]$') {
         Write-Host ("      corners: ({0:0.##},{1:0.##}) and ({2:0.##},{3:0.##}) in the X/Z plate frame." -f `
             $row.Corner0.X, $row.Corner0.Z, $row.Corner1.X, $row.Corner1.Z) -ForegroundColor White
         if ($createdPlaneIds.Count -gt 0) {
-            Write-Host "      snap the rectangle edges to the visible slot-edge planes." -ForegroundColor White
+            Write-Host "      To snap the slot in place: hold CTRL + ALT, then click the two planes spanning" -ForegroundColor White
+            Write-Host "      across the LENGTH of the part (X direction) and the RIGHT-SIDE EDGE of the jig." -ForegroundColor White
+            Write-Host "      Dotted blue lines should form the rectangle; then snap each rectangle corner to it." -ForegroundColor White
         }
         Write-Host "      Click one corner, then the opposite corner (ONE closed rectangle)." -ForegroundColor White
         Write-Host "      Then press Esc to drop the rectangle tool (leave the rectangle drawn)." -ForegroundColor White

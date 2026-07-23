@@ -65,6 +65,9 @@ Write-Host ""
 # shared read helpers (Get-Comp, Get-CylinderAxes, Get-CylinderAxisFromSurface,
 # Get-AllSurfaces, Read-CoordSysTransform, Get-EdgeArcCenter)
 . (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
+# pure projection math (Get-FastenerPlaneFrame) so section 6c can report the panel
+# plane derived from the fastener axes the same way the tool will.
+. (Join-Path $ScriptDir 'lib\fastener_layout.ps1')
 
 # ============================================
 # CONNECT (single session)
@@ -145,6 +148,7 @@ Rep ""
 # ============================================
 Rep "== [2] SELECTED-BORE (Get-CylinderAxisFromSurface over the selection buffer) ==" 'Cyan'
 $selCount = 0; $selCyl = 0
+$script:selBoreAxes = @()   # accumulate readable bore axes for the section-6b offset check
 try {
     $buf = ($session.CurrentSelectionBuffer()).Contents
     $selCount = @($buf).Count
@@ -157,6 +161,7 @@ try {
         try { $ax = Get-CylinderAxisFromSurface -Surf $si } catch {}
         if ($null -ne $ax) {
             $selCyl++
+            $script:selBoreAxes += [pscustomobject]@{ A = $ax.A; Radius = [double]$ax.Radius }
             if ($selCyl -le 6) { Rep ("  selected cylinder r={0:0.####} origin {1}" -f [double]$ax.Radius, (Fmt-Pt $ax.A)) 'Green' }
         }
     }
@@ -250,10 +255,11 @@ Rep ""
 # Select the fasteners first (whole component instances), then re-run.
 Rep "== [6] SELECTED COMPONENTS (Path.GetTransform(BottomUp).GetOrigin - the assembly read) ==" 'Cyan'
 $compXfOk = 0
+$script:compOrigins = @()   # kept BottomUp=$true origins (dedup by full path), for the checks below
 try {
     $buf6 = @(($session.CurrentSelectionBuffer()).Contents)
     Rep ("Selection buffer holds {0} item(s)." -f $buf6.Count)
-    $seen6 = @{}
+    $seen6 = @{}; $noPath6 = 0; $mergedPath6 = 0
     foreach ($sel in $buf6) {
         # raw selection string first (proves what got selected even if Path is null)
         $ss = ''
@@ -262,31 +268,187 @@ try {
         if ($ss -match ':([^<]+)<') { $pn = $matches[1] } elseif ($ss) { $pn = $ss }
         $path = $null
         try { $path = $sel.Path } catch {}
-        if ($null -eq $path) { Rep ("  selected item has NO component Path (not a component instance?)  {0}" -f $ss) 'Yellow'; continue }
-        # component id (dedup a component selected as several surfaces)
-        $cid = $null
-        try { $ids = $path.ComponentIds; if ($null -ne $ids -and $ids.Count -gt 0) { $cid = [int]$ids[$ids.Count - 1] } } catch {}
-        if ($null -ne $cid) { if ($seen6.ContainsKey($cid)) { continue }; $seen6[$cid] = $true }
+        if ($null -eq $path) { $noPath6++; Rep ("  selected item has NO component Path (not a component instance?)  {0}" -f $ss) 'Yellow'; continue }
+        # DEDUP by the FULL component path (root->leaf), matching Read-FastenerCentersFromModel.
+        # A leaf-only key would collapse distinct instances that share a leaf id in
+        # different subassemblies; the full path '1|5|7' vs '1|6|7' keeps them apart.
+        $key = $null
+        try { $ids = $path.ComponentIds; if ($null -ne $ids -and $ids.Count -gt 0) { $key = ($ids -join '|') } } catch {}
+        if ($null -ne $key) { if ($seen6.ContainsKey($key)) { $mergedPath6++; continue }; $seen6[$key] = $true }
         # LOCATION: report BOTH transform directions so the right one is obvious.
-        $oT = $null; $oF = $null
-        try { $oT = Get-Comp (($path.GetTransform($true)).GetOrigin()) } catch { Rep ("  id=$cid GetTransform(\$true) threw: $($_.Exception.Message)") 'Red' }
-        try { $oF = Get-Comp (($path.GetTransform($false)).GetOrigin()) } catch { Rep ("  id=$cid GetTransform(\$false) threw: $($_.Exception.Message)") 'Red' }
+        # AXES: read ALL THREE axes (GetX/GetY/GetZAxis) off the BottomUp=$true transform.
+        # The live GetZAxis read (1,0,0) LAY IN the plate plane (not the normal), so section
+        # 6c compares each of the three against the point-cloud best-fit normal to find a
+        # TRUE, selection-independent panel normal if one exists.
+        $oT = $null; $oF = $null; $zAxis = $null; $xAxis = $null; $yAxis = $null
+        try {
+            $xfT = $path.GetTransform($true)
+            $oT = Get-Comp $xfT.GetOrigin()
+            try { $zAxis = Get-Comp $xfT.GetZAxis() } catch { $zAxis = $null }
+            try { $xAxis = Get-Comp $xfT.GetXAxis() } catch { $xAxis = $null }
+            try { $yAxis = Get-Comp $xfT.GetYAxis() } catch { $yAxis = $null }
+        } catch { Rep ("  path=$key GetTransform(\$true) threw: $($_.Exception.Message)") 'Red' }
+        try { $oF = Get-Comp (($path.GetTransform($false)).GetOrigin()) } catch { Rep ("  path=$key GetTransform(\$false) threw: $($_.Exception.Message)") 'Red' }
         if ($null -ne $oT -or $null -ne $oF) {
             $compXfOk++
-            Rep ("  component id=$cid  BottomUp=`$true origin {0}  |  `$false origin {1}   {2}" -f (Fmt-Pt $oT), (Fmt-Pt $oF), $pn) 'Green'
-        } elseif ($null -ne $cid) { Rep ("  component id=$cid transform unreadable  {0}" -f $pn) 'Yellow' }
+            if ($null -ne $oT) { $script:compOrigins += [pscustomobject]@{ Key = $key; O = $oT; D = $zAxis; DX = $xAxis; DY = $yAxis; Pn = $pn } }
+            $axStr = if ($null -ne $zAxis) { Fmt-Pt $zAxis } else { '(axis unreadable)' }
+            Rep ("  path=$key  origin(`$true) {0}  |  origin(`$false) {1}  |  Zaxis {2}   {3}" -f (Fmt-Pt $oT), (Fmt-Pt $oF), $axStr, $pn) 'Green'
+        } elseif ($null -ne $key) { Rep ("  path=$key transform unreadable  {0}" -f $pn) 'Yellow' }
     }
     if ($buf6.Count -eq 0) {
         Rep "Nothing selected. To test the ASSEMBLY read, SELECT the fasteners (Ctrl-click the" 'DarkGray'
         Rep "component instances in the tree or graphics), then re-run this probe." 'DarkGray'
     } elseif ($compXfOk -gt 0) {
-        Rep ("-> component-path transform origin worked for {0} selected component(s)." -f $compXfOk) 'Green'
+        Rep ("-> component-path transform origin worked for {0} of {1} selected item(s)." -f $compXfOk, $buf6.Count) 'Green'
+        if ($noPath6    -gt 0) { Rep ("   ({0} pick(s) had no component Path -- surface/edge/datum, silently skipped by the reader.)" -f $noPath6) 'Yellow' }
+        if ($mergedPath6 -gt 0) { Rep ("   ({0} pick(s) were the SAME component path, merged.)" -f $mergedPath6) 'DarkGray' }
         Rep "   Pick the BottomUp value whose origins match the fasteners' real positions;" 'Green'
         Rep "   fastenator.cmd uses `$true. If `$false is the correct one, tell me and I'll flip it." 'Green'
     } else {
         Rep "Selected items exposed no readable component-path transform (select whole component instances)." 'Yellow'
     }
 } catch { Rep ("Selected-component read threw: $($_.Exception.Message)") 'Red' }
+Rep ""
+
+# ============================================
+# 6a. COINCIDENT-ORIGIN CHECK -- do selected components stack (bolt+washer+nut)?
+# ============================================
+# The #1 over-count cause: a bolt + washer + nut are 3 components at ~the same
+# (x,y,z). If the selected set has clusters of near-coincident origins, the read
+# returns N-per-hole and the tight assembly dedup (1e-3) won't merge them ->
+# "too many holes". This makes that visible: count clusters at a few tolerances.
+Rep "== [6a] COINCIDENT ORIGINS (bolt+washer+nut stacking -> over-count) ==" 'Cyan'
+# build the vector list WITHOUT the pipeline (| ForEach { $_.O } FLATTENS each 3-vector
+# into 3 scalars -> a bogus 3x count). Push each origin array as one element.
+$origins = @()
+foreach ($co in $script:compOrigins) { $origins += ,$co.O }
+if ($origins.Count -lt 2) {
+    Rep ("Only {0} readable component origin(s) -- select the fasteners in section [6] to test stacking." -f $origins.Count) 'DarkGray'
+} else {
+    foreach ($tol in @(1e-3, 0.01, 0.05, 0.1)) {
+        # greedy cluster count: a new cluster for any origin farther than $tol (3D) from every kept rep
+        $reps = @()
+        foreach ($o in $origins) {
+            $isNew = $true
+            foreach ($r in $reps) {
+                $dx = [double]$o[0]-[double]$r[0]; $dy = [double]$o[1]-[double]$r[1]; $dz = [double]$o[2]-[double]$r[2]
+                if ([math]::Sqrt($dx*$dx+$dy*$dy+$dz*$dz) -le $tol) { $isNew = $false; break }
+            }
+            if ($isNew) { $reps += ,$o }
+        }
+        Rep ("  at tol {0,6:0.###}: {1} selected origin(s) -> {2} distinct location(s)." -f $tol, $origins.Count, $reps.Count) $(if ($reps.Count -lt $origins.Count) {'Yellow'} else {'Green'})
+    }
+    Rep "  If 'distinct location(s)' < selected at a small tol, you are selecting STACKS." 'Yellow'
+    Rep "  Fix: select ONE component per hole (bolt shanks only), NOT washers/nuts." 'Yellow'
+}
+Rep ""
+
+# ============================================
+# 6b. ORIGIN-vs-BORE-AXIS CHECK -- is the placement csys ON the bore axis?
+# ============================================
+# The position question: GetTransform($true).GetOrigin() is the component's
+# PLACEMENT csys origin, which for a purchased fastener may NOT sit on the bore
+# axis -> every projected (X,Z) is offset from the true hole center. If bore
+# surfaces were ALSO selected (section [2]), compare: for each component origin,
+# the distance to the nearest selected bore axis origin should be ~0 if the csys
+# is on-axis. A consistent nonzero offset means the read needs the bore, not the csys.
+Rep "== [6b] COMPONENT ORIGIN vs BORE AXIS (is the placement csys on the bore?) ==" 'Cyan'
+if ($script:compOrigins.Count -lt 1) {
+    Rep "No component origins read (section [6]) -- nothing to compare." 'DarkGray'
+} elseif ($script:selBoreAxes.Count -lt 1) {
+    Rep "No bore axes were selected (section [2] empty). To run this check, ALSO select the" 'DarkGray'
+    Rep "matching hole BORE surfaces alongside the components, then re-run." 'DarkGray'
+} else {
+    $offsets = @()
+    foreach ($c in $script:compOrigins) {
+        $best = [double]::MaxValue
+        foreach ($b in $script:selBoreAxes) {
+            $dx = [double]$c.O[0]-[double]$b.A[0]; $dy = [double]$c.O[1]-[double]$b.A[1]; $dz = [double]$c.O[2]-[double]$b.A[2]
+            $d = [math]::Sqrt($dx*$dx+$dy*$dy+$dz*$dz)
+            if ($d -lt $best) { $best = $d }
+        }
+        $offsets += $best
+        if ($offsets.Count -le 6) { Rep ("  comp {0}: nearest bore axis is {1:0.####} away  {2}" -f $c.Key, $best, $c.Pn) $(if ($best -le 0.01) {'Green'} else {'Yellow'}) }
+    }
+    $mx = ($offsets | Measure-Object -Maximum).Maximum
+    if ($mx -le 0.01) {
+        Rep ("-> component origins sit ON the bore axes (max offset {0:0.####}). GetTransform origin is a good center." -f $mx) 'Green'
+    } else {
+        Rep ("-> component origins are OFF the bore axes (max offset {0:0.####})." -f $mx) 'Yellow'
+        Rep "   The placement csys is NOT on the bore -> positions will be offset. Read the BORE" 'Yellow'
+        Rep "   cylinder axis for assembly components instead of the transform origin." 'Yellow'
+    }
+}
+Rep ""
+
+# ============================================
+# 6c. PANEL-PLANE DERIVATION -- the BEST-FIT PLANE of the hole positions
+# ============================================
+# The layout fix (user 2026-07-23): the tool projects the hole origins onto the
+# plane the HOLES actually lie on (best-fit of the point cloud), which is an
+# isometry -> true hole spacing preserved even when the panel is not square to the
+# global axes. Live data showed the fastener's OWN axis can lie IN the plate plane
+# (axis read (1,0,0) while the true normal was (0,-1,1)), so the axis is NOT a
+# reliable normal -- the POINTS are. This reports the point-derived plane, its
+# FLATNESS (how coplanar the holes are), and the angle between the fastener axis
+# and that normal (large = the axis is not perpendicular to the plate -- fine).
+Rep "== [6c] PANEL PLANE from HOLE POSITIONS (best-fit; the layout projection) ==" 'Cyan'
+if ($script:compOrigins.Count -lt 3) {
+    Rep ("Only {0} component origin(s) read -- need >=3 to fit a plane. Select more fasteners." -f $script:compOrigins.Count) 'DarkGray'
+} else {
+    $ctrs = @(); foreach ($co in $script:compOrigins) { $ctrs += ,$co.O }
+    $axs  = @(); foreach ($co in $script:compOrigins) { $axs  += ,$co.D }
+    $fr = Get-FastenerPlaneFrame -Centers $ctrs -Axes $axs -AxisX 'X' -AxisZ 'Z'
+    if ($null -ne $fr -and $fr.Valid) {
+        $flatStr = if ($null -ne $fr.Flatness) { ('{0:0.######}' -f [double]$fr.Flatness) } else { 'n/a' }
+        $srStr   = if ($null -ne $fr.SpanRatio) { ('{0:0.######}' -f [double]$fr.SpanRatio) } else { 'n/a' }
+        Rep ("Best-fit panel normal {0}  (source: {1})  flatness {2}  spanRatio {3}" -f (Fmt-Pt $fr.N), $fr.NormalSource, $flatStr, $srStr) $(if ($fr.NormalSource -eq 'points') {'Green'} else {'Yellow'})
+        if ($fr.NormalSource -eq 'points' -and $null -ne $fr.Flatness -and [double]$fr.Flatness -lt 1e-4) {
+            Rep "-> the holes are cleanly COPLANAR: the layout projects onto this plane with TRUE spacing." 'Green'
+        } elseif ($fr.NormalSource -eq 'points') {
+            Rep "-> holes are NOT flat (flatness > 1e-4): you may be selecting fasteners from MORE THAN ONE face." 'Yellow'
+            Rep "   Select one panel/face at a time for a correct flat layout." 'Yellow'
+        } else {
+            Rep "-> holes are collinear/too few; fell back to the fastener AXIS as the normal." 'Yellow'
+        }
+        # PER-AXIS: which fastener axis (if any) IS the plate normal? A truly fixed
+        # (selection-independent) normal is an axis that is BOTH ~parallel to the
+        # best-fit normal AND consistent across all fasteners (near-zero spread). If one
+        # exists we could skip fitting entirely; live GetZAxis (1,0,0) was 90deg off.
+        $angTo = {
+            param($AxList)
+            $best = $null; $spread = 0.0; $ref = $null
+            foreach ($v in $AxList) {
+                if ($null -eq $v) { continue }
+                $u = FL-Unit $v; if ($null -eq $u) { continue }
+                if ($null -eq $ref) { $ref = $u }
+                $cs = [Math]::Abs((FL-Dot $u $ref)); if ($cs -gt 1.0) { $cs = 1.0 }
+                $d = [Math]::Acos($cs) * 180.0 / [Math]::PI
+                if ($d -gt $spread) { $spread = $d }
+                $cn = [Math]::Abs((FL-Dot $u $fr.N)); if ($cn -gt 1.0) { $cn = 1.0 }
+                $an = [Math]::Acos($cn) * 180.0 / [Math]::PI
+                if ($null -eq $best -or $an -lt $best) { $best = $an }
+            }
+            return @{ AngleToNormal = $best; Spread = $spread }
+        }
+        foreach ($nm in @('GetXAxis','GetYAxis','GetZAxis')) {
+            # build the per-axis vector list WITHOUT a pipeline (| ForEach {$_.DX} flattens
+            # each 3-vector into scalars); push each axis array as one element.
+            $lst = @(); foreach ($co in $script:compOrigins) { if ($nm -eq 'GetXAxis') { $lst += ,$co.DX } elseif ($nm -eq 'GetYAxis') { $lst += ,$co.DY } else { $lst += ,$co.D } }
+            $res = & $angTo $lst
+            if ($null -eq $res.AngleToNormal) { Rep ("  $nm : unreadable on this build") 'DarkGray'; continue }
+            $isNormal = ($res.AngleToNormal -le 2.0 -and $res.Spread -le 2.0)
+            Rep ("  $nm : {0:0.##} deg from plate normal, cross-fastener spread {1:0.##} deg{2}" -f [double]$res.AngleToNormal, [double]$res.Spread, $(if ($isNormal) { '  <== candidate FIXED normal (selection-independent)' } else { '' })) $(if ($isNormal) {'Green'} else {'DarkGray'})
+        }
+        Rep "  (If one axis is ~0 deg from the normal AND ~0 spread, it is the true drill axis and could seed a fixed normal. Else the point-cloud best-fit is the only reliable normal -- select the FULL panel so it is well-conditioned.)" 'DarkGray'
+        Rep ("Fastener GetZAxis vs plate normal: {0:0.##} deg (large = the bolt Z axis is NOT the plate normal; the POINTS still win)." -f [double]$fr.AxisSpreadDeg) 'DarkGray'
+    } else {
+        $emsg = if ($null -ne $fr) { ($fr.Errors -join '; ') } else { 'null frame' }
+        Rep ("Could not derive a panel plane: {0}" -f $emsg) 'Yellow'
+        Rep "-> layout will REFUSE this selection (collinear/too few/not coplanar) rather than distort - select 3+ fasteners spanning the panel." 'Yellow'
+    }
+}
 Rep ""
 
 # ============================================

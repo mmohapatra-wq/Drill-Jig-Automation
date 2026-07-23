@@ -346,29 +346,56 @@ function Read-FastenerCentersFromModel {
     }
 
     $centers = @()
+    $axes    = @()   # PARALLEL to $centers: each fastener's own axis dir (assembly frame),
+                     # or $null when unreadable. Feeds ConvertTo-LayoutXZ -Axes so the layout
+                     # is projected onto the fastener PANEL plane (not two dropped global axes).
     $medianDia = 0.0
     $method = 'none'
     $msg = ''
+    # diagnostics returned to the caller so a WRONG COUNT is VISIBLE, not silent
+    # (assembly mode populates these; part mode leaves them 0).
+    $rawSel = 0; $skippedNoPath = 0; $skippedNoXform = 0; $mergedDup = 0; $axisReads = 0
 
     if ($IsAsm) {
         # ASSEMBLY: read SELECTED component locations from the selection buffer.
         $method = 'component-path transform (selected components)'
         $buf = @()
         try { if ($null -ne $Session) { $buf = @(($Session.CurrentSelectionBuffer()).Contents) } } catch {}
+        $rawSel = @($buf).Count
         $seenComp = @{}
         foreach ($sel in $buf) {
             $path = $null; try { $path = $sel.Path } catch {}
-            if ($null -eq $path) { continue }
-            $cid = $null
-            try { $ids = $path.ComponentIds; if ($null -ne $ids -and $ids.Count -gt 0) { $cid = [int]$ids[$ids.Count - 1] } } catch {}
-            if ($null -ne $cid) { if ($seenComp.ContainsKey($cid)) { continue }; $seenComp[$cid] = $true }
-            $o = $null
-            try { $o = Get-Comp (($path.GetTransform($true)).GetOrigin()) } catch {}
-            if ($null -ne $o) { $centers += ,$o }
+            if ($null -eq $path) { $skippedNoPath++; continue }   # surface/edge/datum pick, NOT a component instance
+            # DEDUP KEY = the FULL component path (root->leaf), NOT the leaf id alone.
+            # IpfcComponentPath.ComponentIds is the whole path to the component; two
+            # DISTINCT instances in different subassemblies can share a leaf id, so a
+            # leaf-only key would silently collapse them (wrong count + wrong positions
+            # on a NESTED assembly). For a FLAT assembly each path is a single id, so
+            # this is byte-identical to the old leaf-only behaviour there (the
+            # confirmed-live 12-fastener case).
+            $key = $null
+            try { $ids = $path.ComponentIds; if ($null -ne $ids -and $ids.Count -gt 0) { $key = ($ids -join '|') } } catch {}
+            if ($null -ne $key) { if ($seenComp.ContainsKey($key)) { $mergedDup++; continue }; $seenComp[$key] = $true }
+            # ONE transform read -> BOTH origin (position) and Z axis (the fastener's
+            # own bore axis, in the assembly frame). GetTransform($true) is an
+            # IpfcTransform3D; .GetZAxis() is the SAME proven read family as
+            # Read-CoordSysTransform. Z-along-bore is the near-universal fastener
+            # convention; a violator shows up as a large AxisSpreadDeg downstream.
+            $o = $null; $d = $null
+            try {
+                $xf = $path.GetTransform($true)     # IpfcTransform3D (member->root)
+                $o  = Get-Comp $xf.GetOrigin()
+                try { $d = Get-Comp $xf.GetZAxis() } catch { $d = $null }
+            } catch {}
+            if ($null -ne $o) {
+                $centers += ,$o
+                $axes    += ,$d                     # may be $null; ConvertTo-LayoutXZ tolerates nulls
+                if ($null -ne $d) { $axisReads++ }
+            } else { $skippedNoXform++ }
         }
         if ($centers.Count -eq 0) { $msg = 'no component locations read - select whole fastener component instances (not a surface/edge)' }
     } else {
-        # PART: sweep bore radii and take each cylinder axis origin.
+        # PART: sweep bore radii and take each cylinder axis origin + DIRECTION.
         $method = 'cylinder-axis (model sweep)'
         $sweep = if ($null -ne $Radii -and @($Radii).Count -gt 0) { @($Radii) } else {
             @(0.0625,0.086,0.098,0.1015,0.125,0.1285,0.144,0.1495,0.166,0.1875,0.196,0.201,0.25,0.3125,0.375,0.4375,0.5)
@@ -376,13 +403,15 @@ function Read-FastenerCentersFromModel {
         $seen = @{}
         $diams = @()
         foreach ($rad in $sweep) {
-            $axes = @()
-            try { $axes = @(Get-CylinderAxes -Model $Model -TypeObj $TypeObj -TargetRadius $rad -RadTol $RadTol) } catch {}
-            foreach ($a in $axes) {
+            $cyl = @()
+            try { $cyl = @(Get-CylinderAxes -Model $Model -TypeObj $TypeObj -TargetRadius $rad -RadTol $RadTol) } catch {}
+            foreach ($a in $cyl) {
                 $key = ('{0:0.###}|{1:0.###}|{2:0.###}' -f [double]$a.A[0], [double]$a.A[1], [double]$a.A[2])
                 if ($seen.ContainsKey($key)) { continue }
                 $seen[$key] = $true
                 $centers += ,$a.A
+                $axes    += ,$a.D                   # the bore axis direction (parallel to $centers)
+                if ($null -ne $a.D) { $axisReads++ }
                 $diams += (2.0 * [double]$rad)
             }
         }
@@ -396,11 +425,19 @@ function Read-FastenerCentersFromModel {
     return [pscustomobject]@{
         Ok         = ($centers.Count -ge 1)
         Centers    = $centers
+        Axes       = $axes                      # PARALLEL to Centers; feeds ConvertTo-LayoutXZ -Axes
         Count      = [int]$centers.Count
         IsAsm      = [bool]$IsAsm
         ReadMethod = $method
         MedianDia  = [double]$medianDia
         Message    = $msg
+        # selection diagnostics (assembly mode) - let the caller show the operator
+        # WHY a count looks wrong instead of silently under/over-counting.
+        RawSelected     = [int]$rawSel          # items in the selection buffer
+        SkippedNoPath   = [int]$skippedNoPath   # picks with no component Path (surface/edge/datum)
+        SkippedNoXform  = [int]$skippedNoXform  # components whose transform origin was unreadable
+        MergedDuplicate = [int]$mergedDup       # same component path selected more than once
+        AxisReads       = [int]$axisReads       # how many fastener axes were readable (-> panel-plane projection)
     }
 }
 

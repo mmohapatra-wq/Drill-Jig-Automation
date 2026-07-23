@@ -1417,6 +1417,176 @@ try { $ppMal = Get-SlotPatternPlan -Rows @([pscustomobject]@{ Foo = 1 }, [pscust
 Assert-True "pat: malformed row skipped, does NOT throw" ((-not $threwPP2) -and $ppMal.Count -eq 1)
 
 # ----------------------------------------------------------------------------
+# Get-SlotPatternRuns (drilljig-gui) -- partition IRREGULAR rows into MAXIMAL runs
+# of equal spacing so each run is its own hands-free pattern (user 2026-07-23:
+# multiple patterns for differing distances; minimize manual draws). A strict
+# generalization of Get-SlotPatternPlan: even -> 1 run; all-different -> pairs +
+# singletons. Must: (a) partition all rows, (b) DrawCount == RunCount, (c) right
+# per-run seeds/counts/increments, (d) carry row objects, (e) never throw.
+# ----------------------------------------------------------------------------
+Write-Host "  -- slots: Get-SlotPatternRuns (multi-pattern irregular) --" -ForegroundColor White
+
+# helper: build synthetic rows with just the fields the planner reads + carries.
+function Script:RunRow($cross) { [pscustomobject]@{ CrossCoord = [double]$cross; SlotLen = 10.0; Corner0 = @{X=0;Z=$cross}; Corner1 = @{X=10;Z=$cross} } }
+
+# a regular 5-row orthogrid -> ONE run (== today's single pattern).
+$rnEvenGeo   = Get-OrthogridGeometry -CcX 2.0 -CcZ 1.5 -Nx 3 -Nz 5 -Edge 0.5
+$rnEvenSlots = Get-RowSlots -Points $rnEvenGeo.Points -SlotWidth 0.25 -Width $rnEvenGeo.Width -Height $rnEvenGeo.Height
+$rnEven = Get-SlotPatternRuns -Rows $rnEvenSlots.Rows
+Assert-True "runs: even grid -> valid"                 ($rnEven.Valid)
+Assert-True "runs: even grid -> 1 run"                 ($rnEven.RunCount -eq 1)
+Assert-True "runs: even grid -> DrawCount == RunCount" ($rnEven.DrawCount -eq $rnEven.RunCount)
+Assert-True "runs: even grid -> run covers all 5 rows" ($rnEven.Runs[0].Count -eq 5)
+Assert-True "runs: even grid -> increment = CcZ (1.5)" (Approx $rnEven.Runs[0].Increment 1.5)
+Assert-True "runs: even grid -> not a singleton"       (-not $rnEven.Runs[0].IsSingleton)
+
+# mixed gaps [5,5,7,7] -> 2 runs: {0,5,10}(inc5) + {17,24}(inc7). 2 draws (was 5).
+$rnMix = Get-SlotPatternRuns -Rows @((RunRow 0),(RunRow 5),(RunRow 10),(RunRow 17),(RunRow 24))
+Assert-True "runs: [5,5,7,7] -> 2 runs"                ($rnMix.RunCount -eq 2)
+Assert-True "runs: [5,5,7,7] -> DrawCount 2"           ($rnMix.DrawCount -eq 2)
+Assert-True "runs: run A count 3, inc 5"               ($rnMix.Runs[0].Count -eq 3 -and (Approx $rnMix.Runs[0].Increment 5.0))
+Assert-True "runs: run B count 2, inc 7"               ($rnMix.Runs[1].Count -eq 2 -and (Approx $rnMix.Runs[1].Increment 7.0))
+Assert-True "runs: run A seed at cross 0"              (Approx $rnMix.Runs[0].SeedRow.CrossCoord 0.0)
+Assert-True "runs: run B seed at cross 17"             (Approx $rnMix.Runs[1].SeedRow.CrossCoord 17.0)
+Assert-True "runs: seed carries row object (SlotLen)"  ($rnMix.Runs[0].SeedRow.SlotLen -eq 10.0)
+# partition invariant: sum of run row counts == total rows, no overlap.
+$rnMixSum = ($rnMix.Runs | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+Assert-True "runs: [5,5,7,7] partition sum == 5"       ($rnMixSum -eq 5 -and $rnMix.TotalRows -eq 5)
+
+# all-different gaps [3,7,10] -> greedy pairs {0,3}+{10,20}, singleton {30}. 3 draws (was 4).
+$rnDiff = Get-SlotPatternRuns -Rows @((RunRow 0),(RunRow 3),(RunRow 10),(RunRow 20),(RunRow 30))
+# gaps: 3,7,10,10 -> run A {0,3} inc3; then {10,20,30} inc10 (7 breaks A, 10==10 extends)
+Assert-True "runs: [3,7,10,10] -> 2 runs"              ($rnDiff.RunCount -eq 2)
+Assert-True "runs: run A {0,3} count 2 inc 3"          ($rnDiff.Runs[0].Count -eq 2 -and (Approx $rnDiff.Runs[0].Increment 3.0))
+Assert-True "runs: run B {10,20,30} count 3 inc 10"    ($rnDiff.Runs[1].Count -eq 3 -and (Approx $rnDiff.Runs[1].Increment 10.0))
+
+# each run greedily grabs its start + the immediate next, so a run is ALWAYS >=2
+# except a TRAILING leftover row. coords 0,1,4,11 (gaps 1,3,7): run{0,1}inc1, then
+# run{4,11}inc7 (4->11 is the only remaining gap). 2 runs, both pairs, NO mid-singleton.
+$rnNoShare = Get-SlotPatternRuns -Rows @((RunRow 0),(RunRow 1),(RunRow 4),(RunRow 11))
+Assert-True "runs: [1,3,7] -> 2 runs (greedy pairs)"   ($rnNoShare.RunCount -eq 2)
+Assert-True "runs: first run pairs {0,1} inc1"         ($rnNoShare.Runs[0].Count -eq 2 -and (Approx $rnNoShare.Runs[0].Increment 1.0))
+Assert-True "runs: second run pairs {4,11} inc7"       ($rnNoShare.Runs[1].Count -eq 2 -and (Approx $rnNoShare.Runs[1].Increment 7.0))
+
+# TRAILING SINGLETON: odd leftover row that can't join the prior run. coords 0,1,5
+# (gaps 1,4): run{0,1}inc1, then coord5 is the last row -> singleton {5}.
+$rnTail = Get-SlotPatternRuns -Rows @((RunRow 0),(RunRow 1),(RunRow 5))
+Assert-True "runs: [1,4] -> 2 runs (pair + tail single)" ($rnTail.RunCount -eq 2)
+Assert-True "runs: tail {5} is a singleton, inc 0"       ($rnTail.Runs[1].IsSingleton -and $rnTail.Runs[1].Count -eq 1 -and $rnTail.Runs[1].Increment -eq 0.0)
+Assert-True "runs: tail singleton seed at cross 5"       (Approx $rnTail.Runs[1].SeedRow.CrossCoord 5.0)
+# partition invariant holds with a singleton present.
+$rnTailSum = ($rnTail.Runs | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum
+Assert-True "runs: tail-singleton partition sum == 3"    ($rnTailSum -eq 3 -and $rnTail.TotalRows -eq 3)
+
+# unsorted input -> sorted runs (custom layouts arrive unordered).
+$rnUnsorted = Get-SlotPatternRuns -Rows @((RunRow 10),(RunRow 0),(RunRow 5))
+Assert-True "runs: unsorted -> 1 even run (0,5,10)"    ($rnUnsorted.RunCount -eq 1 -and $rnUnsorted.Runs[0].Count -eq 3 -and (Approx $rnUnsorted.Runs[0].Increment 5.0))
+Assert-True "runs: unsorted -> seed is lowest (0)"     (Approx $rnUnsorted.Runs[0].SeedRow.CrossCoord 0.0)
+
+# single row -> 1 singleton run (nothing to pattern; just draw it).
+$rn1 = Get-SlotPatternRuns -Rows @((RunRow 2.0))
+Assert-True "runs: single row -> 1 singleton run"      ($rn1.RunCount -eq 1 -and $rn1.Runs[0].IsSingleton -and $rn1.Runs[0].Count -eq 1)
+
+# within-Tol grouping (float noise still one run).
+$rnTol = Get-SlotPatternRuns -Rows @((RunRow 0),(RunRow 1.50002),(RunRow 2.99999)) -Tol 0.001
+Assert-True "runs: gaps within Tol -> 1 run"           ($rnTol.RunCount -eq 1 -and $rnTol.Runs[0].Count -eq 3)
+
+# empty / null / malformed -> never throws.
+$rnEmpty = Get-SlotPatternRuns -Rows @()
+Assert-True "runs: empty -> valid false, 0 runs"       ((-not $rnEmpty.Valid) -and $rnEmpty.RunCount -eq 0)
+$threwRN = $false
+try { $null = Get-SlotPatternRuns -Rows $null } catch { $threwRN = $true }
+Assert-True "runs: null Rows does NOT throw"           (-not $threwRN)
+$threwRN2 = $false; $rnMal = $null
+try { $rnMal = Get-SlotPatternRuns -Rows @([pscustomobject]@{ Foo = 1 }, (RunRow 2.0), (RunRow 4.0)) } catch { $threwRN2 = $true }
+Assert-True "runs: malformed row skipped, no throw"    ((-not $threwRN2) -and $rnMal.TotalRows -eq 2 -and $rnMal.Runs[0].Count -eq 2)
+
+# ----------------------------------------------------------------------------
+# Get-SlotSeedPatterns (drilljig-gui, single-seed) -- ONE seed, then one pattern
+# per arithmetic-from-seed group covers the rest (user 2026-07-23: no 2nd seed
+# sketch, "as many patterns until all rows have a slot"). Each pattern emanates
+# from the seed (leader = instance 0), so it spans CONSECUTIVE present multiples of
+# its increment; isolated rows become count-2 patterns. Must: (a) SeedRow = min
+# cross, (b) partition all OTHER rows (each covered once), (c) counts/increments
+# right, (d) never off-row, (e) never throw.
+# ----------------------------------------------------------------------------
+Write-Host "  -- slots: Get-SlotSeedPatterns (single-seed multi-pattern) --" -ForegroundColor White
+
+# even grid -> ONE pattern from the seed covers all (== the old single pattern).
+$spEvenGeo   = Get-OrthogridGeometry -CcX 2.0 -CcZ 1.5 -Nx 3 -Nz 5 -Edge 0.5
+$spEvenSlots = Get-RowSlots -Points $spEvenGeo.Points -SlotWidth 0.25 -Width $spEvenGeo.Width -Height $spEvenGeo.Height
+$spEven = Get-SlotSeedPatterns -Rows $spEvenSlots.Rows
+Assert-True "seedpat: even grid -> valid"              ($spEven.Valid)
+Assert-True "seedpat: even grid -> 1 pattern"          ($spEven.PatternCount -eq 1)
+Assert-True "seedpat: even grid -> count 5 (all rows)" ($spEven.Patterns[0].Count -eq 5)
+Assert-True "seedpat: even grid -> increment = CcZ"    (Approx $spEven.Patterns[0].Increment 1.5)
+Assert-True "seedpat: even grid -> seed at lowest row" (Approx $spEven.SeedRow.CrossCoord ($spEvenSlots.Rows | ForEach-Object { $_.CrossCoord } | Measure-Object -Minimum).Minimum)
+
+# collinear-from-seed merge + isolated rows. coords 0,2,4,7,9,11 (offsets 2,4,7,9,11):
+# g=2 covers 2,4 (count 3); then 7 -> count2; 9 -> count2; 11 -> count2 = 4 patterns.
+$spMix = Get-SlotSeedPatterns -Rows @((RunRow 0),(RunRow 2),(RunRow 4),(RunRow 7),(RunRow 9),(RunRow 11))
+Assert-True "seedpat: [2,4,7,9,11] -> 4 patterns"      ($spMix.PatternCount -eq 4)
+Assert-True "seedpat: first pattern inc2 count3 (0,2,4)" ($spMix.Patterns[0].Count -eq 3 -and (Approx $spMix.Patterns[0].Increment 2.0))
+Assert-True "seedpat: seed at cross 0"                 (Approx $spMix.SeedRow.CrossCoord 0.0)
+# partition invariant: covered offsets across all patterns == the 5 non-seed rows, once each.
+$spCov = @($spMix.Patterns | ForEach-Object { $_.Offsets } | ForEach-Object { $_ }) | Sort-Object
+Assert-True "seedpat: covered offsets == 2,4,7,9,11"   (($spCov -join ',') -eq '2,4,7,9,11')
+
+# a clean arithmetic run merges into ONE pattern. coords 0,2,4,6 -> inc2 count4.
+$spRun = Get-SlotSeedPatterns -Rows @((RunRow 0),(RunRow 2),(RunRow 4),(RunRow 6))
+Assert-True "seedpat: 0,2,4,6 -> 1 pattern inc2 count4" ($spRun.PatternCount -eq 1 -and $spRun.Patterns[0].Count -eq 4 -and (Approx $spRun.Patterns[0].Increment 2.0))
+
+# a broken multiple does NOT place an off-row slot: coords 0,3,6,7 -> g=3 covers 3,6
+# (count3), then 7 -> count2 (NOT 9). 2 patterns.
+$spBrk = Get-SlotSeedPatterns -Rows @((RunRow 0),(RunRow 3),(RunRow 6),(RunRow 7))
+Assert-True "seedpat: 0,3,6,7 -> 2 patterns"           ($spBrk.PatternCount -eq 2)
+Assert-True "seedpat: group1 inc3 count3 (3,6)"        ($spBrk.Patterns[0].Count -eq 3 -and (Approx $spBrk.Patterns[0].Increment 3.0))
+Assert-True "seedpat: group2 inc7 count2 (7 only)"     ($spBrk.Patterns[1].Count -eq 2 -and (Approx $spBrk.Patterns[1].Increment 7.0))
+
+# two rows -> 1 count-2 pattern (seed + it).
+$sp2 = Get-SlotSeedPatterns -Rows @((RunRow 0),(RunRow 5))
+Assert-True "seedpat: 2 rows -> 1 pattern count2 inc5" ($sp2.PatternCount -eq 1 -and $sp2.Patterns[0].Count -eq 2 -and (Approx $sp2.Patterns[0].Increment 5.0))
+
+# single row -> seed only, NO patterns.
+$sp1 = Get-SlotSeedPatterns -Rows @((RunRow 2.0))
+Assert-True "seedpat: single row -> 0 patterns"        ($sp1.Valid -and $sp1.PatternCount -eq 0 -and (Approx $sp1.SeedRow.CrossCoord 2.0))
+
+# unsorted -> seed is the lowest, patterns from it.
+$spU = Get-SlotSeedPatterns -Rows @((RunRow 10),(RunRow 0),(RunRow 5))
+Assert-True "seedpat: unsorted -> seed at 0, 1 pattern inc5 count3" ((Approx $spU.SeedRow.CrossCoord 0.0) -and $spU.PatternCount -eq 1 -and $spU.Patterns[0].Count -eq 3 -and (Approx $spU.Patterns[0].Increment 5.0))
+
+# empty / null / malformed -> never throws.
+$spEmpty = Get-SlotSeedPatterns -Rows @()
+Assert-True "seedpat: empty -> valid false, 0 patterns" ((-not $spEmpty.Valid) -and $spEmpty.PatternCount -eq 0)
+$threwSP = $false
+try { $null = Get-SlotSeedPatterns -Rows $null } catch { $threwSP = $true }
+Assert-True "seedpat: null Rows does NOT throw"        (-not $threwSP)
+$threwSP2 = $false; $spMal = $null
+try { $spMal = Get-SlotSeedPatterns -Rows @([pscustomobject]@{ Foo = 1 }, (RunRow 2.0), (RunRow 4.0)) } catch { $threwSP2 = $true }
+Assert-True "seedpat: malformed row skipped, no throw" ((-not $threwSP2) -and $spMal.TotalRows -eq 2 -and $spMal.PatternCount -eq 1 -and $spMal.Patterns[0].Count -eq 2)
+
+# RULE: exactly ONE regular pattern + count-2 accommodation per stray (user 2026-07-23).
+# The FIRST pattern is the dominant run tagged 'regular'; the rest are 'accommodation'.
+$spKind = Get-SlotSeedPatterns -Rows @((RunRow 0),(RunRow 3),(RunRow 4.5),(RunRow 6))
+Assert-True "seedpat: first pattern Kind='regular'"    ($spKind.Patterns[0].Kind -eq 'regular')
+Assert-True "seedpat: stray pattern Kind='accommodation'" ($spKind.Patterns[1].Kind -eq 'accommodation' -and $spKind.Patterns[1].Count -eq 2)
+
+# a SECOND arithmetic run must NOT become a second multi-count pattern -- the dominant
+# run is the ONE regular pattern; every other row is a count-2 accommodation. rows
+# 0,2,4,10,20,30: dominant run is pitch 10 (10,20,30 = 3 rows) > pitch 2 (2,4 = 2 rows),
+# so regular = inc10 count4 (0,10,20,30); 2 and 4 become count-2 accommodations (NOT a
+# second inc2 count3 pattern the old greedy would have made).
+$spTwo = Get-SlotSeedPatterns -Rows @((RunRow 0),(RunRow 2),(RunRow 4),(RunRow 10),(RunRow 20),(RunRow 30))
+Assert-True "seedpat: dominant run -> regular inc10 count4" ($spTwo.Patterns[0].Kind -eq 'regular' -and $spTwo.Patterns[0].Count -eq 4 -and (Approx $spTwo.Patterns[0].Increment 10.0))
+Assert-True "seedpat: second run NOT a multi-count pattern" (@($spTwo.Patterns | Where-Object { $_.Count -gt 2 }).Count -eq 1)
+Assert-True "seedpat: strays 2 and 4 are count-2 accommodations" (($spTwo.PatternCount -eq 3) -and (@($spTwo.Patterns | Where-Object { $_.Kind -eq 'accommodation' -and $_.Count -eq 2 }).Count -eq 2))
+$spAccInc = @($spTwo.Patterns | Where-Object { $_.Kind -eq 'accommodation' } | ForEach-Object { $_.Increment } | Sort-Object)
+Assert-True "seedpat: accommodation increments == 2,4"  (($spAccInc -join ',') -eq '2,4')
+# every row is still covered exactly once (seed + regular multiples + accommodations).
+$spAllCov = @(@($spTwo.Patterns | ForEach-Object { $_.Offsets } | ForEach-Object { $_ })) | Sort-Object
+Assert-True "seedpat: covered offsets == 2,4,10,20,30"  (($spAllCov -join ',') -eq '2,4,10,20,30')
+
+# ----------------------------------------------------------------------------
 # slotinator PATTERN-MODE plane reduction -- in pattern mode slotinator feeds only
 # the FIRST row's 2 corners to Get-SharedPlanePlan (the seed's guide planes; the
 # pattern replicates the seed, so rows 2..N need no planes), vs ALL corners in

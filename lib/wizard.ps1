@@ -1012,6 +1012,18 @@ function Show-Wizard {
         & $InvokeGuarded {
             if ($wz.Index -ge $wz.Steps.Count) { return }
             $step = $wz.Steps[$wz.Index]
+            # DISPOSE the outgoing step's controls before clearing. .Controls.Clear()
+            # only REMOVES children - it does not Dispose them. A WebView2 (welcome/overview
+            # 3D) that is merely removed keeps its Edge browser PROCESS + its UserDataFolder
+            # LOCK alive; the next WebView2 then can't initialize (blank 3D) and the leaked
+            # processes pile up until the app FREEZES. Recursively dispose every child so the
+            # WebView2 (and any other IDisposable) is torn down on each step change.
+            $disposeTree = {
+                param($ctl)
+                foreach ($ch in @($ctl.Controls)) { & $disposeTree $ch }
+                try { if ($ctl -is [System.IDisposable]) { $ctl.Dispose() } } catch {}
+            }
+            foreach ($ch in @($body.Controls)) { try { & $disposeTree $ch } catch {} }
             $body.Controls.Clear()
             $lblStepNo.Text = ('Step {0} of {1}' -f ($wz.Index + 1), $wz.Steps.Count)
             $lblTitle.Text  = [string]$step.Title
@@ -1140,7 +1152,11 @@ function Add-WizardChoiceCards {
         [int]$Top = 8,
         [int]$CardWidth = 210,
         [int]$CardHeight = 120,
-        [ValidateSet('rerender','advance','none')][string]$AfterPick = 'rerender'
+        [ValidateSet('rerender','advance','none')][string]$AfterPick = 'rerender',
+        # 0-based index of a card to show PRESELECTED (persistent green border). -1 = none.
+        # Every card also shows the same green border on hover, so the operator always sees
+        # a "select" outline on the box they are about to pick (user 2026-07-21).
+        [int]$HighlightIndex = -1
     )
     # theme palette (dark-blue) with safe fallbacks if Show-Wizard wasn't the caller
     $thm = $script:WizTheme
@@ -1149,6 +1165,8 @@ function Add-WizardChoiceCards {
     $cInk   = if ($thm) { $thm.Ink }       else { [System.Drawing.Color]::FromArgb(238, 242, 248) }
     $cMuted = if ($thm) { $thm.Muted }     else { [System.Drawing.Color]::FromArgb(158, 172, 196) }
     $cBorder = [System.Drawing.Color]::FromArgb(72, 92, 132)
+    # green "selected/preselected" outline (matches the honesty-palette green chips).
+    $cSel = [System.Drawing.Color]::FromArgb(88, 200, 122)
 
     $gap = 18
     $innerW = [Math]::Max(20, $CardWidth - 24)
@@ -1194,7 +1212,9 @@ function Add-WizardChoiceCards {
         $cardP.Location  = New-Object System.Drawing.Point($cx, $cy)
         $cardP.Size      = New-Object System.Drawing.Size($CardWidth, $cardH)
         $cardP.BackColor = $cBack
-        $cardP.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        # BorderStyle NONE -> the border is drawn in Paint so we can color it GREEN when the
+        # card is preselected (HighlightIndex) or hovered, and the normal muted border otherwise.
+        $cardP.BorderStyle = [System.Windows.Forms.BorderStyle]::None
         $cardP.Cursor    = [System.Windows.Forms.Cursors]::Hand
         $cardP.Tag       = $i
 
@@ -1222,9 +1242,40 @@ function Add-WizardChoiceCards {
             $cardP.Controls.Add($sb)
         }
 
-        # hover affordance (capture the two theme colours by value in the closure)
-        $enter = { param($s,$e) $s.BackColor = $cHover }.GetNewClosure()
-        $leave = { param($s,$e) $s.BackColor = $cBack }.GetNewClosure()
+        # GREEN SELECT-BORDER: drawn in Paint. A per-card hover flag (captured by both the
+        # Paint and the enter/leave handlers) plus the preselected HighlightIndex drive it.
+        # Everything closes over $cardPanel (the panel), NOT the event $sender, so hovering a
+        # child label still toggles the PANEL border. Colors captured by value in the closures.
+        $cardPanel = $cardP
+        $myIdx = $i
+        $hovered = [ref]$false
+        $paint = {
+            param($s, $e)
+            $g = $e.Graphics
+            $sel = ($hovered.Value -or ($myIdx -eq $HighlightIndex))
+            if ($sel) {
+                $pen = New-Object System.Drawing.Pen($cSel, 2)
+                $g.DrawRectangle($pen, 1, 1, ($s.Width - 3), ($s.Height - 3))
+            } else {
+                $pen = New-Object System.Drawing.Pen($cBorder, 1)
+                $g.DrawRectangle($pen, 0, 0, ($s.Width - 1), ($s.Height - 1))
+            }
+            $pen.Dispose()
+        }.GetNewClosure()
+        $cardP.Add_Paint($paint)
+        # hover affordance: brighten the bg AND light the green border. Leave is GUARDED --
+        # crossing onto a child label fires the panel's MouseLeave even though the cursor is
+        # still over the card, so only clear hover when the cursor truly left the card bounds
+        # (otherwise the border would flicker as the mouse moves within the card).
+        $enter = { param($s,$e) $cardPanel.BackColor = $cHover; $hovered.Value = $true; $cardPanel.Invalidate() }.GetNewClosure()
+        $leave = {
+            param($s,$e)
+            try {
+                $pt = $cardPanel.PointToClient([System.Windows.Forms.Cursor]::Position)
+                if ($cardPanel.ClientRectangle.Contains($pt)) { return }   # still inside -> keep hover
+            } catch {}
+            $cardPanel.BackColor = $cBack; $hovered.Value = $false; $cardPanel.Invalidate()
+        }.GetNewClosure()
         $cardP.Add_MouseEnter($enter); $cardP.Add_MouseLeave($leave)
         foreach ($child in $cardP.Controls) { $child.Add_MouseEnter($enter); $child.Add_MouseLeave($leave) }
 

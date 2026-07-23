@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Drill-Jig 3D Preview (concept prototype)</title>
+<!--
+  ============================================================================
+  drilljig_3d_preview.html - STAGE 1 concept prototype (HTML) for the drill-jig
+  3D preview + live sliders. Standalone; touches no repo code.
+
+  WHAT THIS PROVES
+    * A real, orbitable 3D view of the jig plate + drilled holes + chip-relief
+      slots, driven by the SAME orthogrid math as lib\orthogrid.ps1
+      (Get-OrthogridGeometry / Get-RowSlots).
+    * Live sliders (Nx, Nz, spacing, hole dia, depth) rebuild the 3D instantly.
+    * A MATH SELF-TEST badge (top-left) checks the JS geometry port against
+      values captured from the REAL PowerShell functions - the browser proves
+      its own math on load (same evidence idea as the repo's render_*_check.ps1).
+
+  STAGING (per the user):  HTML (this)  ->  Windows PowerShell WPF window  ->
+  integrate into drilljig-gui.cmd. The eventual GUI path is WPF Media3D
+  (verified live on this machine); this HTML validates the VISUAL + INTERACTION.
+
+  DEPENDENCY NOTE: loads three.js from a CDN (jsdelivr) for the prototype. On a
+  network-blocked machine the 3D pane shows a friendly notice AND the math
+  self-test still runs (it is pure JS, no three.js). The production GUI path is
+  offline WPF, not this file.
+
+  GEOMETRY FRAME (matches the app): X = plate width (right), Z = plate height
+  (depth), Y = through-thickness (up here). Holes are thru-all along Y; a slot
+  is one full-length band per hole ROW, width = hole dia, depth = slot depth.
+  ============================================================================
+-->
+<style>
+  :root{
+    --form:#141E34; --canvas:#1E2A44; --card:#22314f; --cardh:#2b3c60;
+    --ink:#EEF2F8; --muted:#9EACC4; --accent:#5AA9FF;
+    --ok:#78D296; --warn:#F5C85A; --err:#F5786E; --field:#101a2a;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--form);color:var(--ink);
+    font-family:'Segoe UI',system-ui,sans-serif;overflow:hidden}
+  #app{display:flex;height:100vh;width:100vw}
+  #panel{width:340px;min-width:340px;height:100%;overflow-y:auto;padding:16px 18px;
+    background:var(--form);border-right:1px solid #2b3c60}
+  #view{flex:1;position:relative;background:var(--canvas)}
+  #cv{display:block;width:100%;height:100%}
+  h1{font-size:17px;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:11.5px;margin:0 0 12px;line-height:1.4}
+  .selftest{font-size:12px;font-weight:600;padding:6px 9px;border-radius:6px;margin-bottom:14px;
+    border:1px solid #33436a;background:var(--card)}
+  .selftest.pass{color:var(--ok);border-color:#2f5a41}
+  .selftest.fail{color:var(--err);border-color:#5a2f2f}
+  .grp{margin-bottom:6px}
+  .row{display:flex;align-items:center;gap:8px;margin:9px 0}
+  .row label{flex:1;font-size:12.5px;color:var(--ink)}
+  .row .val{width:52px;text-align:right;font-variant-numeric:tabular-nums;
+    color:var(--accent);font-size:12.5px;font-weight:600}
+  input[type=range]{flex:0 0 150px;accent-color:var(--accent);cursor:pointer}
+  .readout{background:var(--card);border:1px solid #33436a;border-radius:7px;
+    padding:10px 12px;margin:14px 0 8px;font-size:13px;font-weight:600;color:var(--ok);
+    line-height:1.5;min-height:20px}
+  .readout.bad{color:var(--warn)}
+  .errs{color:var(--err);font-size:11.5px;line-height:1.45;margin:2px 0 8px;white-space:pre-wrap}
+  .ctx{color:var(--muted);font-size:11.5px;line-height:1.5;margin:4px 0}
+  .btns{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+  button{background:var(--card);color:var(--ink);border:1px solid #3a4d76;border-radius:6px;
+    padding:6px 10px;font-size:12px;cursor:pointer;font-family:inherit}
+  button:hover{background:var(--cardh)}
+  button.on{background:var(--accent);color:#08101f;border-color:var(--accent);font-weight:600}
+  .toggles{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px}
+  .toggles label{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);
+    background:var(--card);border:1px solid #33436a;border-radius:6px;padding:5px 8px;cursor:pointer}
+  .legend{margin-top:12px;font-size:11.5px;color:var(--muted);line-height:1.7}
+  .sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:middle;margin-right:5px}
+  .divider{height:1px;background:#2b3c60;margin:14px 0}
+  #loaderr{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+    text-align:center;padding:30px;color:var(--warn);font-size:14px;line-height:1.6}
+  #hint{position:absolute;left:12px;bottom:10px;color:var(--muted);font-size:11px;
+    background:rgba(20,30,52,.6);padding:4px 8px;border-radius:5px}
+  code{color:var(--accent)}
+  /* EMBED MODE (URL hash #embed): host-driven, VIEW-ONLY. Keep the info sidebar
+     (readout, dimensions, legend - "what's what") but hide the EDITABLE controls
+     (sliders + toggles) and the dev-only self-test badge. The 3D + a "general view"
+     banner show alongside. Standalone (no hash) is byte-for-byte unaffected. */
+  #embedbanner{display:none}
+  body.embed #sliders,
+  body.embed .toggles,
+  body.embed #selftest{display:none}
+  body.embed #embedbanner{display:block;position:absolute;top:10px;left:50%;
+    transform:translateX(-50%);color:var(--warn);font-size:12.5px;font-weight:600;
+    background:rgba(20,30,52,.72);border:1px solid #4a5a33;border-radius:6px;
+    padding:6px 14px;pointer-events:none;z-index:5;white-space:nowrap}
+  /* WELCOME MODE (URL hash #welcome): a full-bleed 3D "hero" shot for the GUI's
+     landing page - HIDE the whole sidebar (no readout/legend/sliders), show only
+     the 3D. It renders a generic illustrative jig WITH seated drill bushings; the
+     scene is otherwise the same three.js pipeline (WebGL antialias). */
+  body.welcome #panel{display:none}
+  body.welcome #app{width:100vw}
+  body.welcome #view{width:100vw}
+  body.welcome #hint{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <h1>Drill-Jig 3D Preview</h1>
+    <p class="sub">Concept prototype &middot; live orthogrid layout, drilled holes &amp;
+      chip-relief slots. Math mirrors <code>Get-OrthogridGeometry</code> / <code>Get-RowSlots</code>.</p>
+
+    <div id="selftest" class="selftest">math self-test: running&hellip;</div>
+
+    <div class="grp" id="sliders"></div>
+
+    <div class="toggles">
+      <label><input type="checkbox" id="lockEdge" checked> Edge = hole &Oslash;</label>
+      <label><input type="checkbox" id="tglSlots" checked> Slots</label>
+      <label><input type="checkbox" id="tglWire"> Wireframe</label>
+    </div>
+
+    <div id="readout" class="readout">&mdash;</div>
+    <div id="errs" class="errs"></div>
+    <div id="ctx" class="ctx"></div>
+
+    <div class="btns">
+      <button id="btnIso" class="on">Iso view</button>
+      <button id="btnTop">Top</button>
+      <button id="btnFront">Front</button>
+      <button id="btnReset">Reset view</button>
+    </div>
+
+    <div class="divider"></div>
+    <div class="legend">
+      <div><span class="sw" style="background:#9aa7bd"></span>plate</div>
+      <div><span class="sw" style="background:#0e1524;border:1px solid #3a4d76"></span>drilled holes (thru-all)</div>
+      <div><span class="sw" style="background:#e0a020"></span>chip-relief slots (1 per row)</div>
+      <div style="margin-top:6px">axes &nbsp;<b style="color:#ff6b6b">X</b>=width&nbsp;
+        <b style="color:#6bff9e">Y</b>=thickness&nbsp; <b style="color:#6bb6ff">Z</b>=depth</div>
+      <div style="margin-top:6px">drag = orbit &middot; wheel = zoom &middot; right-drag = pan</div>
+    </div>
+  </div>
+
+  <div id="view">
+    <canvas id="cv"></canvas>
+    <div id="loaderr"></div>
+    <div id="embedbanner">General view &mdash; approximate, not exact</div>
+    <div id="hint">drag to orbit &middot; scroll to zoom</div>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+/* ==========================================================================
+   1) PURE GEOMETRY  - direct port of lib\orthogrid.ps1 (Get-OrthogridGeometry
+      + Get-RowSlots). No three.js needed; runs on load for the self-test.
+   ========================================================================== */
+const TOL = 1e-9;
+
+// ---- module-scoped 3D + UI state, declared EARLY. applyEdgeLock() runs at load
+//      and reaches schedule(), which reads `ready`; a `let` declared lower would
+//      be in the Temporal Dead Zone and throw, silently killing the whole page.
+let THREE, controls, renderer, scene, camera, modelGroup, ready = false;
+let lastGeo = null, rafPending = false;
+// EMBED MODE: when the host (drilljig-gui WebView2) drives the scene, this holds
+// the host-supplied geometry and computeGeo() returns it instead of reading the
+// sliders. Null in the standalone window (sliders drive as normal).
+let EMBED_GEO = null;
+const EMBED = (location.hash || '').toLowerCase().indexOf('embed') !== -1;
+// WELCOME MODE: the GUI landing-page hero. Full-bleed 3D, no sidebar, and SEATED
+// DRILL BUSHINGS drawn in the bores (a headed cylinder per hole). It uses a generic
+// built-in layout so it renders on its own (no host payload needed).
+const WELCOME = (location.hash || '').toLowerCase().indexOf('welcome') !== -1;
+if (EMBED && !WELCOME && document.body) {
+  document.body.classList.add('embed');
+  // operator-facing header for the GUI overview (the sidebar stays: readout,
+  // dimensions, legend - "what's what" - just no editable sliders).
+  const _h1 = document.querySelector('h1'); if (_h1) _h1.textContent = 'Drill-Jig Overview';
+  const _sub = document.querySelector('.sub');
+  if (_sub) _sub.textContent = 'General view of your layout — approximate, not exact. Drag to rotate.';
+}
+if (WELCOME && document.body) { document.body.classList.add('welcome'); }
+let plateMat, plateBadMat, slotMat, edgeMat, bushBodyMat, bushHeadMat, bushBoreMat;
+let currentPlateMesh = null, currentEdges = null;
+
+function getOrthogridGeometry(CcX, CcZ, Nx, Nz, Edge, ClearDia, HoleDia, EdgeMargin) {
+  const errors = [];
+  if (CcX <= 0)      errors.push(`CcX must be > 0 (got ${CcX})`);
+  if (CcZ <= 0)      errors.push(`CcZ must be > 0 (got ${CcZ})`);
+  if (Nx < 1)        errors.push(`Nx must be >= 1 (got ${Nx})`);
+  if (Nz < 1)        errors.push(`Nz must be >= 1 (got ${Nz})`);
+  if (Edge < 0)      errors.push(`Edge must be >= 0 (got ${Edge})`);
+  if (ClearDia < 0)  errors.push(`ClearDia must be >= 0 (got ${ClearDia})`);
+  if (HoleDia < 0)   errors.push(`HoleDia must be >= 0 (got ${HoleDia})`);
+
+  const emGiven = (EdgeMargin >= 0);
+
+  if (HoleDia > 0) {
+    if (Nx >= 2 && CcX < (HoleDia - TOL))
+      errors.push(`center-to-center X ${round(CcX,4)} is less than the hole diameter ${round(HoleDia,4)} -- adjacent holes along X would overlap (use >= ${round(HoleDia,4)})`);
+    if (Nz >= 2 && CcZ < (HoleDia - TOL))
+      errors.push(`center-to-center Z ${round(CcZ,4)} is less than the hole diameter ${round(HoleDia,4)} -- adjacent holes along Z would overlap (use >= ${round(HoleDia,4)})`);
+    const holeRadius = HoleDia / 2.0;
+    const reqWall = emGiven ? EdgeMargin : holeRadius;
+    if (Nx >= 1 && Nz >= 1 && Edge < (reqWall - TOL))
+      errors.push(`edge margin ${round(Edge,4)} is less than the required edge margin ${round(reqWall,4)} -- a border hole would sit closer than that to the part edge (use >= ${round(reqWall,4)})`);
+  }
+
+  const valid = (errors.length === 0);
+  const width  = (Nx - 1) * CcX + 2 * Edge + ClearDia;
+  const height = (Nz - 1) * CcZ + 2 * Edge + ClearDia;
+  const count  = Nx * Nz;
+
+  const inset = Edge + ClearDia / 2.0;
+  const points = [];
+  if (Nx >= 1 && Nz >= 1) {
+    for (let i = 0; i < Nx; i++) {          // i outer, j inner (matches PS loop order)
+      for (let j = 0; j < Nz; j++) {
+        points.push({ I: i, J: j, X: inset + i * CcX, Z: inset + j * CcZ });
+      }
+    }
+  }
+  return {
+    valid, errors, mode: 'orthogrid',
+    CcX, CcZ, Nx, Nz, Edge, ClearDia, HoleDia,
+    edgeMargin: emGiven ? EdgeMargin : HoleDia / 2.0,
+    width, height, count, points
+  };
+}
+
+// Get-RowSlots (LengthMode='full'): one full-length band per hole row. rowAxis 'X'
+// (default) = rows run along X, grouped on the CROSS = Z; rowAxis 'Z' = the swap (rows
+// run along Z, grouped on the CROSS = X). The band spans the full plate along the row
+// axis and is slotWidth thick on the cross axis. Output fields are ALWAYS in X/Z space
+// (alongMin/alongMax = X-extent, crossLo/crossHi = Z-extent, centerX/centerZ) so the
+// slot-mesh drawing is direction-agnostic. rowAxis omitted -> 'X', so the in-page
+// self-test (which never passes rowAxis) is byte-identical to before.
+function getRowSlots(points, slotWidth, width, height, rowAxis) {
+  const rows = [];
+  if (!points || points.length < 1 || !(slotWidth > 0)) return { valid: false, count: 0, rows };
+  const ax = (('' + (rowAxis || 'X')).toUpperCase() === 'Z') ? 'Z' : 'X';
+  const rowTol = Math.max(slotWidth / 4, 0.01);   // PHYSICAL, never 1e-6
+  const crossOf   = (ax === 'Z') ? (p => p.X) : (p => p.Z);   // group on the cross coord
+  const fullAlong = (ax === 'Z') ? height : width;           // the row-axis plate extent
+
+  const pts = points.map(p => ({ cross: crossOf(p) })).sort((a, b) => a.cross - b.cross);
+  const groups = [];
+  let cur = [], prev = null;
+  for (const p of pts) {
+    if (cur.length === 0) { cur = [p]; prev = p.cross; continue; }
+    if (Math.abs(p.cross - prev) > rowTol) { groups.push(cur); cur = [p]; }
+    else cur.push(p);
+    prev = p.cross;
+  }
+  if (cur.length) groups.push(cur);
+
+  let idx = 0;
+  for (const g of groups) {
+    const mean = g.reduce((s, p) => s + p.cross, 0) / g.length;
+    let bandLo = mean - slotWidth / 2, bandHi = mean + slotWidth / 2;
+    if (bandLo < 0) bandLo = 0;
+    // map (full span on the row axis, slotWidth band on the cross axis) into X/Z:
+    let alongMin, alongMax, crossLo, crossHi;
+    if (ax === 'Z') { alongMin = bandLo; alongMax = bandHi; crossLo = 0; crossHi = fullAlong; }  // X band, Z full
+    else            { alongMin = 0; alongMax = fullAlong; crossLo = bandLo; crossHi = bandHi; }  // X full, Z band
+    rows.push({
+      index: idx++, crossCoord: mean, crossLo, crossHi,
+      alongMin, alongMax, slotLen: (ax === 'Z' ? (crossHi - crossLo) : (alongMax - alongMin)), slotWidth,
+      centerX: (alongMin + alongMax) / 2, centerZ: (crossLo + crossHi) / 2,
+      corner0: { X: alongMin, Z: crossLo }, corner1: { X: alongMax, Z: crossHi }
+    });
+  }
+  return { valid: true, count: rows.length, rows };
+}
+
+function round(v, n) { const f = Math.pow(10, n); return Math.round(v * f) / f; }
+
+/* ==========================================================================
+   2) MATH SELF-TEST  - expected values captured from the REAL PowerShell
+      Get-OrthogridGeometry / Get-RowSlots (2026-07-22). If these pass, the JS
+      port above reproduces the app's geometry exactly.
+   ========================================================================== */
+const SELFTEST_CASES = [
+  { n:'default',  in:[0.5,0.5,5,4,0.25,0.25,0.25,0.25],
+    exp:{valid:true,  width:2.75, height:2.25, count:20, errN:0, p0:[0.375,0.375],  pl:[2.375,1.875],  slots:4, s0:[0,0.25,2.75,0.5]} },
+  { n:'single',   in:[0.5,0.5,1,1,0.5,0.5,0.5,0.5],
+    exp:{valid:true,  width:1.5,  height:1.5,  count:1,  errN:0, p0:[0.75,0.75],    pl:[0.75,0.75],    slots:1, s0:[0,0.5,1.5,1]} },
+  { n:'collideX', in:[0.4,0.6,3,3,0.5,0.5,0.5,0.5],
+    exp:{valid:false, width:2.3,  height:2.7,  count:9,  errN:1} },
+  { n:'edgefail', in:[0.6,0.6,3,3,0.1,0.5,0.5,0.5],
+    exp:{valid:false, width:1.9,  height:1.9,  count:9,  errN:1} },
+  { n:'wide',     in:[0.75,0.5,8,3,0.375,0.375,0.375,0.375],
+    exp:{valid:true,  width:6.375,height:2.125,count:24, errN:0, p0:[0.5625,0.5625],pl:[5.8125,1.5625],slots:3, s0:[0,0.375,6.375,0.75]} }
+];
+
+function runSelfTest() {
+  const T = 1e-4, fails = [];
+  for (const c of SELFTEST_CASES) {
+    const g = getOrthogridGeometry(...c.in), e = c.exp, f = [];
+    if (g.valid !== e.valid) f.push('valid');
+    if (Math.abs(g.width  - e.width)  > T) f.push('width');
+    if (Math.abs(g.height - e.height) > T) f.push('height');
+    if (g.count !== e.count) f.push('count');
+    if (g.errors.length !== e.errN) f.push('errN');
+    if (e.p0) {
+      const p0 = g.points[0], pl = g.points[g.points.length - 1];
+      if (Math.abs(p0.X-e.p0[0])>T || Math.abs(p0.Z-e.p0[1])>T) f.push('p0');
+      if (Math.abs(pl.X-e.pl[0])>T || Math.abs(pl.Z-e.pl[1])>T) f.push('pl');
+    }
+    if (e.slots !== undefined) {
+      const s = g.valid ? getRowSlots(g.points, c.in[6], g.width, g.height) : { count:0, rows:[] };
+      if (s.count !== e.slots) f.push('slotN');
+      if (e.s0 && s.rows.length) {
+        const r = s.rows[0];
+        if (Math.abs(r.corner0.X-e.s0[0])>T || Math.abs(r.corner0.Z-e.s0[1])>T ||
+            Math.abs(r.corner1.X-e.s0[2])>T || Math.abs(r.corner1.Z-e.s0[3])>T) f.push('slot0');
+      }
+    }
+    if (f.length) fails.push(`${c.n}:${f.join(',')}`);
+  }
+  const el = document.getElementById('selftest');
+  if (fails.length === 0) {
+    el.className = 'selftest pass';
+    el.textContent = `✓ math self-test: ${SELFTEST_CASES.length}/${SELFTEST_CASES.length} PASS (JS == PowerShell)`;
+  } else {
+    el.className = 'selftest fail';
+    el.textContent = `✗ math self-test: ${SELFTEST_CASES.length - fails.length}/${SELFTEST_CASES.length} - ${fails.join(' | ')}`;
+  }
+}
+runSelfTest();  // pure JS - runs even if three.js fails to load
+
+/* ==========================================================================
+   3) UI STATE + SLIDERS
+   ========================================================================== */
+const P = { CcX:0.5, CcZ:0.5, Nx:5, Nz:4, HoleDia:0.25, BushingLen:0.75, SlotDepth:0.25, Edge:0.25, RowAxis:'X' };
+// WELCOME hero: match the fixed generic layout in computeGeo() (hole 0.5, 3x2 grid)
+if (WELCOME) { P.HoleDia = 0.5; P.BushingLen = 0.7; P.SlotDepth = 0.22; P.Edge = 0.5; P.CcX = 0.9; P.CcZ = 0.9; P.Nx = 3; P.Nz = 2; }
+
+const SLIDERS = [
+  { k:'Nx',        label:'Holes along X (Nx)', min:1,   max:15, step:1,   fmt:v=>v.toFixed(0) },
+  { k:'Nz',        label:'Holes along Z (Nz)', min:1,   max:15, step:1,   fmt:v=>v.toFixed(0) },
+  { k:'CcX',       label:'Center-to-center X', min:0.1, max:3,  step:0.05,fmt:v=>v.toFixed(2)+'"' },
+  { k:'CcZ',       label:'Center-to-center Z', min:0.1, max:3,  step:0.05,fmt:v=>v.toFixed(2)+'"' },
+  { k:'HoleDia',   label:'Hole diameter',      min:0.05,max:1.5,step:0.01,fmt:v=>v.toFixed(2)+'"' },
+  { k:'BushingLen',label:'Bushing length',     min:0.1, max:3,  step:0.05,fmt:v=>v.toFixed(2)+'"' },
+  { k:'SlotDepth', label:'Slot depth',         min:0,   max:1,  step:0.01,fmt:v=>v.toFixed(2)+'"' },
+  { k:'Edge',      label:'Edge margin',        min:0,   max:1,  step:0.01,fmt:v=>v.toFixed(2)+'"' }
+];
+
+const sliderEls = {};
+const wrap = document.getElementById('sliders');
+for (const s of SLIDERS) {
+  const row = document.createElement('div'); row.className = 'row';
+  const lab = document.createElement('label'); lab.textContent = s.label; lab.htmlFor = 'sl_'+s.k;
+  const inp = document.createElement('input');
+  inp.type='range'; inp.id='sl_'+s.k; inp.min=s.min; inp.max=s.max; inp.step=s.step; inp.value=P[s.k];
+  const val = document.createElement('span'); val.className='val'; val.textContent=s.fmt(P[s.k]);
+  row.append(lab, inp, val); wrap.appendChild(row);
+  sliderEls[s.k] = { inp, val, fmt:s.fmt };
+  inp.addEventListener('input', () => {
+    P[s.k] = parseFloat(inp.value);
+    if (lockEdge.checked && (s.k === 'HoleDia')) { P.Edge = P.HoleDia; syncEdgeSlider(); }
+    val.textContent = s.fmt(P[s.k]);
+    schedule();
+  });
+}
+const lockEdge = document.getElementById('lockEdge');
+const edgeRow = sliderEls['Edge'];
+function syncEdgeSlider(){ edgeRow.inp.value = P.Edge; edgeRow.val.textContent = edgeRow.fmt(P.Edge); }
+function applyEdgeLock(){
+  if (lockEdge.checked){ P.Edge = P.HoleDia; syncEdgeSlider(); edgeRow.inp.disabled = true; }
+  else { edgeRow.inp.disabled = false; }
+  schedule();
+}
+lockEdge.addEventListener('change', applyEdgeLock);
+applyEdgeLock();  // start locked (matches the app: Edge = hole dia)
+
+const tglSlots = document.getElementById('tglSlots');
+const tglWire  = document.getElementById('tglWire');
+tglSlots.addEventListener('change', schedule);
+tglWire .addEventListener('change', () => { applyWire(); render(); });
+
+/* ==========================================================================
+   4) THREE.JS SCENE  (state hoisted to the top of the module to avoid TDZ)
+   ========================================================================== */
+async function boot() {
+  try {
+    THREE = await import('three');
+    const mod = await import('three/addons/controls/OrbitControls.js');
+    startApp(mod.OrbitControls);
+  } catch (e) {
+    const el = document.getElementById('loaderr');
+    el.style.display = 'flex';
+    el.innerHTML = '3D renderer could not load three.js (needs network for this prototype).<br>' +
+      'The <b>math self-test</b> and readout above still work offline.<br><br>' +
+      '<span style="color:#9EACC4;font-size:12px">The production GUI path is offline WPF Media3D, not this file.</span>';
+    // still drive the readout so sliders show live numbers (the slider 'input'
+    // handlers already call schedule() -> recomputeOnly() while ready===false).
+    recomputeOnly();
+  }
+}
+
+function startApp(OrbitControls) {
+  const cv = document.getElementById('cv');
+  renderer = new THREE.WebGLRenderer({ canvas: cv, antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1E2A44);
+
+  camera = new THREE.PerspectiveCamera(48, 1, 0.01, 500);
+  controls = new OrbitControls(camera, cv);
+  controls.enableDamping = true; controls.dampingFactor = 0.09;
+  // WELCOME hero: gentle auto-orbit about the target, stopped once the user grabs it
+  if (WELCOME) { controls.autoRotate = true; controls.autoRotateSpeed = 0.8; }
+  controls.addEventListener('start', () => { controls.autoRotate = false; });
+
+  scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x223047, 0.95));
+  const dir = new THREE.DirectionalLight(0xffffff, 1.15); dir.position.set(4, 8, 6); scene.add(dir);
+  const fill = new THREE.DirectionalLight(0x99bbff, 0.4); fill.position.set(-5, 3, -4); scene.add(fill);
+  // a touch more key light for the metallic bushings on the hero view
+  if (WELCOME) { const rim = new THREE.DirectionalLight(0xfff0d8, 0.5); rim.position.set(-3, 5, 7); scene.add(rim); }
+
+  addAxes();
+  modelGroup = new THREE.Group(); scene.add(modelGroup);
+
+  document.getElementById('btnIso'  ).addEventListener('click', () => setView('iso'));
+  document.getElementById('btnTop'  ).addEventListener('click', () => setView('top'));
+  document.getElementById('btnFront').addEventListener('click', () => setView('front'));
+  document.getElementById('btnReset').addEventListener('click', () => fitView(true));
+
+  window.addEventListener('resize', onResize);
+  onResize();
+  ready = true;
+  rebuild(true);
+  animate();
+}
+
+// materials created once, reused across rebuilds (only geometry is rebuilt)
+function ensureMats() {
+  if (plateMat) return;
+  plateMat    = new THREE.MeshStandardMaterial({ color:0x9aa7bd, metalness:0.55, roughness:0.5, side:THREE.DoubleSide });
+  plateBadMat = new THREE.MeshStandardMaterial({ color:0xd06a62, metalness:0.35, roughness:0.6, side:THREE.DoubleSide });
+  edgeMat     = new THREE.LineBasicMaterial({ color:0x0e1524 });
+  slotMat     = new THREE.MeshStandardMaterial({ color:0xe0a020, metalness:0.2,  roughness:0.55,
+                  transparent:true, opacity:0.72, side:THREE.DoubleSide });
+  // seated drill-bushing materials (welcome mode): bright steel body + head, dark bore.
+  // DoubleSide so the OPEN tube walls + flat annular caps read from inside and out (the
+  // bushing is a hollow tube - the bore is real empty space you can see through).
+  bushBodyMat = new THREE.MeshStandardMaterial({ color:0xc2cad8, metalness:0.8, roughness:0.32, side:THREE.DoubleSide });
+  bushHeadMat = new THREE.MeshStandardMaterial({ color:0xd6dce8, metalness:0.8, roughness:0.28, side:THREE.DoubleSide });
+  bushBoreMat = new THREE.MeshStandardMaterial({ color:0x39424f, metalness:0.6, roughness:0.5,  side:THREE.DoubleSide });
+}
+
+function rebuild(refit) {
+  if (!ready) return;
+  ensureMats();
+  // dispose old
+  while (modelGroup.children.length) {
+    const c = modelGroup.children.pop();
+    if (c.geometry) c.geometry.dispose();
+    modelGroup.remove(c);
+  }
+  currentPlateMesh = null; currentEdges = null;
+
+  const geo = computeGeo();
+  lastGeo = geo;
+  updateReadout(geo);
+
+  const thickness = P.BushingLen + P.SlotDepth;
+  const w = geo.width, h = geo.height;
+  if (!(w > 0 && h > 0)) return;
+
+  // ---- plate: extrude a rectangle with a circular hole at every point -> real thru-holes
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0); shape.lineTo(w, 0); shape.lineTo(w, h); shape.lineTo(0, h); shape.lineTo(0, 0);
+  const r = P.HoleDia / 2;
+  if (r > 0) {
+    for (const p of geo.points) {
+      const hole = new THREE.Path();
+      hole.absarc(p.X, p.Z, r, 0, Math.PI * 2, true);
+      shape.holes.push(hole);
+    }
+  }
+  const pg = new THREE.ExtrudeGeometry(shape, { depth: thickness, bevelEnabled: false, curveSegments: 36 });
+  const plate = new THREE.Mesh(pg, geo.valid ? plateMat : plateBadMat);
+  plate.rotation.x = -Math.PI / 2;      // shape XY -> world XZ, extrude -> +Y (thickness up)
+  modelGroup.add(plate);
+  currentPlateMesh = plate;
+
+  // thin dark edge lines for definition
+  const eg = new THREE.EdgesGeometry(pg, 30);
+  const edges = new THREE.LineSegments(eg, edgeMat);   // reused singleton (no per-rebuild leak)
+  edges.rotation.x = -Math.PI / 2;
+  modelGroup.add(edges);
+  currentEdges = edges;
+
+  // ---- chip-relief slots: one full-length band per hole row.
+  // Standard/overview mode recesses the slot from the TOP; WELCOME mode recesses it
+  // from the BOTTOM (opposite the bushing heads, which sit on top) so it reads as the
+  // "slot on the bottom" the operator asked for.
+  if (tglSlots.checked && geo.valid && P.SlotDepth > 0) {
+    const slots = getRowSlots(geo.points, P.HoleDia, w, h, P.RowAxis);
+    for (const row of slots.rows) {
+      const sx = Math.max(row.alongMax - row.alongMin, 1e-3);
+      const sz = Math.max(row.crossHi - row.crossLo, 1e-3);
+      const box = new THREE.BoxGeometry(sx, P.SlotDepth, sz);
+      const m = new THREE.Mesh(box, slotMat);
+      const yc = WELCOME ? (P.SlotDepth / 2 - 0.002) : (thickness - P.SlotDepth / 2 + 0.002);
+      // group-space frame matches the rotated plate: world (X, Yup, -Z)
+      m.position.set(row.centerX, yc, -row.centerZ);
+      modelGroup.add(m);
+    }
+  }
+
+  // ---- WELCOME: a seated headed DRILL BUSHING in each bore, built as a HOLLOW TUBE
+  //      so the through-bore is real EMPTY space you can see straight through (open
+  //      outer + inner walls, flat annular caps - no solid center). The head flange
+  //      protrudes above the top. Only the hero landing view; overview/standalone
+  //      modes keep the plain empty bores.
+  if (WELCOME && r > 0) {
+    const bodyR = r * 0.985;                          // body outer radius (fills the bore)
+    const boreR = Math.max(r * 0.5, 0.02);            // inner bore radius (empty)
+    const headR = r * 1.42;                           // protruding flange outer radius
+    const headH = Math.max(thickness * 0.16, r * 0.5);
+    const seg = 40;
+    // build ONE reusable tube (outer wall + inner bore wall + top/bottom ring caps),
+    // shifted so the body spans [0,thickness] with the head added on top.
+    const RING_ROT = -Math.PI / 2;                    // RingGeometry lies in XY -> rotate to XZ (horizontal)
+    for (const p of geo.points) {
+      const gx = p.X, gz = -p.Z;
+      const g = new THREE.Group();
+      // --- body: hollow tube from y=0 to y=thickness ---
+      const outerWall = new THREE.Mesh(new THREE.CylinderGeometry(bodyR, bodyR, thickness, seg, 1, true), bushBodyMat);
+      outerWall.position.y = thickness / 2; g.add(outerWall);
+      const boreWall = new THREE.Mesh(new THREE.CylinderGeometry(boreR, boreR, thickness + headH + 0.01, seg, 1, true), bushBoreMat);
+      boreWall.position.y = (thickness + headH) / 2; g.add(boreWall);   // bore runs full height (body+head)
+      const botCap = new THREE.Mesh(new THREE.RingGeometry(boreR, bodyR, seg), bushBodyMat);
+      botCap.rotation.x = RING_ROT; botCap.position.y = 0.001; g.add(botCap);
+      // --- head: wider flange on top, from y=thickness to y=thickness+headH ---
+      const headWall = new THREE.Mesh(new THREE.CylinderGeometry(headR, headR, headH, seg, 1, true), bushHeadMat);
+      headWall.position.y = thickness + headH / 2; g.add(headWall);
+      const shoulder = new THREE.Mesh(new THREE.RingGeometry(bodyR, headR, seg), bushHeadMat);   // body top -> head underside
+      shoulder.rotation.x = RING_ROT; shoulder.position.y = thickness; g.add(shoulder);
+      const topCap = new THREE.Mesh(new THREE.RingGeometry(boreR, headR, seg), bushHeadMat);      // head top annulus (bore stays open)
+      topCap.rotation.x = RING_ROT; topCap.position.y = thickness + headH; g.add(topCap);
+      g.position.set(gx, 0, gz);
+      modelGroup.add(g);
+    }
+  }
+
+  // center the whole model at the origin (frame: world.x=X, world.z=-Z)
+  modelGroup.position.set(-w / 2, 0, h / 2);
+
+  applyWire();
+  if (refit) fitView(false);
+}
+
+function applyWire() {
+  const wire = tglWire.checked;
+  if (plateMat)    plateMat.wireframe = wire;
+  if (plateBadMat) plateBadMat.wireframe = wire;
+  if (slotMat)     slotMat.wireframe = wire;
+  if (currentEdges) currentEdges.visible = !wire;
+}
+
+/* ---- camera framing ---- */
+function fitView(reset) {
+  if (!lastGeo) return;
+  const w = lastGeo.width, h = lastGeo.height, t = P.BushingLen + P.SlotDepth;
+  const maxDim = Math.max(w, h, t) || 1;
+  const dist = (maxDim / (2 * Math.tan((camera.fov * Math.PI / 180) / 2))) * 1.7;
+  controls.target.set(0, t / 2, 0);
+  if (reset || !camera.userData.placed) {
+    camera.position.set(dist * 0.75, dist * 0.7, dist * 0.85);
+    camera.userData.placed = true;
+  }
+  camera.near = maxDim / 100; camera.far = maxDim * 50;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+function setView(kind) {
+  if (!lastGeo) return;
+  const w = lastGeo.width, h = lastGeo.height, t = P.BushingLen + P.SlotDepth;
+  const maxDim = Math.max(w, h, t) || 1;
+  const dist = (maxDim / (2 * Math.tan((camera.fov * Math.PI / 180) / 2))) * 1.7;
+  controls.target.set(0, t / 2, 0);
+  if (kind === 'top')   camera.position.set(0.0001, dist, 0.0001);
+  if (kind === 'front') camera.position.set(0, t / 2, dist);
+  if (kind === 'iso')   camera.position.set(dist * 0.75, dist * 0.7, dist * 0.85);
+  document.getElementById('btnIso').classList.toggle('on', kind === 'iso');
+  camera.updateProjectionMatrix(); controls.update();
+}
+
+function addAxes() {
+  const L = 1.0;
+  const mk = (dir, color) => {
+    const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), dir.clone().multiplyScalar(L)]);
+    return new THREE.Line(g, new THREE.LineBasicMaterial({ color }));
+  };
+  const ax = new THREE.Group();
+  ax.add(mk(new THREE.Vector3(1,0,0), 0xff6b6b));   // X width
+  ax.add(mk(new THREE.Vector3(0,1,0), 0x6bff9e));   // Y thickness
+  ax.add(mk(new THREE.Vector3(0,0,1), 0x6bb6ff));   // Z depth
+  ax.position.set(0, 0, 0);
+  scene.add(ax);
+}
+
+function onResize() {
+  const v = document.getElementById('view');
+  const w = v.clientWidth, h = v.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+
+function schedule() { if (!ready) { recomputeOnly(); return; } if (!rafPending) { rafPending = true; requestAnimationFrame(() => { rafPending = false; rebuild(false); }); } }
+function render() { renderer.render(scene, camera); }
+function animate() { controls.update(); render(); requestAnimationFrame(animate); }
+
+/* ==========================================================================
+   5) READOUT (works with or without 3D)
+   ========================================================================== */
+function computeGeo() {
+  if (EMBED_GEO) return EMBED_GEO;                 // host-driven (drilljig-gui): use the supplied layout
+  if (WELCOME) {                                   // hero landing view: a fixed, good-looking generic jig
+    return getOrthogridGeometry(0.9, 0.9, 3, 2, 0.5, 0.5, 0.5, 0.5);
+  }
+  const clear = P.HoleDia;                         // ClearDia = hole dia (app rule)
+  const em = lockEdge.checked ? P.HoleDia : -1;    // EdgeMargin = hole dia when locked
+  return getOrthogridGeometry(P.CcX, P.CcZ, Math.round(P.Nx), Math.round(P.Nz), P.Edge, clear, P.HoleDia, em);
+}
+
+// HOST BRIDGE (embed mode): drilljig-gui calls this via ExecuteScriptAsync with the
+// current layout so the 3D reflects exactly what the operator laid out. Payload:
+// { valid, width, height, holeDia, thickness, slotDepth, points:[{X,Z},...] }.
+// Stash-and-apply so it works whether it arrives before or after three.js is ready.
+window.setJigGeometry = function (p) {
+  try {
+    EMBED_GEO = {
+      valid: !!p.valid, width: +p.width, height: +p.height,
+      count: (p.points || []).length, points: p.points || [], errors: []
+    };
+    P.HoleDia = +p.holeDia;
+    P.SlotDepth = +p.slotDepth;
+    P.BushingLen = Math.max(0.01, (+p.thickness) - (+p.slotDepth));  // so thickness = BushingLen + SlotDepth
+    // chip-relief slot DIRECTION from the host (fastener X/Z toggle); default X so a
+    // payload without rowAxis behaves exactly as before. The band grouping + orientation
+    // flow through getRowSlots(...,P.RowAxis) in rebuild(), so the slots reorient live.
+    P.RowAxis = (('' + (p.rowAxis || 'X')).toUpperCase() === 'Z') ? 'Z' : 'X';
+    if (ready) { rebuild(true); }   // else the initial startApp rebuild() reads EMBED_GEO
+  } catch (e) { /* never throw into the host */ }
+};
+function recomputeOnly() { updateReadout(computeGeo()); }
+
+function updateReadout(geo) {
+  const ro = document.getElementById('readout'), er = document.getElementById('errs'), cx = document.getElementById('ctx');
+  const thickness = P.BushingLen + P.SlotDepth;
+  let slotN = 0;
+  if (geo.valid) { const s = getRowSlots(geo.points, P.HoleDia, geo.width, geo.height, P.RowAxis); slotN = s.count; }
+  if (geo.valid) {
+    ro.className = 'readout';
+    ro.textContent = `Part ${geo.width.toFixed(2)} × ${geo.height.toFixed(2)}"   |   ${geo.count} holes   |   ${slotN} relief slot(s)`;
+    er.textContent = '';
+  } else {
+    ro.className = 'readout bad';
+    ro.textContent = `Part ${geo.width.toFixed(2)} × ${geo.height.toFixed(2)}"  (invalid layout)`;
+    er.textContent = geo.errors.join('\n');
+  }
+  cx.textContent = `hole Ø ${P.HoleDia.toFixed(3)}"   ·   plate thickness ${thickness.toFixed(3)}" (bushing ${P.BushingLen.toFixed(2)} + slot ${P.SlotDepth.toFixed(2)})`;
+}
+
+boot();
+</script>
+</body>
+</html>

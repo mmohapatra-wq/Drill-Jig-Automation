@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bushing SVG Schematic Preview</title>
+<!--
+  Standalone, single-page test harness for the drill-jig "render our own bushing
+  schematic" idea (research 2026-07-22: McMaster product images cannot be pulled by
+  part number, so we DRAW the bushing ourselves from OD / ID / Length -- values the
+  catalog already stores). This page is the PROTOTYPE for the eventual PowerShell
+  helper `Get-BushingSvg -OD -ID -Length [-HeadDia]`: the JS bushingSvg() function
+  below is written to map 1:1 onto that helper, and its emitted SVG markup is exactly
+  what the helper should produce (view it via "Show SVG source").
+
+  No dependencies, no network, no build step -- open it in any browser. Matches the
+  dark theme of docs\drill_jig_tree_builder.html. Nothing here touches the toolkit's
+  .cmd / .ps1 code; it is a sandbox for eyeballing the visual before it is ported.
+-->
+<style>
+  :root {
+    --bg:#1e1f24; --panel:#2a2c33; --panel2:#32343c; --ink:#e7e8ea; --muted:#9aa0a6;
+    --line:#3d404a; --accent:#4f9cff; --ok:#38c172; --warn:#e0a93b; --err:#ef6b73;
+    --steel:#c7ccd4; --steel-dk:#8b92a0; --hatch:#5a6070; --bore:#15161a;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 "Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .hint { color:var(--muted); font-size:12px; }
+  .wrap { display:flex; gap:0; height:calc(100vh - 52px); }
+  .left { flex:0 0 340px; overflow:auto; padding:16px 18px; border-right:1px solid var(--line); background:var(--panel); }
+  .right { flex:1 1 auto; overflow:auto; padding:18px 20px; display:flex; flex-direction:column; gap:14px; }
+  h2 { font-size:12px; margin:0 0 8px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+  label.fld { display:block; margin:10px 0 2px; font-size:12px; color:var(--muted); }
+  input[type=number], input[type=text], select {
+    width:100%; font:inherit; background:var(--panel2); color:var(--ink);
+    border:1px solid var(--line); border-radius:6px; padding:6px 8px;
+  }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
+  .row2 { display:flex; gap:8px; }
+  .row2 > div { flex:1; }
+  button { font:inherit; cursor:pointer; border:1px solid var(--line); background:var(--panel2); color:var(--ink); border-radius:6px; padding:6px 12px; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .svgwrap { display:flex; align-items:center; justify-content:center; background:#202127; border:1px solid var(--line); border-radius:10px; padding:10px; min-height:320px; }
+  .svgwrap svg { max-width:100%; height:auto; }
+  .meta { display:flex; flex-wrap:wrap; gap:8px 22px; font-size:13px; }
+  .meta b { color:var(--muted); font-weight:600; }
+  .pnrow { font-size:13px; }
+  .pnrow a { color:var(--accent); text-decoration:none; }
+  .pnrow a:hover { text-decoration:underline; }
+  .flag { color:var(--warn); font-size:12px; margin-top:4px; }
+  .err { color:var(--err); font-size:13px; margin-top:6px; min-height:18px; }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  textarea.src { width:100%; height:220px; background:#16171b; color:#cfe3ff; border:1px solid var(--line); border-radius:8px; padding:10px; font:12px/1.5 "Cascadia Code", Consolas, monospace; resize:vertical; white-space:pre; }
+  details summary { cursor:pointer; color:var(--muted); font-size:12px; margin-bottom:6px; }
+  .note { color:var(--muted); font-size:12px; }
+  .chk { display:flex; align-items:center; gap:6px; margin-top:10px; font-size:12px; color:var(--muted); }
+  .chk input { width:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bushing SVG Schematic Preview</h1>
+  <span class="hint">Prototype for <code>Get-BushingSvg -OD -ID -Length</code>. We draw the bushing ourselves from the dimensions the catalog already stores (McMaster product images can't be pulled by part number).</span>
+</header>
+<div class="wrap">
+  <div class="left">
+    <h2>Bushing</h2>
+    <label class="fld" for="preset">Catalog preset (real rows)</label>
+    <select id="preset"></select>
+
+    <div class="row2" style="margin-top:10px">
+      <div><label class="fld" for="od">OD (in)</label><input type="number" id="od" step="0.0001" min="0" value="0.75"></div>
+      <div><label class="fld" for="id">ID / bore (in)</label><input type="number" id="id" step="0.0001" min="0" value="0.5"></div>
+    </div>
+    <div class="row2">
+      <div><label class="fld" for="len">Length (in)</label><input type="number" id="len" step="0.0001" min="0" value="0.75"></div>
+      <div><label class="fld" for="head">Head Ø (opt, in)</label><input type="number" id="head" step="0.0001" min="0" value=""></div>
+    </div>
+
+    <label class="fld" for="label">Label (EasyName)</label>
+    <input type="text" id="label" value="Sleeve | OD 3/4 x ID 1/2 x 3/4 Lg">
+    <label class="fld" for="pn">McMaster part number</label>
+    <input type="text" id="pn" value="3556N158">
+
+    <div class="err" id="err"></div>
+
+    <label class="chk"><input type="checkbox" id="showEnd" checked> Show end view</label>
+    <label class="chk"><input type="checkbox" id="showDims" checked> Show dimensions</label>
+
+    <div class="toolbar" style="margin-top:16px">
+      <button class="primary" id="dl">Download SVG</button>
+      <button id="dlpng">Download PNG</button>
+    </div>
+    <p class="note" style="margin-top:14px">This page changes no toolkit code. It only renders the schematic so you can approve the look before it's ported to a pure <code>lib\</code> helper + a WinForms/PictureBox preview in <code>drilljig-gui.cmd</code>.</p>
+  </div>
+
+  <div class="right">
+    <div class="card">
+      <div class="svgwrap" id="svgwrap"></div>
+    </div>
+
+    <div class="card">
+      <div class="meta" id="meta"></div>
+      <div class="pnrow" id="pnrow" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <details>
+        <summary>Show SVG source (this is what <code>Get-BushingSvg</code> will emit)</summary>
+        <div class="toolbar" style="margin:6px 0 8px"><button id="copy">Copy SVG</button><span class="note" id="copied"></span></div>
+        <textarea class="src" id="src" readonly spellcheck="false"></textarea>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// Real catalog rows (from data\bushings.csv + data\bushings_drill.csv, 2026-07-22).
+// The last one is an OD-3/4 removable bushing whose PN was blanked+flagged this month
+// (real McMaster number was clipped from the source PDF) -- it exercises the
+// "no part number -> show the note, no link" path.
+const PRESETS = [
+  { easy:"Sleeve | OD 3/4 x ID 1/2 x 5/16 Lg",       pn:"3556N155", od:0.75, id:0.5,   len:0.3125, note:"" },
+  { easy:"Sleeve | OD 3/4 x ID 1/2 x 3/4 Lg",        pn:"3556N158", od:0.75, id:0.5,   len:0.75,   note:"" },
+  { easy:"Sleeve | OD 1 x ID 3/4 x 3/8 Lg",          pn:"3556N179", od:1.0,  id:0.75,  len:0.375,  note:"" },
+  { easy:"Drill Bushing | OD 1/4 x ID 0.125 x 1/4 Lg", pn:"8493A002", od:0.25, id:0.125, len:0.25, note:"" },
+  { easy:"Drill Bushing | OD 1/2 x ID 0.25 x 1/4 Lg",  pn:"8493A072", od:0.5,  id:0.25,  len:0.25, note:"" },
+  { easy:"Drill Bushing | OD 3/4 x ID 1/2 x 3/4 Lg (removable, PN unverified)", pn:"", od:0.75, id:0.5, len:0.75,
+    note:"PN unverified - real 3/4 OD removable-bushing part number was clipped from the source McMaster PDF; look up on mcmaster.com by ID+length before ordering." },
+];
+
+// ---- machinist-fraction label (reverse of ConvertTo-Decimal; matches EasyName style) ----
+function toFrac(x) {
+  if (!isFinite(x) || x <= 0) return String(x);
+  const whole = Math.floor(x + 1e-9);
+  const frac = x - whole;
+  if (frac < 1e-6) return String(whole);                 // integer inches
+  for (const den of [2,4,8,16,32,64]) {
+    const num = Math.round(frac * den);
+    if (Math.abs(num/den - frac) < 1e-6) {
+      let n = num, d = den;
+      const g = gcd(n, d); n/=g; d/=g;                    // reduce
+      const f = n + "/" + d;
+      return whole > 0 ? (whole + " " + f) : f;
+    }
+  }
+  return (+x.toFixed(4)).toString();                      // odd drill size -> decimal
+}
+function gcd(a,b){ return b ? gcd(b, a%b) : a; }
+const DIA = "⌀";                                     // diameter sign  (charset=utf-8)
+
+// ---------------------------------------------------------------------------
+// bushingSvg(opts) -> SVG string.  PURE. This is the exact logic the PowerShell
+// helper Get-BushingSvg -OD -ID -Length [-HeadDia] will reproduce.
+//   opts = { od, id, len, headDia?, label?, pn?, showEnd?, showDims? }
+// Draws a longitudinal cross-section (walls hatched, bore open) + optional end
+// view (concentric OD/ID circles). Dimensions labeled in machinist fractions.
+// ---------------------------------------------------------------------------
+function bushingSvg(o) {
+  const od = +o.od, id = +o.id, len = +o.len;
+  const headDia = o.headDia > 0 ? +o.headDia : 0;
+  const showEnd  = o.showEnd  !== false;
+  const showDims = o.showDims !== false;
+
+  // ---- layout constants (SVG user units == px) ----
+  const W = showEnd ? 660 : 460, H = 340;
+  const sideL = 70, sideT = 56, sideMaxW = 300, sideMaxH = 200;   // side-view region
+  const outerDia = Math.max(od, headDia);
+
+  // auto-scale so the largest extent fills ~92% of its region (both views share scale)
+  const scale = Math.min(sideMaxW / len, sideMaxH / outerDia) * 0.92;
+  const Lp = len * scale, ODp = od * scale, IDp = id * scale, HDp = headDia * scale;
+
+  // side-view box, centered in its region
+  const bx = sideL + (sideMaxW - Lp) / 2;
+  const by = sideT + (sideMaxH - ODp) / 2;
+  const cy = by + ODp / 2;                                        // axis center-y
+  const wall = (ODp - IDp) / 2;                                   // wall thickness (px)
+  const boreT = by + wall, boreB = by + wall + IDp;               // bore band edges
+
+  const S = [];
+  S.push(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" font-family="Segoe UI, sans-serif">`);
+  S.push(`<defs>
+    <pattern id="hatch" width="7" height="7" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+      <line x1="0" y1="0" x2="0" y2="7" stroke="#5a6070" stroke-width="1"/>
+    </pattern>
+  </defs>`);
+  S.push(`<rect x="0" y="0" width="${W}" height="${H}" fill="#202127"/>`);
+
+  const f = n => (+n.toFixed(2));                                 // 2-dp px rounding for clean markup
+
+  // ---------- SIDE VIEW (longitudinal cross-section) ----------
+  // optional HEAD flange at the left end (drawn first, behind the body)
+  if (headDia > 0) {
+    const hw = Math.max(6, Lp * 0.18);                            // head length ~ small
+    const hy = cy - HDp / 2;
+    S.push(`<rect x="${f(bx)}" y="${f(hy)}" width="${f(hw)}" height="${f(HDp)}" fill="url(#hatch)" stroke="#c7ccd4" stroke-width="1.5"/>`);
+  }
+  // body: outer rect hatched (the cut wall material)
+  S.push(`<rect x="${f(bx)}" y="${f(by)}" width="${f(Lp)}" height="${f(ODp)}" fill="url(#hatch)" stroke="#c7ccd4" stroke-width="1.8"/>`);
+  // bore: open channel (background fill) with solid edges (the through hole)
+  S.push(`<rect x="${f(bx)}" y="${f(boreT)}" width="${f(Lp)}" height="${f(IDp)}" fill="#15161a" stroke="none"/>`);
+  S.push(`<line x1="${f(bx)}" y1="${f(boreT)}" x2="${f(bx+Lp)}" y2="${f(boreT)}" stroke="#c7ccd4" stroke-width="1.4"/>`);
+  S.push(`<line x1="${f(bx)}" y1="${f(boreB)}" x2="${f(bx+Lp)}" y2="${f(boreB)}" stroke="#c7ccd4" stroke-width="1.4"/>`);
+  // axis center line (dash-dot)
+  S.push(`<line x1="${f(bx-16)}" y1="${f(cy)}" x2="${f(bx+Lp+16)}" y2="${f(cy)}" stroke="#6b7280" stroke-width="1" stroke-dasharray="10 3 2 3"/>`);
+
+  if (showDims) {
+    const dimCol = "#9aa0a6";
+    // LENGTH dimension (below)
+    const dy = by + ODp + 30;
+    S.push(dimLineH(bx, bx + Lp, dy, `${toFrac(len)}"`, dimCol));
+    S.push(`<line x1="${f(bx)}" y1="${f(by+ODp)}" x2="${f(bx)}" y2="${f(dy+5)}" stroke="${dimCol}" stroke-width="0.8"/>`);
+    S.push(`<line x1="${f(bx+Lp)}" y1="${f(by+ODp)}" x2="${f(bx+Lp)}" y2="${f(dy+5)}" stroke="${dimCol}" stroke-width="0.8"/>`);
+    // OD dimension (left, vertical)
+    const dx = bx - 30;
+    S.push(dimLineV(by, by + ODp, dx, `${DIA}${toFrac(od)}"`, dimCol, "OD"));
+    S.push(`<line x1="${f(bx)}" y1="${f(by)}" x2="${f(dx-5)}" y2="${f(by)}" stroke="${dimCol}" stroke-width="0.8"/>`);
+    S.push(`<line x1="${f(bx)}" y1="${f(by+ODp)}" x2="${f(dx-5)}" y2="${f(by+ODp)}" stroke="${dimCol}" stroke-width="0.8"/>`);
+    // ID dimension (internal, near the left quarter of the bore)
+    const idx = bx + Lp * 0.30;
+    S.push(dimLineV(boreT, boreB, idx, `${DIA}${toFrac(id)}"`, "#8fb7ff", "ID", true));
+  }
+  S.push(`<text x="${f(bx + Lp/2)}" y="${f(sideT-24)}" fill="#9aa0a6" font-size="11" text-anchor="middle">CROSS-SECTION</text>`);
+
+  // ---------- END VIEW (concentric circles) ----------
+  if (showEnd) {
+    const ecx = sideL + sideMaxW + 110, ecy = sideT + sideMaxH/2;
+    const rO = ODp/2, rI = IDp/2;
+    if (headDia > 0) S.push(`<circle cx="${f(ecx)}" cy="${f(ecy)}" r="${f(HDp/2)}" fill="url(#hatch)" stroke="#8b92a0" stroke-width="1.2"/>`);
+    S.push(`<circle cx="${f(ecx)}" cy="${f(ecy)}" r="${f(rO)}" fill="url(#hatch)" stroke="#c7ccd4" stroke-width="1.8"/>`);
+    S.push(`<circle cx="${f(ecx)}" cy="${f(ecy)}" r="${f(rI)}" fill="#15161a" stroke="#c7ccd4" stroke-width="1.4"/>`);
+    // center cross
+    S.push(`<line x1="${f(ecx-rO-10)}" y1="${f(ecy)}" x2="${f(ecx+rO+10)}" y2="${f(ecy)}" stroke="#6b7280" stroke-width="0.9" stroke-dasharray="8 3 2 3"/>`);
+    S.push(`<line x1="${f(ecx)}" y1="${f(ecy-rO-10)}" x2="${f(ecx)}" y2="${f(ecy+rO+10)}" stroke="#6b7280" stroke-width="0.9" stroke-dasharray="8 3 2 3"/>`);
+    S.push(`<text x="${f(ecx)}" y="${f(sideT-24)}" fill="#9aa0a6" font-size="11" text-anchor="middle">END VIEW</text>`);
+    if (showDims) {
+      S.push(`<text x="${f(ecx)}" y="${f(ecy+rO+26)}" fill="#9aa0a6" font-size="11" text-anchor="middle">OD ${DIA}${toFrac(od)}"  •  ID ${DIA}${toFrac(id)}"</text>`);
+    }
+  }
+
+  // ---------- title strip ----------
+  if (o.label) S.push(`<text x="${f(W/2)}" y="${f(H-14)}" fill="#e7e8ea" font-size="12" text-anchor="middle">${escapeXml(o.label)}</text>`);
+  S.push(`</svg>`);
+  return S.join("\n");
+}
+
+// horizontal dimension line with arrowheads + centered label above
+function dimLineH(x1, x2, y, text, col) {
+  const a = 5;
+  return `<g>
+    <line x1="${x1.toFixed(2)}" y1="${y.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y.toFixed(2)}" stroke="${col}" stroke-width="1"/>
+    <path d="M${(x1+a).toFixed(2)},${(y-a).toFixed(2)} L${x1.toFixed(2)},${y.toFixed(2)} L${(x1+a).toFixed(2)},${(y+a).toFixed(2)}" fill="none" stroke="${col}" stroke-width="1"/>
+    <path d="M${(x2-a).toFixed(2)},${(y-a).toFixed(2)} L${x2.toFixed(2)},${y.toFixed(2)} L${(x2-a).toFixed(2)},${(y+a).toFixed(2)}" fill="none" stroke="${col}" stroke-width="1"/>
+    <text x="${((x1+x2)/2).toFixed(2)}" y="${(y-6).toFixed(2)}" fill="${col}" font-size="12" text-anchor="middle">L = ${text}</text>
+  </g>`;
+}
+// vertical dimension line with arrowheads + label
+function dimLineV(y1, y2, x, text, col, prefix, inside) {
+  const a = 5;
+  const tx = inside ? x + 8 : x - 6;
+  const anchor = inside ? "start" : "end";
+  return `<g>
+    <line x1="${x.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x.toFixed(2)}" y2="${y2.toFixed(2)}" stroke="${col}" stroke-width="1"/>
+    <path d="M${(x-a).toFixed(2)},${(y1+a).toFixed(2)} L${x.toFixed(2)},${y1.toFixed(2)} L${(x+a).toFixed(2)},${(y1+a).toFixed(2)}" fill="none" stroke="${col}" stroke-width="1"/>
+    <path d="M${(x-a).toFixed(2)},${(y2-a).toFixed(2)} L${x.toFixed(2)},${y2.toFixed(2)} L${(x+a).toFixed(2)},${(y2-a).toFixed(2)}" fill="none" stroke="${col}" stroke-width="1"/>
+    <text x="${tx.toFixed(2)}" y="${((y1+y2)/2+4).toFixed(2)}" fill="${col}" font-size="12" text-anchor="${anchor}">${prefix} ${text}</text>
+  </g>`;
+}
+function escapeXml(s){ return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
+
+// ---- validation (mirrors what the PS helper will guard) ----
+function validate(od, id, len) {
+  if (!(od > 0) || !(id > 0) || !(len > 0)) return "OD, ID and Length must all be greater than 0.";
+  if (id >= od) return `Bore (ID ${id}) must be smaller than OD ${od} -- a bushing needs a wall.`;
+  return "";
+}
+
+// ---- wire up the UI ----
+const $ = id => document.getElementById(id);
+function els(){ return { od:+$("od").value, id:+$("id").value, len:+$("len").value,
+  head:parseFloat($("head").value)||0, label:$("label").value.trim(), pn:$("pn").value.trim(),
+  showEnd:$("showEnd").checked, showDims:$("showDims").checked }; }
+
+function render() {
+  const e = els();
+  const err = validate(e.od, e.id, e.len);
+  $("err").textContent = err;
+  if (err) { $("svgwrap").innerHTML = '<span class="note">Fix the inputs to render.</span>'; $("src").value=""; return; }
+
+  const svg = bushingSvg({ od:e.od, id:e.id, len:e.len, headDia:e.head, label:e.label, pn:e.pn, showEnd:e.showEnd, showDims:e.showDims });
+  $("svgwrap").innerHTML = svg;
+  $("src").value = svg;
+
+  // meta
+  const wall = ((e.od - e.id)/2);
+  $("meta").innerHTML =
+    `<span><b>OD</b> ${DIA}${toFrac(e.od)}" (${e.od})</span>` +
+    `<span><b>ID</b> ${DIA}${toFrac(e.id)}" (${e.id})</span>` +
+    `<span><b>Length</b> ${toFrac(e.len)}" (${e.len})</span>` +
+    `<span><b>Wall</b> ${(+wall.toFixed(4))}"</span>` +
+    (e.head>0 ? `<span><b>Head Ø</b> ${toFrac(e.head)}"</span>` : ``);
+
+  // part number row: link only when a real PN exists (the 54 blanked rows have none)
+  const preset = PRESETS.find(p => p.pn === e.pn && e.pn) ||
+                 PRESETS.find(p => p.easy === e.label);
+  const note = (preset && !preset.pn) ? preset.note : "";
+  if (e.pn && !/^\(|n\/a|unspecified/i.test(e.pn)) {
+    const url = "https://www.mcmaster.com/" + encodeURIComponent(e.pn) + "/";
+    $("pnrow").innerHTML = `<b style="color:var(--muted)">Part number:</b> ${escapeHtml(e.pn)} &nbsp; ` +
+      `<a href="${url}" target="_blank" rel="noopener">View on McMaster &#8599;</a> ` +
+      `<span class="note">(opens their page in a browser &mdash; a link, not a hotlinked image)</span>`;
+  } else {
+    $("pnrow").innerHTML = `<b style="color:var(--muted)">Part number:</b> <span class="flag">&#9888; none on file &mdash; ${escapeHtml(note || "look up on mcmaster.com by ID + length before ordering.")}</span>`;
+  }
+}
+function escapeHtml(s){ return String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])); }
+
+// presets
+const sel = $("preset");
+PRESETS.forEach((p,i) => { const o=document.createElement("option"); o.value=i; o.textContent=p.easy; sel.appendChild(o); });
+sel.value = 1;  // the OD 3/4 x ID 1/2 x 3/4 sleeve
+sel.addEventListener("change", () => {
+  const p = PRESETS[+sel.value]; if (!p) return;
+  $("od").value=p.od; $("id").value=p.id; $("len").value=p.len; $("label").value=p.easy; $("pn").value=p.pn;
+  render();
+});
+["od","id","len","head","label","pn","showEnd","showDims"].forEach(id => {
+  $(id).addEventListener("input", render); $(id).addEventListener("change", render);
+});
+
+// download / copy
+$("dl").addEventListener("click", () => {
+  const blob = new Blob([$("src").value], { type:"image/svg+xml" });
+  const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+  a.download = "bushing_" + (els().pn || "schematic") + ".svg"; a.click(); URL.revokeObjectURL(a.href);
+});
+$("dlpng").addEventListener("click", () => {
+  const svg = $("src").value; if (!svg) return;
+  const img = new Image();
+  const url = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  img.onload = () => {
+    const c=document.createElement("canvas"); c.width=img.width||660; c.height=img.height||340;
+    const g=c.getContext("2d"); g.fillStyle="#202127"; g.fillRect(0,0,c.width,c.height); g.drawImage(img,0,0);
+    const a=document.createElement("a"); a.href=c.toDataURL("image/png");
+    a.download="bushing_"+(els().pn||"schematic")+".png"; a.click();
+  };
+  img.src = url;
+});
+$("copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("src").value); $("copied").textContent="copied!"; setTimeout(()=>$("copied").textContent="",1500); }
+  catch { $("src").select(); document.execCommand("copy"); $("copied").textContent="copied!"; }
+});
+
+render();
+</script>
+</body>
+</html>
