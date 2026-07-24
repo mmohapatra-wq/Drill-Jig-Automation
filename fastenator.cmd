@@ -282,7 +282,9 @@ Write-Host ""
 # (that path reads bore surfaces and does not build an axis list) => legacy global
 # projection, unchanged.
 $fastAxes = if (-not $asmMode -and $optSelected) { $null } elseif ($null -ne $read) { $read.Axes } else { $null }
-$layout = ConvertTo-LayoutXZ -Centers $centers -Axes $fastAxes -AxisX $axisX -AxisZ $axisZ -AxisXSign $signX -AxisZSign $signZ -Margin $margin -DedupTol $dedup
+# -AlignGrid: de-rotate the pattern so its rows/columns run PERPENDICULAR to the layout
+# axes (not diagonal) when the selected fasteners' grid is rotated relative to the axes.
+$layout = ConvertTo-LayoutXZ -Centers $centers -Axes $fastAxes -AxisX $axisX -AxisZ $axisZ -AxisXSign $signX -AxisZSign $signZ -Margin $margin -DedupTol $dedup -AlignGrid
 if (-not $layout.Valid) {
     Write-Host "  Could not build a valid layout:" -ForegroundColor Red
     foreach ($e in $layout.Errors) { Write-Host ("    - $e") -ForegroundColor Red }

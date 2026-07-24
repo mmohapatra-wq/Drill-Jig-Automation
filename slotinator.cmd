@@ -690,11 +690,11 @@ if ($go -notmatch '^[Yy]$') {
         $seedFeatId    = $seed.FeatId
         $afterFeat     = Get-FeatureIdSet      # baseline for the pattern new-count diff
 
-        # Auto-identifying the seed feature id is now only for the post-pattern
-        # count report - the operator selects the seed MANUALLY below, so a null id
-        # does NOT block patterning (that was the old, too-strict guard).
-        if ($null -ne $seedFeatId) { Write-Host ("  Seed cut feature id = {0} (for the count report)." -f $seedFeatId) -ForegroundColor DarkGray }
-        else { Write-Host "  (Seed feature id not auto-identified; the post-pattern count is best-effort.)" -ForegroundColor DarkGray }
+        # The seed feature id drives the HANDS-FREE re-select below (Invoke-Slot-
+        # PatternFromSeed). A null id (feature diff didn't resolve exactly one new
+        # feature) simply routes to the manual-reselect fallback - it never blocks.
+        if ($null -ne $seedFeatId) { Write-Host ("  Seed cut feature id = {0} (used to auto-reselect for the pattern)." -f $seedFeatId) -ForegroundColor DarkGray }
+        else { Write-Host "  (Seed feature id not auto-identified; will ask you to click the seed for the pattern.)" -ForegroundColor DarkGray }
 
         # --- The pattern DIRECTION reference = a base DATUM PLANE, fed BY ID ---
         # THE LIVE FAILURE (trail.txt.33): the operator picked a CURVED EDGE for the
@@ -710,36 +710,49 @@ if ($go -notmatch '^[Yy]$') {
         $dirDatumId   = if ($slots.CrossAxis -eq 'Z') { $frontBaseId } else { $topBaseId }
         $dirDatumName = if ($slots.CrossAxis -eq 'Z') { 'FRONT' } else { 'TOP' }
 
-        # --- SELECT the seed slot in the model tree (recording-faithful) ---
-        # The pattern replicates the SELECTED feature; a search-dialog buffer select
-        # does NOT register as the pattern target on this build (user 2026-07-07), so
-        # the operator clicks the seed once - exactly what the mapkey's
-        # `~ Select PHTLeft.AssyTree` does.
-        Write-Host ""
-        Write-Host "  SELECT THE SEED SLOT CUT in Creo's model tree (the remove-material extrude you" -ForegroundColor Magenta
-        Write-Host "  just verified - NOT a base or copy-geometry feature), then press ENTER." -ForegroundColor Magenta
-        Read-Host
-        $selSeed = Read-SelectedId
+        # --- HANDS-FREE: re-select the seed feature by ID + pattern (NO manual click) ---
+        # user 2026-07-23: "you dont need to ask the user, you can manually just reselect
+        # that feature and do the patterns." The seed slot's feature id was captured above
+        # ($seedFeatId). Re-select it via the edginator-proven RAW-COM channel
+        # (Select-FeatureById -> CreateModelItemSelection + AddSelection) and fire the
+        # pattern - this is a DIFFERENT channel than the tree-SEARCH one FIX 1 found dead
+        # for the pattern target. Canary-gated on a VersionStamp change; on a no-change it
+        # FALLS BACK to the manual reselect (the proven path), so a build where the COM
+        # select doesn't register is never stuck.
         $patChanged = $false
-        if ($null -eq $selSeed) {
-            Write-Host "  Nothing selected - cannot pattern. The seed slot IS cut; re-run with --no-pattern" -ForegroundColor Yellow
-            Write-Host "  to cut the rest per-row, or finish the pattern by hand in Creo." -ForegroundColor Yellow
-        } elseif ($null -eq $dirDatumId) {
+        if ($null -eq $dirDatumId) {
             Write-Host "  Cannot pattern: the $dirDatumName datum (the pattern direction) was not discovered." -ForegroundColor Yellow
             Write-Host "  Re-run with --no-pattern to cut per-row, or pattern by hand in Creo." -ForegroundColor Yellow
         } else {
-            Write-Host ("  Seed selected (id {0}). Patterning {1} copies at pitch {2:0.####} along {3}," -f `
-                $selSeed, $patPlan.Count, $patPlan.Increment, $slots.CrossAxis) -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host ("  Re-selecting the seed slot (id {0}) and patterning {1} copies at pitch {2:0.####} along {3}," -f `
+                $seedFeatId, $patPlan.Count, $patPlan.Increment, $slots.CrossAxis) -ForegroundColor Cyan
             Write-Host "  direction = the $dirDatumName datum plane (fed by ID - no pick)..." -ForegroundColor Cyan
-            # ONE atomic RunMacro (NO pick, so nothing is split - boxinator rule):
-            # open pattern on the selected seed -> activate the dir-1 collector -> feed
-            # the datum plane BY ID -> set count + spacing (+ optional flip) -> confirm.
-            $stamp2 = $null; try { $stamp2 = $model.VersionStamp } catch {}
-            try {
-                $patMacro = Build-SlotPatternMacro -DirDatumId ([int]$dirDatumId) -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$PatternFlip
-                $session.RunMacro($patMacro)
-                if ($null -ne $stamp2) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stamp2 -TimeoutMs 30000 }
-            } catch { Write-Host "    pattern macro error: $($_.Exception.Message)" -ForegroundColor Red }
+            $pr = Invoke-SlotPatternFromSeed -SeedFeatId ([int]$seedFeatId) -DirDatumId ([int]$dirDatumId) `
+                -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$PatternFlip
+            $patChanged = ($pr.Selected -and $pr.Changed)
+
+            if (-not $patChanged) {
+                # FALLBACK: the auto-select/pattern did not take -> ask the operator to
+                # click the seed once (exactly the old, proven path).
+                Write-Host ("  Auto-reselect of the seed did not pattern ({0})." -f $pr.Reason) -ForegroundColor Yellow
+                Write-Host "  SELECT THE SEED SLOT CUT in Creo's model tree (the remove-material extrude you" -ForegroundColor Magenta
+                Write-Host "  just verified - NOT a base or copy-geometry feature), then press ENTER." -ForegroundColor Magenta
+                Read-Host
+                $selSeed = Read-SelectedId
+                if ($null -eq $selSeed) {
+                    Write-Host "  Nothing selected - cannot pattern. The seed slot IS cut; re-run with --no-pattern" -ForegroundColor Yellow
+                    Write-Host "  to cut the rest per-row, or finish the pattern by hand in Creo." -ForegroundColor Yellow
+                } else {
+                    Write-Host ("  Seed selected (id {0}). Patterning..." -f $selSeed) -ForegroundColor Cyan
+                    $stamp2 = $null; try { $stamp2 = $model.VersionStamp } catch {}
+                    try {
+                        $patMacro = Build-SlotPatternMacro -DirDatumId ([int]$dirDatumId) -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$PatternFlip
+                        $session.RunMacro($patMacro)
+                        if ($null -ne $stamp2) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stamp2 -TimeoutMs 30000 }
+                    } catch { Write-Host "    pattern macro error: $($_.Exception.Message)" -ForegroundColor Red }
+                }
+            }
         }
 
         $afterPat = Get-FeatureIdSet

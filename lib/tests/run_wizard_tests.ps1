@@ -803,6 +803,7 @@ $coreFns = @('Initialize-DrilljigCore','New-OffsetPlane','Set-PlaneOffset','Set-
              'Get-BushingLengthOptions','Get-IdOdOptions','Resolve-BushingPickRow','Resolve-BushingLengthInput',
              'Test-OdFirstSpec','Get-OdGroups','Resolve-OdBushingPick',
              'Resolve-CustomOdInput','Resolve-CustomOdPick',
+             'Select-FeatureById','Invoke-SlotPatternFromSeed',
              'Build-CsysFromPlanesMacro','Get-CsysShowMacro','Resolve-IndexHolePlanes','Read-IndexSelectionIds','Invoke-IndexCsys',
              'Get-HolesRelativeToIndex','Export-IndexHoleCsv','Build-CsysOffsetPointsMacro','Invoke-CsysOffsetPoints',
              'Resolve-HoleFeatGroups','Format-IndexHoleReport','Write-IndexHoleReport',
@@ -921,6 +922,7 @@ if (-not $wfLoaded) {
         $steps = New-Object System.Collections.ArrayList
         $treeRoot = Get-Content $ctx.TreePath -Raw | ConvertFrom-Json
         $ctx.TreeNode = @($treeRoot)[0]
+        $ctx.TreeRoot = @($treeRoot)[0]   # Reset-TreeWalk reads $ctx.TreeRoot to restart the walk
         Invoke-Expression $src.Substring($siR, $eiR - $siR) | Out-Null
         $tStep = $steps | Where-Object { $_.Key -eq 'tree' } | Select-Object -First 1
 
@@ -932,25 +934,26 @@ if (-not $wfLoaded) {
             & $script:capOnPick $i $script:capOpts[$i] $ctx $fakeWiz | Out-Null
             $pnl.Dispose()
         }
-        # OD-FIRST metal flow (user 2026-07-22): Q1=0 (Metal) / Q2=0 (PFD) lands on the
-        # "3/4 OD removable bushings" outcome, which is OD-FILTERED -> the metal path shows
-        # OD cards (no ID question), then the standardized length auto-resolves (single OD).
-        # So after the outcome the walk fires: OD pick -> length -> completes.
+        # ID-FIRST metal->PFD SLEEVE flow (user 2026-07-23): Q1=0 (Metal) / Q2=0 (PFD) now
+        # lands on the "3/4 ID sleeves" outcome, which is ID-FILTERED -> the PFD path shows
+        # ID cards (only 3/4), then the standardized length; the single OD auto-resolves.
+        # So after the outcome the walk fires: ID pick -> length -> completes.
         $threw = $false
         try {
             & $fire 0   # Q1 material (Metal)
-            & $fire 0   # Q2 PFD/Hand -> outcome -> catalog (OD-first)
+            & $fire 0   # Q2 PFD -> outcome -> catalog (ID-first sleeve, 3/4 ID only)
             if ($null -ne $ctx.PendingSpec) {
-                & $fire 0   # OD pick (FIRST for metal; no ID question)
-                & $fire 0   # length -> OD already chosen -> completes here
+                & $fire 0   # ID pick (3/4 is the ONLY ID; card index 0, customod is index 1)
+                & $fire 0   # length -> single OD auto-resolves -> completes here
             }
         } catch { $threw = $true; Write-Host ("       threw: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
         Assert-True "tree OnPick walk does not throw (no null-index)" (-not $threw)
-        Assert-True "metal path is OD-first (BushOdFirst set)" ([bool]$ctx.BushOdFirst)
-        Assert-True "tree walk set BushOD (metal, no ID chosen)" ($null -ne $ctx.BushOD)
-        Assert-True "tree walk left BushID null (metal skips ID)" ($null -eq $ctx.BushID)
+        Assert-True "metal->PFD is ID-first sleeve (BushOdFirst false)" (-not $ctx.BushOdFirst)
+        Assert-True "tree walk set BushID (metal->PFD sleeve, ID chosen)" ($null -ne $ctx.BushID)
+        Assert-True "tree walk left BushOD null (sleeve is ID-first)" ($null -eq $ctx.BushOD)
         Assert-True "tree walk resolved a bushing pick" ($ctx.Picks.Count -gt 0)
-        Assert-True "tree walk pick ID is (any) -- metal OD-first" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -match 'ID \(any\)')
+        Assert-True "tree walk pick is a Sleeve (headless render)" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -match '(?i)sleeve')
+        Assert-True "tree walk pick has a real ID (not (any))" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -notmatch 'ID \(any\)')
         Assert-True "tree walk completed (BushStage cleared)" ($null -eq $ctx.BushStage)
         Assert-True "tree walk set TreeDone" ([bool]$ctx.TreeDone)
         Assert-True "resolved HoleDiameter > 0" ($ctx.Picks.Count -gt 0 -and [double]$ctx.Picks[$ctx.Picks.Count-1].HoleDiameter -gt 0)
@@ -965,6 +968,29 @@ if (-not $wfLoaded) {
         Assert-True "bushing-done shows a Start-over button (no re-cycle)" (@($btnTexts | Where-Object { $_ -match 'Start over' }).Count -gt 0) ("buttons: {0}" -f ($btnTexts -join ' | '))
         Assert-True "bushing-done shows a Back-to-options button (step back)" (@($btnTexts | Where-Object { $_ -match 'Back to options' }).Count -gt 0) ("buttons: {0}" -f ($btnTexts -join ' | '))
         $cp.Dispose()
+
+        # OD-FIRST metal->Hand Drill removable-bushing flow (user 2026-07-22, RETAINED):
+        # Metal -> Hand Drill still resolves to "3/4 OD and 1/2 OD removable bushings" (OD-
+        # FILTERED) -> OD cards (no ID question), then length auto-resolves. Reset the walk
+        # and re-drive Q1=0 (Metal) / Q2=1 (Hand Drill) to keep end-to-end OD-first coverage
+        # (only Metal->PFD switched to the ID-first sleeve path in 2026-07-23).
+        Reset-TreeWalk -Context $ctx
+        $threwHD = $false
+        try {
+            & $fire 0   # Q1 material (Metal)
+            & $fire 1   # Q2 Hand Drill -> outcome -> catalog (OD-first removable)
+            if ($null -ne $ctx.PendingSpec) {
+                & $fire 0   # OD pick (FIRST for metal; no ID question)
+                & $fire 0   # length -> OD already chosen -> completes here
+            }
+        } catch { $threwHD = $true; Write-Host ("       threw: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
+        Assert-True "metal->HandDrill walk does not throw" (-not $threwHD)
+        Assert-True "metal->HandDrill is OD-first (BushOdFirst set)" ([bool]$ctx.BushOdFirst)
+        Assert-True "metal->HandDrill set BushOD (no ID chosen)" ($null -ne $ctx.BushOD)
+        Assert-True "metal->HandDrill left BushID null (skips ID)" ($null -eq $ctx.BushID)
+        Assert-True "metal->HandDrill resolved a pick" ($ctx.Picks.Count -gt 0)
+        Assert-True "metal->HandDrill pick ID is (any) -- OD-first" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -match 'ID \(any\)')
+        Assert-True "metal->HandDrill completed (TreeDone)" ([bool]$ctx.TreeDone)
 
         # --- PRESS-NEXT-TO-TAKE-THE-RECOMMENDATION (user 2026-07-21). Set-BushLengthPick +
         #     the tree step's Validate/OnNext must let the operator commit the recommended
@@ -1754,6 +1780,62 @@ if (-not $wfDrive) {
         Assert-True "rail resize harness ran" $false ("harness error: {0}" -f $_.Exception.Message)
     }
 }
+
+# ----------------------------------------------------------------------------
+# core: Invoke-SlotPatternFromSeed -- HANDS-FREE seed re-select + pattern (user
+# 2026-07-23: "you dont need to ask the user, you can manually just reselect that
+# feature and do the patterns"). Replaces the manual "click the seed in the model
+# tree" step with a raw-COM re-select (Select-FeatureById) + one ProCmdGeomPattern,
+# canary-gated. COM-heavy, so stub Select-FeatureById + Wait-ModelModified + the core
+# session/model scope and assert the GATING logic (Selected/Changed) + that the pattern
+# macro fires ONLY after a successful select. Placed LAST: it shadows Select-FeatureById
+# / Wait-ModelModified, so no earlier test can see the stubs.
+# ----------------------------------------------------------------------------
+Write-Host "  -- core: Invoke-SlotPatternFromSeed (auto-reselect + pattern) --" -ForegroundColor White
+$script:ispFired = @()
+$ispStubS = [pscustomobject]@{}; Add-Member -InputObject $ispStubS -MemberType ScriptMethod -Name RunMacro -Value { param($x) $script:ispFired += ,([string]$x) }
+$ispStubM = [pscustomobject]@{}; Add-Member -InputObject $ispStubM -MemberType ScriptProperty -Name VersionStamp -Value { 'v1' }
+Set-Variable -Name DJSession -Scope Script -Value $ispStubS
+Set-Variable -Name DJModel   -Scope Script -Value $ispStubM
+$script:ispSel = $true;  function Select-FeatureById { param([int]$FeatId) return $script:ispSel }
+$script:ispWait = $true; function Wait-ModelModified { param($Model=$null,[string]$PreviousStamp,[int]$TimeoutMs=30000,[scriptblock]$OnPoll=$null) return $script:ispWait }
+
+# guard: seed id <=0 -> Selected false, NO pattern fired
+$script:ispFired = @()
+$r0 = Invoke-SlotPatternFromSeed -SeedFeatId 0 -DirDatumId 55 -Count 5 -Spacing 4 -TimeoutMs 50
+Assert-True "isp: seed id 0 -> Selected false"          (-not $r0.Selected)
+Assert-True "isp: seed id 0 -> no pattern fired"        (@($script:ispFired).Count -eq 0)
+Assert-True "isp: seed id 0 -> reason names capture"    ($r0.Reason -match 'captured')
+
+# guard: no direction datum -> Selected false, NO pattern fired
+$script:ispFired = @()
+$rD = Invoke-SlotPatternFromSeed -SeedFeatId 700 -DirDatumId 0 -Count 5 -Spacing 4 -TimeoutMs 50
+Assert-True "isp: no dir datum -> Selected false"       (-not $rD.Selected)
+Assert-True "isp: no dir datum -> no pattern fired"     (@($script:ispFired).Count -eq 0)
+
+# select fails -> Selected false, NO pattern fired, reason names the select
+$script:ispFired = @(); $script:ispSel = $false
+$rF = Invoke-SlotPatternFromSeed -SeedFeatId 700 -DirDatumId 55 -Count 5 -Spacing 4 -TimeoutMs 50
+Assert-True "isp: select fails -> Selected false"       (-not $rF.Selected)
+Assert-True "isp: select fails -> no pattern fired"     (@($script:ispFired).Count -eq 0)
+Assert-True "isp: select fails -> reason names select"  ($rF.Reason -match 'select')
+
+# select ok + model changes -> Selected+Changed true; fires ONE ProCmdGeomPattern feeding the dir datum by id
+$script:ispFired = @(); $script:ispSel = $true; $script:ispWait = $true
+$rOk = Invoke-SlotPatternFromSeed -SeedFeatId 700 -DirDatumId 55 -Count 5 -Spacing 4 -TimeoutMs 50
+Assert-True "isp: ok -> Selected true"                  ($rOk.Selected)
+Assert-True "isp: ok -> Changed true"                   ($rOk.Changed)
+Assert-True "isp: ok -> fired exactly one pattern macro"(@($script:ispFired).Count -eq 1)
+Assert-True "isp: ok -> macro opens ProCmdGeomPattern"  ($script:ispFired[0] -match 'ProCmdGeomPattern')
+Assert-True "isp: ok -> macro feeds dir datum id 55"    ($script:ispFired[0] -match 'InputIDPanel.*55')
+
+# select ok but model NOT changed -> Selected true, Changed false (canary miss -> caller falls back to manual)
+$script:ispFired = @(); $script:ispSel = $true; $script:ispWait = $false
+$rNo = Invoke-SlotPatternFromSeed -SeedFeatId 700 -DirDatumId 55 -Count 5 -Spacing 4 -TimeoutMs 50
+Assert-True "isp: no-change -> Selected true"           ($rNo.Selected)
+Assert-True "isp: no-change -> Changed false"           (-not $rNo.Changed)
+Assert-True "isp: no-change -> fired the pattern once"  (@($script:ispFired).Count -eq 1)
+Assert-True "isp: no-change -> reason names no change"  ($rNo.Reason -match 'change')
 
 # ----------------------------------------------------------------------------
 Write-Host ""

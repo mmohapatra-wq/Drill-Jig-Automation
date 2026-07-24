@@ -128,9 +128,10 @@ function Group-CatalogByID {
 }
 
 # OD-FIRST (METAL removable-bushing) PICK (user 2026-07-22). LOCAL copies of the shared
-# lib\drilljig_core.ps1 helpers (jiginator.ps1 dot-sources no lib). METAL -> PFD / Hand
-# Drill gives an OD-filtered spec (only 1/2" & 3/4" ODs); the drilled hole IS the
-# removable bushing's OD, so the flow displays the OD, skips ID, then asks the length.
+# lib\drilljig_core.ps1 helpers (jiginator.ps1 dot-sources no lib). METAL -> Hand Drill
+# gives an OD-filtered spec (only 1/2" & 3/4" ODs); the drilled hole IS the removable
+# bushing's OD, so the flow displays the OD, skips ID, then asks the length. (METAL -> PFD
+# is no longer OD-first: user 2026-07-23 changed its leaf to "3/4 ID sleeves" -> ID-first.)
 function Test-OdFirstSpec {
     param($Spec)
     if ($null -eq $Spec -or $null -eq $Spec.Filters) { return $false }
@@ -371,10 +372,11 @@ function Invoke-BushingPick {
         return $null
     }
 
-    # OD-FIRST metal path (user 2026-07-22): METAL -> PFD / Hand Drill is OD-filtered
+    # OD-FIRST metal path (user 2026-07-22): METAL -> Hand Drill is OD-filtered
     # (only 1/2" & 3/4" ODs). The drilled hole IS the removable bushing's OD, so DISPLAY
     # THE OD, skip the ID question, then ask the standardized length (recommended from the
-    # OD value). The 3D-print SLEEVE path (ID-filtered) falls through to the ID-first flow.
+    # OD value). The 3D-print SLEEVE path AND METAL -> PFD (user 2026-07-23: "3/4 ID sleeves")
+    # are ID-filtered and fall through to the ID-first flow below.
     if (Test-OdFirstSpec -Spec $Spec) {
         $odGroups = Get-OdGroups -Rows $rows
         while ($true) {

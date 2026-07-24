@@ -201,6 +201,48 @@ function FL-AxisVec {
 }
 
 # ----------------------------------------------------------------------------
+# FL-BestGridAngle - the in-plane rotation (radians, in [0, pi/2)) that best ALIGNS
+# a 2D point set to the axes: the angle that, applied to every point, MINIMISES the
+# axis-aligned bounding-box area. For a filled rectangular grid that is the grid's own
+# orientation; for a SQUARE grid it is 0 (a 45deg box is larger), so an already-aligned
+# pattern is returned as ~0 (no rotation). Rotating-calipers idea, done as a coarse 1deg
+# sweep + a 0.1deg refine (cheap for a few dozen holes; deterministic). PURE.
+#   $Raw : array of objects with numeric .RX / .RZ (the projected in-plane coords).
+# ----------------------------------------------------------------------------
+function FL-BestGridAngle {
+    param([array]$Raw, [double]$CoarseDeg = 1.0)
+    if ($null -eq $Raw -or @($Raw).Count -lt 2) { return 0.0 }
+    $areaAt = {
+        param($th)
+        $cs = [Math]::Cos($th); $sn = [Math]::Sin($th)
+        $minx = [double]::MaxValue; $maxx = -[double]::MaxValue
+        $miny = [double]::MaxValue; $maxy = -[double]::MaxValue
+        foreach ($p in $Raw) {
+            $u = [double]$p.RX; $v = [double]$p.RZ
+            $nu = $u*$cs - $v*$sn
+            $nv = $u*$sn + $v*$cs
+            if ($nu -lt $minx) { $minx = $nu }; if ($nu -gt $maxx) { $maxx = $nu }
+            if ($nv -lt $miny) { $miny = $nv }; if ($nv -gt $maxy) { $maxy = $nv }
+        }
+        return ($maxx - $minx) * ($maxy - $miny)
+    }
+    $bestDeg = 0.0; $bestArea = [double]::MaxValue
+    for ($d = 0.0; $d -lt 90.0; $d += $CoarseDeg) {
+        $a = & $areaAt ($d * [Math]::PI / 180.0)
+        if ($a -lt $bestArea) { $bestArea = $a; $bestDeg = $d }
+    }
+    $lo = $bestDeg - $CoarseDeg; $hi = $bestDeg + $CoarseDeg
+    for ($d = $lo; $d -le $hi; $d += 0.1) {
+        $a = & $areaAt ($d * [Math]::PI / 180.0)
+        if ($a -lt $bestArea) { $bestArea = $a; $bestDeg = $d }
+    }
+    # normalise into [0, 90)
+    $nd = $bestDeg % 90.0
+    if ($nd -lt 0) { $nd += 90.0 }
+    return ($nd * [Math]::PI / 180.0)
+}
+
+# ----------------------------------------------------------------------------
 # Get-FastenerPlaneFrame - build an in-plane orthonormal frame for the fastener
 # PANEL from each fastener's OWN AXIS (user 2026-07-23: "every single bolt has
 # its own axis that defines itself ... read to the assembly default coordinate
@@ -452,7 +494,8 @@ function global:ConvertTo-LayoutXZ {
         [double]$AxisZSign = 1.0,
         [double]$Margin = 0.25,
         [double]$DedupTol = 1e-4,
-        [array]$Axes = $null      # OPTIONAL each-fastener axis (parallel to Centers) -> panel-plane projection
+        [array]$Axes = $null,     # OPTIONAL each-fastener axis (parallel to Centers) -> panel-plane projection
+        [switch]$AlignGrid        # de-rotate the pattern so rows/columns run parallel to the layout axes
     )
 
     $errors = @()
@@ -506,7 +549,7 @@ function global:ConvertTo-LayoutXZ {
                 Valid=$false; Errors=[string[]]@($illReason); Points=@(); Count=0; Dropped=0; Skipped=0;
                 MinX=0.0; MinZ=0.0; MaxX=0.0; MaxZ=0.0; SpanX=0.0; SpanZ=0.0;
                 AxisX=$ax; AxisZ=$az; AxisXSign=[double]$AxisXSign; AxisZSign=[double]$AxisZSign;
-                Margin=[double]$Margin; DedupTol=[double]$DedupTol; Frame='plane'; AxisSpreadDeg=$null; NormalSource='none'; Flatness=$null; SpanRatio=$null
+                Margin=[double]$Margin; DedupTol=[double]$DedupTol; Frame='plane'; AxisSpreadDeg=$null; NormalSource='none'; Flatness=$null; SpanRatio=$null; AlignAngleDeg=0.0
             }
         }
         $frameMode = 'plane'
@@ -560,7 +603,34 @@ function global:ConvertTo-LayoutXZ {
             Valid=$false; Errors=[string[]]$errors; Points=@(); Count=0; Dropped=0; Skipped=[int]$skipped;
             MinX=0.0; MinZ=0.0; MaxX=0.0; MaxZ=0.0; SpanX=0.0; SpanZ=0.0;
             AxisX=$ax; AxisZ=$az; AxisXSign=[double]$AxisXSign; AxisZSign=[double]$AxisZSign;
-            Margin=[double]$Margin; DedupTol=[double]$DedupTol; Frame=$frameMode; AxisSpreadDeg=$axisSpreadDeg; NormalSource=$normalSource; Flatness=$flatness; SpanRatio=$spanRatio
+            Margin=[double]$Margin; DedupTol=[double]$DedupTol; Frame=$frameMode; AxisSpreadDeg=$axisSpreadDeg; NormalSource=$normalSource; Flatness=$flatness; SpanRatio=$spanRatio; AlignAngleDeg=0.0
+        }
+    }
+
+    # -- GRID ALIGNMENT (user 2026-07-23): de-rotate the in-plane pattern so its rows/
+    #    columns run PERPENDICULAR to the layout axes (not diagonal) when the selected
+    #    fasteners' grid is rotated relative to the chosen axes. Pure 2D rotation about the
+    #    centroid = an ISOMETRY, so every hole-to-hole distance is preserved; only the
+    #    orientation changes (and the plate shrinks from the diagonal extent to the true
+    #    W x H). The angle is the one that MINIMISES the axis-aligned bounding-box area
+    #    (rotating-calipers idea) -- for a filled rectangular grid that is the grid
+    #    orientation, and for a SQUARE grid it correctly picks 0deg (a 45deg box is larger),
+    #    so an already-aligned pattern is left unchanged (angle ~0). Off by default; the
+    #    fastener consumers pass -AlignGrid.
+    $alignDeg = 0.0
+    if ($AlignGrid -and $raw.Count -ge 2) {
+        $th = FL-BestGridAngle -Raw $raw           # radians in [0, pi/2)
+        $alignDeg = $th * 180.0 / [Math]::PI
+        if ([Math]::Abs($th) -gt 1e-9) {
+            $cs = [Math]::Cos($th); $sn = [Math]::Sin($th)
+            $rot = @()
+            foreach ($p in $raw) {
+                $u = [double]$p.RX; $v = [double]$p.RZ
+                $nu = $u*$cs - $v*$sn
+                $nv = $u*$sn + $v*$cs
+                $rot += [pscustomobject]@{ RX = [double]$nu; RZ = [double]$nv }
+            }
+            $raw = $rot
         }
     }
 
@@ -624,6 +694,7 @@ function global:ConvertTo-LayoutXZ {
         NormalSource  = $normalSource          # 'points' (best-fit plane) | 'axis' (fallback) | 'global'
         Flatness      = $flatness              # smallest/largest eigenvalue ratio; ~0 = perfectly coplanar
         SpanRatio     = $spanRatio             # mid/largest eigenvalue ratio; ~0 = collinear selection
+        AlignAngleDeg = [double]$alignDeg      # in-plane de-rotation applied to align the grid to the axes (0 = none / not requested)
     }
 }
 

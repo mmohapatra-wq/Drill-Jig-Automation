@@ -187,12 +187,13 @@ function Invoke-BushingPick {
         return $null
     }
 
-    # OD-FIRST metal path (user 2026-07-22): for METAL -> PFD / Hand Drill the tree gives a
+    # OD-FIRST metal path (user 2026-07-22): for METAL -> Hand Drill the tree gives a
     # removable-bushing spec filtered by OD (only 1/2" and 3/4" ODs). The technician does
     # not care about the bore ID -- the drilled jig hole IS the removable bushing's OD --
     # so DISPLAY THE OD, skip the ID question, then ask the standardized length only. The
     # length is recommended from the OD value (0.5 OD -> 1/2" Lg, 0.75 OD -> 3/4" Lg). The
-    # 3D-print SLEEVE path (ID-filtered spec) falls through to the ID-first flow below.
+    # 3D-print SLEEVE path AND METAL -> PFD (user 2026-07-23: leaf changed to "3/4 ID
+    # sleeves") are ID-filtered specs that fall through to the ID-first flow below.
     if (Test-OdFirstSpec -Spec $Spec) {
         $odGroups = Get-OdGroups -Rows $rows
         while ($true) {
@@ -478,7 +479,7 @@ function Invoke-Walk {
                 }
             } else {
                 # Not a catalog leaf. Some leaves declare the hole OD outright
-                # (metal -> PFD: "the OD of the hole will be 3/4 in"). Resolve the
+                # (e.g. a "the OD of the hole will be 3/4 in" leaf). Resolve the
                 # diameter straight from the label, with NO bushing pick. There is
                 # no bushing => no length, so BushingLength stays $null and STAGE 2's
                 # SIDE offset falls back to a manual entry (only the OD is fixed).
@@ -703,7 +704,8 @@ function Get-FastenerLayoutRawPoints {
         # the fastener PANEL plane so true hole spacing survives a tilted panel (the fix
         # for "only some register" / "holes too close" on higher-level assemblies).
         $fastAxes = if ($null -ne $read) { $read.Axes } else { $null }
-        $layout = ConvertTo-LayoutXZ -Centers $centers -Axes $fastAxes -AxisX $axX -AxisZ $axZ -Margin $mg -DedupTol $dt
+        # -AlignGrid: de-rotate so the hole grid runs perpendicular to the layout axes.
+        $layout = ConvertTo-LayoutXZ -Centers $centers -Axes $fastAxes -AxisX $axX -AxisZ $axZ -Margin $mg -DedupTol $dt -AlignGrid
         if (-not $layout.Valid) {
             Write-Host "  Could not build a valid layout:" -ForegroundColor Red
             foreach ($e in $layout.Errors) { Write-Host ("    - $e") -ForegroundColor Red }
@@ -2498,28 +2500,34 @@ if ($doSlots) {
                 Write-Host "  The seed slot was not confirmed -- no further slots made. Inspect Creo." -ForegroundColor Yellow
             } elseif ($usePattern) {
                 $reliefCut = $true   # the seed row IS a real relief cut; the plate is (at least partly) relieved
-                # --- PATTERN the seed to the remaining rows (hands-free, datum-by-ID) ---
+                # --- PATTERN the seed to the remaining rows: HANDS-FREE (user 2026-07-23) ---
+                # Re-select the seed feature by its captured id ($seed.FeatId) via the
+                # edginator-proven raw-COM channel (Select-FeatureById) - NO manual tree
+                # click - and fire the pattern. $usePattern already required $dirDatumId.
+                # Canary-gated; on a no-change fall back to the manual reselect.
                 Write-Host ""
-                Write-Host "  SELECT THE SEED SLOT CUT in Creo's model tree (the remove-material extrude you" -ForegroundColor Magenta
-                Write-Host "  just verified), then press ENTER." -ForegroundColor Magenta
-                Read-Host
-                $selSeed = Read-SelectedId
-                if ($null -eq $selSeed) {
-                    Write-Host "  Nothing selected -- the seed slot IS cut; pattern by hand, or re-run with --no-pattern." -ForegroundColor Yellow
-                } else {
-                    Write-Host ("  Patterning {0} copies at pitch {1:0.####} along {2}, direction = the {3} datum (by ID)..." -f $patPlan.Count, $patPlan.Increment, $slots.CrossAxis, $dirName) -ForegroundColor Cyan
-                    $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
-                    $patChanged = $false
-                    try {
-                        $session.RunMacro((Build-SlotPatternMacro -DirDatumId $dirDatumId -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$slotPatternFlip))
-                        if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -TimeoutMs 30000 }
-                    } catch { Write-Host "    pattern macro error: $($_.Exception.Message)" -ForegroundColor Red }
-                    if ($patChanged) {
-                        Write-Host ("  Done -- seed slot patterned to the remaining rows (model changed). {0} slots total, one per" -f $patPlan.Count) -ForegroundColor Green
-                        Write-Host ("  row, spaced {0:0.####}. If the copies marched the WRONG way (off the plate), re-run with --pattern-flip." -f $patPlan.Increment) -ForegroundColor DarkGray
+                Write-Host ("  Re-selecting the seed slot (id {0}) and patterning {1} copies at pitch {2:0.####} along {3}, direction = the {4} datum (by ID)..." -f $seed.FeatId, $patPlan.Count, $patPlan.Increment, $slots.CrossAxis, $dirName) -ForegroundColor Cyan
+                $pr = Invoke-SlotPatternFromSeed -SeedFeatId ([int]$seed.FeatId) -DirDatumId ([int]$dirDatumId) -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$slotPatternFlip
+                $patChanged = ($pr.Selected -and $pr.Changed)
+                if (-not $patChanged) {
+                    Write-Host ("  Auto-reselect did not pattern ({0}). SELECT THE SEED SLOT CUT in Creo's model tree, then press ENTER." -f $pr.Reason) -ForegroundColor Magenta
+                    Read-Host
+                    $selSeed = Read-SelectedId
+                    if ($null -eq $selSeed) {
+                        Write-Host "  Nothing selected -- the seed slot IS cut; pattern by hand, or re-run with --no-pattern." -ForegroundColor Yellow
                     } else {
-                        Write-Host "  The pattern did NOT change the model. The seed slot IS cut; finish by hand or re-run with --no-pattern." -ForegroundColor Yellow
+                        $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
+                        try {
+                            $session.RunMacro((Build-SlotPatternMacro -DirDatumId $dirDatumId -Count ([int]$patPlan.Count) -Spacing ([double]$patPlan.Increment) -Flip:$slotPatternFlip))
+                            if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -TimeoutMs 30000 }
+                        } catch { Write-Host "    pattern macro error: $($_.Exception.Message)" -ForegroundColor Red }
                     }
+                }
+                if ($patChanged) {
+                    Write-Host ("  Done -- seed slot patterned to the remaining rows (model changed). {0} slots total, one per" -f $patPlan.Count) -ForegroundColor Green
+                    Write-Host ("  row, spaced {0:0.####}. If the copies marched the WRONG way (off the plate), re-run with --pattern-flip." -f $patPlan.Increment) -ForegroundColor DarkGray
+                } else {
+                    Write-Host "  The pattern did NOT change the model. The seed slot IS cut; finish by hand or re-run with --no-pattern." -ForegroundColor Yellow
                 }
             } else {
                 # --- PER-ROW: seed is row 1; draw the rest with the confirmed flip ---

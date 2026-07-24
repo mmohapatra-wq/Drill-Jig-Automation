@@ -143,10 +143,11 @@ $ctx = @{
     BushStage   = $null      # 'id' | 'len' | 'od' (id-first) or 'od1' | 'len' (od-first metal)
     Grouped     = $null      # catalog grouped by ID (persistent so OnPick can index it)
     BushID      = $null      # chosen ID group (from Group-CatalogByID)
-    # OD-FIRST metal path (user 2026-07-22): METAL -> PFD / Hand Drill is OD-filtered; the
+    # OD-FIRST metal path (user 2026-07-22): METAL -> Hand Drill is OD-filtered; the
     # operator picks the OD (= drilled hole) directly, ID is unspecified. BushOdFirst gates
     # the OD-first sub-flow; BushOdGroups = Get-OdGroups (persistent for OnPick); BushOD =
-    # the chosen OD group. Set-BushLengthPick reads these when BushOdFirst is true.
+    # the chosen OD group. Set-BushLengthPick reads these when BushOdFirst is true. (METAL ->
+    # PFD is no longer OD-first -- user 2026-07-23 changed its leaf to "3/4 ID sleeves".)
     BushOdFirst = $false     # true when PendingSpec is the metal OD-first path
     BushOdGroups = $null     # Get-OdGroups for the metal spec (persistent for OnPick)
     BushOD      = $null      # chosen OD group (OD-first metal path)
@@ -247,6 +248,7 @@ $ctx = @{
     SlotPlan     = $null      # {Mode='pattern'|'perrow'; SeedRow; Patterns[]; Rows[]; SlotWidth; RowAxis; CrossAxis; Depth; FaceId; DirDatumId; DirName}
     SlotRunIndex = 0          # PER-ROW mode: which row slot-b is currently drawing/cutting
     SeedCut      = $false     # PATTERN mode: the ONE seed slot has been cut + direction-verified
+    SeedFeatId   = 0          # PATTERN mode: the seed slot's feature id (captured at the cut) -> auto-reselect for each pattern (no manual tree click)
     SlotAnyCut   = $false     # a slot was cut (>=1) -> the plate is at least partly relieved
     SlotWarn     = $false     # a pattern did not verify (seed only) -> surface it honestly at the summary
     SlotHasPlanes = $false    # slot-a made the visible slot-edge guide planes -> show the CTRL+ALT snap technique
@@ -757,7 +759,8 @@ function global:Invoke-GuiFastenerLiveRead {
         # -Axes = each fastener's own bore axis (parallel to Centers) => project onto
         # the fastener PANEL plane so true hole spacing survives a panel not square to
         # the global axes (fixes "only some register" / "holes too close" in big asms).
-        $layout = ConvertTo-LayoutXZ -Centers $read.Centers -Axes $read.Axes -AxisX 'X' -AxisZ 'Z' -Margin $mg -DedupTol $dt
+        # -AlignGrid: de-rotate so the hole grid runs perpendicular to the layout axes.
+        $layout = ConvertTo-LayoutXZ -Centers $read.Centers -Axes $read.Axes -AxisX 'X' -AxisZ 'Z' -Margin $mg -DedupTol $dt -AlignGrid
         if (-not $layout.Valid) {
             [void]$Wizard.AskInline('Live read', ("Read $($read.Count) center(s) but could not build a layout:`r`n`r`n" + (($layout.Errors) -join "`r`n")), 'OK')
             return $null
@@ -1876,10 +1879,11 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 $c.PendingSpec = $null; $c.TreeDone = $true
                 return
             }
-            # OD-FIRST metal path (user 2026-07-22): METAL -> PFD / Hand Drill is OD-filtered
+            # OD-FIRST metal path (user 2026-07-22): METAL -> Hand Drill is OD-filtered
             # (only 1/2" & 3/4" ODs). The drilled hole IS the removable bushing's OD, so show
             # OD cards (no ID question), then the standardized length. Persist the OD groups in
-            # $c.BushOdGroups (never a Build-local -- the captured-variable rule).
+            # $c.BushOdGroups (never a Build-local -- the captured-variable rule). (METAL -> PFD
+            # is no longer OD-first -- user 2026-07-23 changed its leaf to "3/4 ID sleeves".)
             if ($c.BushOdFirst) {
                 $c.BushOdGroups = Get-OdGroups -Rows $rows
                 if ($c.BushStage -eq 'od1' -or $null -eq $c.BushStage) {
@@ -3916,7 +3920,7 @@ $slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + 
         } else {
             $np = if ($null -ne $c.SlotPlan) { @($c.SlotPlan.Patterns).Count } else { 0 }
             $armB = Add-ArmBanner $panel ("In Creo's sketcher: draw the ONE seed rectangle over the first hole row (one corner, opposite corner), Esc to finish." + [Environment]::NewLine +
-                                  "Then press 'Finish the seed slot' - Creo cuts it, you confirm the direction, then $np pattern(s) copy it onto every remaining row hands-free (you'll click the seed in the tree once per pattern - no more drawing).") 8
+                                  "Then press 'Finish the seed slot' - Creo cuts it, you confirm the direction, then $np pattern(s) copy it onto every remaining row hands-free (the seed is auto-reselected + patterned for you - no more clicking or drawing).") 8
         }
         if ($c.SlotHasPlanes) {
             Add-Para $panel ("To snap the rectangular chip-relief slot in place, hold both CTRL + ALT, then click the two planes spanning across the LENGTH of the part (X direction) and also the RIGHT-SIDE EDGE of the drill jig. If done correctly, dotted blue lines will form the rectangle shape. Then snap the corners of the rectangle tool onto each corner.") ($armB + 12) 0 'Gray'
@@ -4000,6 +4004,7 @@ $slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + 
         # confirmed on this build). No 2nd seed is ever drawn.
         if (-not $c.SeedCut) {
             $wiz.BeginRun('Cutting the seed slot...')
+            $beforeSeed = Get-FeatureIdSet   # baseline: resolve the seed's feature id after the confirmed cut
             $stamp = $null; try { $stamp = $model.VersionStamp } catch {}
             $changed = $false
             try {
@@ -4023,9 +4028,15 @@ $slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + 
                 [void]$wiz.AskInline('Chip-relief slots', ("Flipped the direction and reopened the sketcher. If the wrong slot is still in Creo, press Ctrl+Z. Redraw the seed rectangle, then press 'Finish the seed slot' again."), 'OK', $true)
                 return $false
             }
+            # capture the confirmed seed's feature id (highest new ITEM_FEATURE) so the
+            # patterns below can re-select it hands-free (no manual tree click). 0 = not
+            # resolved -> the pattern loop falls back to asking the operator to click it.
+            $afterSeed = Get-FeatureIdSet
+            $newSeed = @($afterSeed.Keys | Where-Object { -not $beforeSeed.ContainsKey($_) } | Sort-Object)
+            $c.SeedFeatId = if (@($newSeed).Count -ge 1) { [int]$newSeed[-1] } else { 0 }
             $c.SeedCut = $true
             $c.SlotAnyCut = $true
-            $wiz.Log('Seed slot confirmed - patterning it onto every remaining row (no more drawing).')
+            $wiz.Log(("Seed slot confirmed (feature id {0}) - patterning it onto every remaining row (no more drawing)." -f $(if ($c.SeedFeatId -gt 0) { $c.SeedFeatId } else { 'unresolved' })))
         }
 
         # fire ALL from-seed patterns inline (tree-select the seed once per pattern).
@@ -4039,27 +4050,41 @@ $slotFinishStep = New-WizardStep -Key 'slot-b' -Title 'Chip-relief slots: cut + 
         $accTot = @($pats | Where-Object { $_.Kind -eq 'accommodation' }).Count
         $wiz.BeginRun(("Patterning: 1 regular pattern + {0} accommodation pattern(s) from the one seed..." -f $accTot))
         $donePat = 0
+        $poll = { try { [System.Windows.Forms.Application]::DoEvents() } catch {} }
         for ($k = 0; $k -lt $np; $k++) {
             $p = $pats[$k]
             # label the regular pattern vs the per-stray accommodations (user's model:
             # "the regular pattern" + "a second pattern to accommodate" each off-pattern row).
             $kindWord = if ([string]$p.Kind -eq 'regular') { ("REGULAR pattern ({0} slots at pitch {1:0.###})" -f $p.Count, $p.Increment) } else { ("accommodation pattern (stray row at +{0:0.###})" -f $p.Increment) }
-            # -NoActivate: the operator clicks the seed slot in CREO's model tree WHILE this
-            # prompt is up, then presses OK; a focus-stealing overlay would block that pick.
-            [void]$wiz.AskInline('Chip-relief slots', ("Pattern {0} of {1} - {2}: select the SEED SLOT CUT in Creo's model tree (the remove-material extrude), then press OK. (Same seed every time - Creo makes a new slot each pattern.)" -f ($k + 1), $np, $kindWord), 'OK', $true)
-            $selSeed = Read-SelectedId
-            if ($null -eq $selSeed) {
-                $wiz.Log(("Pattern {0}/{1} ({2}): nothing selected - skipped. Select the seed and re-run, or pattern by hand." -f ($k + 1), $np, $p.Kind))
-                $c.SlotWarn = $true
-                continue
-            }
-            $wiz.Log(("Pattern {0}/{1} - {2} along the {3} datum (by ID)..." -f ($k + 1), $np, $kindWord, $plan.DirName))
-            $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
             $patChanged = $false
-            try {
-                $session.RunMacro((Build-SlotPatternMacro -DirDatumId ([int]$plan.DirDatumId) -Count ([int]$p.Count) -Spacing ([double]$p.Increment) -Flip:$slotPatternFlip))
-                if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -OnPoll { try { [System.Windows.Forms.Application]::DoEvents() } catch {} } }
-            } catch { $wiz.Log("  pattern error: $($_.Exception.Message)") }
+            # HANDS-FREE (user 2026-07-23): re-select the SAME seed feature by its captured
+            # id ($c.SeedFeatId) via the edginator raw-COM channel and pattern - NO manual
+            # tree click. Re-patterning the seed makes a "new sketch + new slot" (operator-
+            # confirmed). Canary-gated inside Invoke-SlotPatternFromSeed.
+            if ([int]$c.SeedFeatId -gt 0) {
+                $wiz.Log(("Pattern {0}/{1} - {2}: re-selecting the seed (id {3}) + patterning along the {4} datum (by ID)..." -f ($k + 1), $np, $kindWord, $c.SeedFeatId, $plan.DirName))
+                $pr = Invoke-SlotPatternFromSeed -SeedFeatId ([int]$c.SeedFeatId) -DirDatumId ([int]$plan.DirDatumId) -Count ([int]$p.Count) -Spacing ([double]$p.Increment) -Flip:$slotPatternFlip -OnPoll $poll
+                $patChanged = ($pr.Selected -and $pr.Changed)
+            }
+            if (-not $patChanged) {
+                # FALLBACK: seed id unresolved, or the auto-select/pattern didn't register ->
+                # ask the operator to click the seed for THIS pattern (the proven path).
+                # -NoActivate: the operator clicks the seed slot in CREO's model tree WHILE this
+                # prompt is up, then presses OK; a focus-stealing overlay would block that pick.
+                [void]$wiz.AskInline('Chip-relief slots', ("Pattern {0} of {1} - {2}: auto-reselect didn't pattern; select the SEED SLOT CUT in Creo's model tree (the remove-material extrude), then press OK. (Same seed every time - Creo makes a new slot each pattern.)" -f ($k + 1), $np, $kindWord), 'OK', $true)
+                $selSeed = Read-SelectedId
+                if ($null -eq $selSeed) {
+                    $wiz.Log(("Pattern {0}/{1} ({2}): nothing selected - skipped. Select the seed and re-run, or pattern by hand." -f ($k + 1), $np, $p.Kind))
+                    $c.SlotWarn = $true
+                    continue
+                }
+                $wiz.Log(("Pattern {0}/{1} - {2} along the {3} datum (by ID)..." -f ($k + 1), $np, $kindWord, $plan.DirName))
+                $stampP = $null; try { $stampP = $model.VersionStamp } catch {}
+                try {
+                    $session.RunMacro((Build-SlotPatternMacro -DirDatumId ([int]$plan.DirDatumId) -Count ([int]$p.Count) -Spacing ([double]$p.Increment) -Flip:$slotPatternFlip))
+                    if ($null -ne $stampP) { $patChanged = Wait-ModelModified -Model $model -PreviousStamp $stampP -OnPoll $poll }
+                } catch { $wiz.Log("  pattern error: $($_.Exception.Message)") }
+            }
             if ($patChanged) { $donePat++; $wiz.Log(("Pattern {0}/{1} placed its slot(s)." -f ($k + 1), $np)) }
             else { $c.SlotWarn = $true; $wiz.Log(("Pattern {0}/{1} did NOT change the model - the seed IS cut; pattern this group by hand." -f ($k + 1), $np)) }
             $wiz.SetChip('slots', ("slots: seed + {0}/{1} patterns" -f $donePat, $np), $(if ($donePat -eq ($k + 1)) { 'built' } else { 'unverified' }))

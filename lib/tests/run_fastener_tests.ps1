@@ -314,6 +314,41 @@ $sp = @([double]$rReal2.SpanX, [double]$rReal2.SpanZ) | Sort-Object
 Assert-True "real2: true spans 1.5 & 6.0 preserved (no distortion)" ((Approx $sp[0] 1.5 1e-2) -and (Approx $sp[1] 6.0 1e-2))
 
 # ----------------------------------------------------------------------------
+# GRID ALIGNMENT (-AlignGrid, user 2026-07-23): a pattern rotated in-plane relative to
+# the layout axes must be DE-ROTATED so rows/columns run perpendicular to the axes.
+# ----------------------------------------------------------------------------
+Write-Host "  -- grid alignment (-AlignGrid) --" -ForegroundColor White
+
+# FL-BestGridAngle: an axis-aligned 2x3 grid -> ~0 deg; the same grid rotated 30 deg -> ~30.
+$gAligned = @( (@{RX=0.0;RZ=0.0}), (@{RX=2.0;RZ=0.0}), (@{RX=0.0;RZ=3.0}), (@{RX=2.0;RZ=3.0}) ) | ForEach-Object { [pscustomobject]$_ }
+Assert-True "align-angle: axis-aligned grid -> ~0 deg" ([Math]::Abs((FL-BestGridAngle -Raw $gAligned) * 180.0 / [Math]::PI) -lt 0.5)
+
+# a 3x3 axis-aligned grid, then rotate every point 30 deg in-plane; ConvertTo-LayoutXZ
+# with axis-aligned axes (normal +Y, layout X/Z) + -AlignGrid must recover a square-ish
+# axis-aligned bounding box (span ratio near the true 2:2), NOT the sqrt2-inflated diag.
+$deg30 = 30.0 * [Math]::PI / 180.0
+$c30 = [Math]::Cos($deg30); $s30 = [Math]::Sin($deg30)
+$gridCtr = @(); $gridAx = @()
+foreach ($gx in 0,1,2) { foreach ($gz in 0,1,2) {
+    # base grid point (gx, gz) in the X-Z plane (Y=5), rotated 30deg about Y (in the X-Z plane)
+    $bx = [double]$gx; $bz = [double]$gz
+    $rxp = $bx*$c30 - $bz*$s30
+    $rzp = $bx*$s30 + $bz*$c30
+    $gridCtr += (,@($rxp, 5.0, $rzp))
+    $gridAx  += (,@(0.0, 1.0, 0.0))
+} }
+$rNoAlign = ConvertTo-LayoutXZ -Centers $gridCtr -Axes $gridAx -AxisX 'X' -AxisZ 'Z' -Margin 0.25 -DedupTol 0
+$rAlign   = ConvertTo-LayoutXZ -Centers $gridCtr -Axes $gridAx -AxisX 'X' -AxisZ 'Z' -Margin 0.25 -DedupTol 0 -AlignGrid
+Assert-True "align: rotated grid keeps all 9 holes (isometry, no merge)" ($rAlign.Valid -and $rAlign.Count -eq 9)
+Assert-True "align: applied ~30 deg de-rotation" ((([Math]::Abs([double]$rAlign.AlignAngleDeg - 30.0) -lt 0.5) -or ([Math]::Abs([double]$rAlign.AlignAngleDeg - 60.0) -lt 0.5)))
+# un-aligned: the 30deg-rotated grid's AABB is inflated (span > true 2.0); aligned: ~2.0
+Assert-True "align: de-rotated spans collapse to the true grid extent (~2.0)" ((Approx $rAlign.SpanX 2.0 1e-2) -and (Approx $rAlign.SpanZ 2.0 1e-2))
+Assert-True "align: un-aligned spans are inflated by the diagonal" ([double]$rNoAlign.SpanX -gt 2.3)
+# already-aligned grid + -AlignGrid -> unchanged (angle ~0, spans still 2 x 3)
+$rAA = ConvertTo-LayoutXZ -Centers $aaCtr -Axes $aaAxes -AxisX 'X' -AxisZ 'Z' -Margin 0.5 -AlignGrid
+Assert-True "align: already-aligned grid unchanged (~0 deg, spans 2 & 3)" ([Math]::Abs([double]$rAA.AlignAngleDeg) -lt 0.5 -and (Approx $rAA.SpanX 2.0 1e-6) -and (Approx $rAA.SpanZ 3.0 1e-6))
+
+# ----------------------------------------------------------------------------
 # CONDITIONING GATE: a selection that cannot define the panel plane FAILS LOUD
 # (Valid=$false) instead of silently distorting via the legacy global drop.
 # ----------------------------------------------------------------------------

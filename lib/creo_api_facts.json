@@ -748,6 +748,16 @@
       "symbols": ["IpfcComponentPath", "GetTransform", "GetOrigin", "IpfcTransform3D", "ComponentIds", "CurrentSelectionBuffer", "SelectionString"],
       "evidence": "CONFIRMED LIVE 2026-07-20 on 004-956-8883-001.asm: 12 selected fastener components (004-956-8871-001.prt) returned Path.GetTransform($true).GetOrigin() = a clean 4x3 grid (X {-2.55,27.44,57.44,87.44} spacing 30, Z {3.06,18.06,33.06} spacing 15, Y=0 constant = through-thickness axis, correctly ignored). BottomUp=$true is the member->root origin (the fastener position); $false is the inverse (assembly origin in member coords). ListItems returned 0 components/bodies/surfaces at the assembly top (sections [1]-[4] empty). gripenator.cmd reads Path.ComponentIds/SelectionString from the buffer; VB docs 'GetTransform(BottomUp as Boolean) as IpfcTransform3D'. Used by fastener-probe.cmd [6], fastenator.cmd --from-components, drilljig.cmd option 4.",
       "verifiedOn": "2026-07-20"
+    },
+    {
+      "id": "slot-pattern-seed-raw-com-select",
+      "category": "selection",
+      "status": "docs-only",
+      "fact": "To pattern a feature (ProCmdGeomPattern) HANDS-FREE, re-select the seed feature by id via the RAW-COM channel: $model.GetItemById(ITEM_FEATURE,id) -> CMpfcSelect.CreateModelItemSelection(feat,$null) -> ($session.CurrentSelectionBuffer()).AddSelection(sel), then fire the pattern macro. This is a DIFFERENT channel than the tree-SEARCH select-by-id (ProCmdMdlTreeSearch/selspecdlg0), which FIX 1 (2026-07-07) found does NOT register as the pattern target. edginator PROVED this raw-COM AddSelection feeds ProCmdRound on the same imported/foreign jig bodies, so it is the natural hands-free pre-select for the pattern -- lib/drilljig_core.ps1 Select-FeatureById + Invoke-SlotPatternFromSeed (canary-gated on a VersionStamp change; falls back to a manual model-tree click on a miss).",
+      "antipattern": "Using the tree-SEARCH select-by-id (Get-SelectByIdMacro) to pre-select the pattern target -- it does not register (FIX 1). Also: assuming this raw-COM path is proven for the pattern -- it is proven for ProCmdRound (edginator), NOT yet confirmed live for ProCmdGeomPattern, so it MUST stay canary-gated with a manual reselect fallback.",
+      "symbols": ["GetItemById", "ITEM_FEATURE", "CreateModelItemSelection", "AddSelection", "CurrentSelectionBuffer", "ProCmdGeomPattern", "Select-FeatureById", "Invoke-SlotPatternFromSeed"],
+      "evidence": "CLAUDE.md slotinator FIX 4 (2026-07-23). Channel proven for ProCmdRound in lib/edge_round.ps1 (edginator, 2026-06-24). Wired into slotinator.cmd + drilljig.cmd STAGE 4 + drilljig-gui.cmd slot-b; gated by run_wizard_tests.ps1 (Invoke-SlotPatternFromSeed cases). LIVE-UNVERIFIED for the pattern target.",
+      "verifiedOn": null
     }
   ]
 }

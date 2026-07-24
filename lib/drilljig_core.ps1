@@ -325,13 +325,14 @@ function Group-CatalogByID {
 }
 
 # ============================================================================
-# OD-FIRST (METAL removable-bushing) PICK (user 2026-07-22): for METAL parts the
-# decision tree resolves to "removable bushings" filtered by OD (metal->PFD = 3/4 OD;
-# metal->Hand Drill = 3/4 OD + 1/2 OD). For those leaves the technician does NOT care
-# about the bore ID -- the drilled jig hole IS the removable bushing's OD, and only
-# 1/2" or 3/4" ODs are on offer. So the metal path DISPLAYS THE OD (never the ID),
-# skips the ID question entirely, then asks the standardized length (which sets the
-# plate thickness). The 3D-print SLEEVE path is unchanged (ID-first).
+# OD-FIRST (METAL removable-bushing) PICK (user 2026-07-22): the METAL -> Hand Drill
+# leaf resolves to "removable bushings" filtered by OD (3/4 OD + 1/2 OD). For that leaf
+# the technician does NOT care about the bore ID -- the drilled jig hole IS the removable
+# bushing's OD, and only 1/2" or 3/4" ODs are on offer. So the OD-first path DISPLAYS THE
+# OD (never the ID), skips the ID question entirely, then asks the standardized length
+# (which sets the plate thickness). NOTE (user 2026-07-23): METAL -> PFD is NO LONGER
+# OD-first -- its tree leaf was changed to "3/4 ID sleeves", so it now takes the ID-FIRST
+# sleeve path below (shows the ID, only 3/4). The 3D-print SLEEVE path is likewise ID-first.
 # The two PURE helpers below drive that branch and are mirrored into jiginator.cmd /
 # jiginator.ps1 (which dot-source no lib). global: so the GUI closures resolve them.
 # ============================================================================
@@ -1156,6 +1157,84 @@ function Build-SlotPatternMacro {
            (Get-SelectDatumByIdMacro -FeatId $DirDatumId) +
            (Build-PatternValuesMacro -Count1 $Count -Spacing1 $Spacing -Flip1:$Flip) +
            (Build-PatternConfirmMacro)
+}
+
+# Select-FeatureById - programmatically select a FEATURE (by id) into the selection
+# buffer via the edginator-proven RAW-COM channel: resolve a CMpfcSelect factory ->
+# CreateModelItemSelection(feature,$null) -> CurrentSelectionBuffer().AddSelection.
+# This is a DIFFERENT channel than the tree-search dialog (Get-SelectByIdMacro): FIX 1
+# (2026-07-07) found a tree-SEARCH buffer select does NOT register as the pattern
+# target, but edginator (2026-06-24, lib\edge_round.ps1) proved this raw-COM
+# AddSelection DOES feed a dashboard command (ProCmdRound) on the SAME imported/foreign
+# jig bodies where the tree search is dead. So it is the natural HANDS-FREE way to
+# re-select the seed slot for ProCmdGeomPattern - no manual model-tree click. Clears the
+# buffer, adds the feature, then VERIFIES the buffer holds that id. Reads the core scope
+# ($script:DJSession/DJModel/DJType). Returns $true only when the feature landed; never
+# throws. ID-only (never reads .Point). NOTE whether ProCmdGeomPattern HONORS a raw-COM-
+# selected feature is a LIVE-BEHAVIORAL unknown, so callers canary-gate on a VersionStamp
+# change and fall back to the (proven) manual reselect - this NEVER regresses that path.
+function Select-FeatureById {
+    param([int]$FeatId)
+    if ($FeatId -le 0) { return $false }
+    $feat = $null
+    try { $feat = $script:DJModel.GetItemById($script:DJType.ITEM_FEATURE, [int]$FeatId) } catch {}
+    if ($null -eq $feat) { return $false }
+    # CM*/CC* factory names are NEVER standalone ProgIDs (the RegenInstructions gotcha) -
+    # cascade candidate ProgIDs; the first whose CreateModelItemSelection works wins.
+    $sel = $null
+    foreach ($progId in @('pfcls.pfcSelect','pfcls.MpfcSelect','pfcls.CMpfcSelect','pfcls.pfcSelectClass')) {
+        try {
+            $cls = New-Object -ComObject $progId
+            $sel = $cls.CreateModelItemSelection($feat, $null)
+            if ($null -ne $sel) { break }
+        } catch {}
+    }
+    if ($null -eq $sel) { return $false }
+    $buf = $null
+    try { $buf = $script:DJSession.CurrentSelectionBuffer() } catch {}
+    if ($null -eq $buf) { return $false }
+    try { $buf.Clear() } catch {}
+    try { $buf.AddSelection($sel) } catch { return $false }
+    # verify it landed (the seed feature id must now be in the buffer)
+    $ids = @()
+    try { foreach ($it in $buf.Contents) { try { $ids += [int]$it.SelItem.Id } catch {} } } catch {}
+    return (@($ids) -contains [int]$FeatId)
+}
+
+# Invoke-SlotPatternFromSeed - HANDS-FREE replacement for the manual "click the seed
+# slot in the model tree, then pattern" step (user 2026-07-23: "you dont need to ask the
+# user, you can manually just reselect that feature and do the patterns"). Given the
+# seed slot's already-captured feature id: programmatically re-select it (Select-
+# FeatureById) and fire ONE ProCmdGeomPattern (Build-SlotPatternMacro), canary-gated on a
+# VersionStamp change. Returns @{ Selected; Changed; Reason }. A caller treats
+# (Selected -and Changed) as success; on anything else it falls back to the manual
+# reselect prompt (the proven path). Reads the core scope. -OnPoll is threaded to
+# Wait-ModelModified (the GUI passes a DoEvents pump so the window repaints during the
+# regen). NEVER assumes success on a can't-read/no-change signal
+# ([[feedback_canary_must_not_assume_on_failure]]).
+function Invoke-SlotPatternFromSeed {
+    param(
+        [int]$SeedFeatId,
+        [int]$DirDatumId,
+        [int]$Count,
+        [double]$Spacing,
+        [switch]$Flip,
+        [int]$TimeoutMs = 30000,
+        [scriptblock]$OnPoll = $null
+    )
+    $res = @{ Selected = $false; Changed = $false; Reason = '' }
+    if ($SeedFeatId -le 0) { $res.Reason = 'seed feature id was not captured'; return $res }
+    if ($DirDatumId -le 0) { $res.Reason = 'pattern-direction datum not available'; return $res }
+    $res.Selected = Select-FeatureById -FeatId ([int]$SeedFeatId)
+    if (-not $res.Selected) { $res.Reason = 'could not select the seed feature via COM'; return $res }
+    $stamp = $null; try { $stamp = $script:DJModel.VersionStamp } catch {}
+    try {
+        $macro = Build-SlotPatternMacro -DirDatumId ([int]$DirDatumId) -Count ([int]$Count) -Spacing ([double]$Spacing) -Flip:$Flip
+        $script:DJSession.RunMacro($macro)
+        if ($null -ne $stamp) { $res.Changed = Wait-ModelModified -PreviousStamp $stamp -TimeoutMs $TimeoutMs -OnPoll $OnPoll }
+    } catch { $res.Reason = "pattern macro error: $($_.Exception.Message)"; return $res }
+    if (-not $res.Changed -and $res.Reason -eq '') { $res.Reason = 'pattern did not change the model (the COM-selected seed may not register as the pattern target on this build)' }
+    return $res
 }
 
 # New-SlotGuidePlanes - create + SHOW the slot-edge offset planes that guide the
