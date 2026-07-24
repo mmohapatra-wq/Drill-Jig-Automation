@@ -25,5 +25,13 @@ csystrf_recipe.txt
 # fastener-probe read-path diagnostic output (throwaway)
 fastener_probe_report.txt
 
+# curved-jig probe outputs (throwaway diagnostics, not committed)
+slotplane_probe_report.txt
+drilljig3d_probe_report.txt
+tangent_plane_probe_report.txt
+
 # fastener layout handoff (per-run artifact, like last_jig_spec.json)
 fastener_layout.json
+
+# hole layout handoff (holelayoutinator.cmd standalone artifact)
+hole_layout.json

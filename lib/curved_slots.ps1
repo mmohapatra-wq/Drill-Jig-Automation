@@ -115,8 +115,13 @@ function global:CS-CleanHoles {
         $id = $null
         try { $id = CS-ReadHoleId $h.Id } catch { $id = $null }
 
+        # Accept EITHER input field name for the hole's sketch plane: SketchPlaneId
+        # (the documented name) OR PlaneId (the name the drilljig3d integration +
+        # curved_slot_macros use, matching the tangent-plane feat-id). Whichever is
+        # present and > 0 wins; this tolerant read keeps both callers correct.
         $planeId = 0
         try { $planeId = CS-ReadPlaneId $h.SketchPlaneId } catch { $planeId = 0 }
+        if ($planeId -le 0) { try { $planeId = CS-ReadPlaneId $h.PlaneId } catch { $planeId = 0 } }
 
         # RowKey as a trimmed string when present (string equality grouping).
         $rowKey = $null

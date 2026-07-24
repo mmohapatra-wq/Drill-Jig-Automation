@@ -85,16 +85,27 @@ function Approx {
     return [Math]::Abs($A - $B) -le $Tol
 }
 
-# Tolerant field getter: returns the value of the FIRST property that exists on
+# Tolerant field getter: returns the value of the FIRST field that exists on
 # $obj from the candidate name list, or $null if none. Contract-named fields are
 # asserted directly; this survives a reasonable naming choice for anything the
 # contract leaves slightly ambiguous.
+#
+# The curved slot-macros lib returns its results as HASHTABLES (@{ Armed=..;
+# Changed=..; SeedsCut=.. }), whose keys are NOT surfaced through
+# $Obj.PSObject.Properties (that only exposes Count/Keys/Values for a hashtable).
+# So read fields the way the sibling suite (run_drilljig3d_stage3_tests.ps1) does:
+# dynamic member access ($Obj.$n), which resolves BOTH hashtable keys AND
+# PSCustomObject/NoteProperty members. Fall back to PSObject.Properties only for a
+# member whose name is not directly addressable.
 function Get-Field {
     param($Obj, [string[]]$Names)
     if ($null -eq $Obj) { return $null }
     foreach ($n in $Names) {
+        # hashtable key -> containsKey; PSCustomObject/NoteProperty -> dynamic access
+        if (($Obj -is [System.Collections.IDictionary]) -and $Obj.Contains($n)) { return $Obj[$n] }
         $prop = $Obj.PSObject.Properties[$n]
         if ($null -ne $prop) { return $prop.Value }
+        try { $v = $Obj.$n; if ($null -ne $v) { return $v } } catch {}
     }
     return $null
 }
@@ -192,21 +203,25 @@ Assert-True "arm-macro: 5002 is NOT in the 7777 macro" (-not ($armMacro2 -match 
 # ============================================================================
 Write-Host "  -- Invoke-CurvedSlotArm (gate on plane id) --" -ForegroundColor White
 
+# Invoke-CurvedSlotArm takes a SEED object (a Get-CurvedSlotPlan seed carrying a
+# .SketchPlaneId) - the SAME shape Invoke-CurvedSlotPlanRun feeds it. Build a minimal
+# seed per case; the arm gates on the seed's .SketchPlaneId (<=0 => never fires).
+
 # plane id 0 -> no usable plane -> Armed=$false, NOTHING fired
 $script:cslmFired = @()
-$armZero = Invoke-CurvedSlotArm -SketchPlaneId 0
+$armZero = Invoke-CurvedSlotArm -Seed ([pscustomobject]@{ SketchPlaneId = 0 })
 Assert-True "arm: plane id 0 -> Armed false"        (-not [bool](Get-Field $armZero @('Armed')))
 Assert-True "arm: plane id 0 -> nothing fired"      (@($script:cslmFired).Count -eq 0)
 
 # negative plane id -> same (no usable plane)
 $script:cslmFired = @()
-$armNeg = Invoke-CurvedSlotArm -SketchPlaneId -5
+$armNeg = Invoke-CurvedSlotArm -Seed ([pscustomobject]@{ SketchPlaneId = -5 })
 Assert-True "arm: negative plane id -> Armed false" (-not [bool](Get-Field $armNeg @('Armed')))
 Assert-True "arm: negative plane id -> nothing fired" (@($script:cslmFired).Count -eq 0)
 
 # positive plane id -> Armed=$true, fires ONE arm macro carrying that id
 $script:cslmFired = @()
-$armOk = Invoke-CurvedSlotArm -SketchPlaneId 5003
+$armOk = Invoke-CurvedSlotArm -Seed ([pscustomobject]@{ SketchPlaneId = 5003 })
 Assert-True "arm: positive plane id -> Armed true"  ([bool](Get-Field $armOk @('Armed')))
 Assert-True "arm: positive plane id -> fired exactly one macro" (@($script:cslmFired).Count -eq 1)
 Assert-True "arm: fired macro opens the sketcher"   ($script:cslmFired[0] -match 'ProCmdDatumSketCurve')
@@ -215,7 +230,7 @@ Assert-True "arm: fired macro arms the rectangle"   ($script:cslmFired[0] -match
 
 # never throws on a bad id
 $threwArm = $false
-try { $null = Invoke-CurvedSlotArm -SketchPlaneId 0 } catch { $threwArm = $true }
+try { $null = Invoke-CurvedSlotArm -Seed ([pscustomobject]@{ SketchPlaneId = 0 }) } catch { $threwArm = $true }
 Assert-True "arm: bad id did NOT throw" (-not $threwArm)
 
 # ============================================================================

@@ -67,6 +67,15 @@ $Verbose = $ScriptArgs -match '(?i)-v|--verbose'
 # hypothesis (surface pre-select). Use to confirm the rest of the pipeline if the
 # orientation step misbehaves live.
 $DefaultOrient = ($ScriptArgs -match '(?i)-{1,2}defaultorient')
+# --tangent-orient : in STAGE 2, build a TANGENT datum plane at each hole (point +
+# STAGE-1 surface) and drill On-Point normal to THAT plane -- its normal IS the
+# surface normal there, so orientation is normal-to-surface by construction (retires
+# the surface-pre-select HYPOTHESIS). OFF by default until tangent-plane-probe.cmd
+# confirms the by-ID Tangent ref feed live; the proven Build-NormalHoleMacro path
+# stays the default. Also reused as the slot sketch host in STAGE 3.
+$TangentOrient = ($ScriptArgs -match '(?i)-{1,2}tangent-orient')
+# --no-slots : skip the STAGE 3 curved chip-relief slot loop.
+$NoSlots = ($ScriptArgs -match '(?i)-{1,2}no-slots')
 $ErrorActionPreference = "Stop"
 $startTime = Get-Date
 
@@ -511,6 +520,24 @@ Write-Host ""
 # ============================================================================
 . (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
 . (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')
+# STAGE 0 decision-tree walk + bushing/hole pick. drilljig_core.ps1 supplies the
+# PURE catalog helpers (Get-CatalogSpec, Get-OdGroups, Resolve-*BushingPick*, ...);
+# jig_tree.ps1 is the console walk (Invoke-Walk / Invoke-BushingPick / Read-Choice)
+# lifted from drilljig.cmd STAGE 1 so the flat + curved tools resolve a hole OD +
+# bushing length through the SAME logic. Both are pure (no Creo) - safe pre-connect.
+. (Join-Path $ScriptDir 'lib\drilljig_core.ps1')
+. (Join-Path $ScriptDir 'lib\jig_tree.ps1')
+# Curved-jig pieces (all offline-tested; the Creo-firing bodies are canary-gated):
+#   tangent_plane.ps1  - Build-TangentPlaneMacro / Invoke-TangentPlane: a datum plane
+#     TANGENT to the curved surface AT a hole's datum point; its normal IS the surface
+#     normal there, so it is BOTH a real normal-to-surface drilling reference AND the
+#     ideal chip-relief slot sketch host (fact tangent-plane-at-point-on-surface).
+#   curved_slots.ps1 / curved_slot_macros.ps1 - plan + drive the per-hole chip-relief
+#     slot loop (arm the seed sketch on each hole's tangent plane BY ID -- proven-live
+#     sketch-open-on-plane-by-id -- then Build-CutFinishMacro, canary-gated each).
+. (Join-Path $ScriptDir 'lib\tangent_plane.ps1')
+. (Join-Path $ScriptDir 'lib\curved_slots.ps1')
+. (Join-Path $ScriptDir 'lib\curved_slot_macros.ps1')
 
 # Resolve the blind-judge config once (BlueGPT REST). $null is fine - the STAGE-2
 # hole-count gate still runs DETERMINISTICALLY; the packet is written for offline
@@ -518,6 +545,68 @@ Write-Host ""
 $judgeCfg = Get-JudgeConfig -RepoRoot $ScriptDir -DefaultModel "sonnet"
 if ($null -eq $judgeCfg) {
     Write-Host "  (blind judge not configured - hole-count gate runs deterministically; packet written for offline judging)" -ForegroundColor DarkGray
+}
+
+# drilljig_core needs its data dir for the catalog (Get-CatalogSpec resolves CSV
+# paths under it). No session/model yet - STAGE 0 is pure, pre-connect.
+try { Initialize-DrilljigCore -Session $null -Model $null -TypeObj $null -DataDir (Join-Path $ScriptDir 'data') } catch {}
+
+# ============================================================================
+# STAGE 0 - DECISION TREE (no Creo). Walk ONCE -> the hole diameter + bushing
+# length, EXACTLY like drilljig.cmd STAGE 1. This is the curved tool's parity
+# answer to "all of the hole and bushing selection". The resolved values take
+# PRECEDENCE over last_jig_spec.json (below); skipping the tree falls back to the
+# file, then to manual entry - so nothing regresses for a bare run.
+#   --no-tree  : skip the walk entirely (old behavior: file/manual only).
+# ============================================================================
+$treeDia = $null; $treeBushLen = $null; $treeBushName = $null
+$SkipTree = ($ScriptArgs -match '(?i)-{1,2}no-tree')
+$treePath = Join-Path $ScriptDir 'docs\drill_jig_decision_tree.json'
+if (-not $SkipTree -and (Test-Path $treePath)) {
+    $tree = $null
+    try { $tree = Get-Content $treePath -Raw | ConvertFrom-Json } catch {
+        Write-Host "  (could not parse the decision tree - skipping STAGE 0: $($_.Exception.Message))" -ForegroundColor Yellow
+    }
+    if ($null -ne $tree) {
+        Write-Host ""
+        Write-Host "  ====================================================================" -ForegroundColor Cyan
+        Write-Host "   STAGE 0 - Drill-jig decision tree (hole + bushing selection)" -ForegroundColor Cyan
+        Write-Host "  ====================================================================" -ForegroundColor Cyan
+        Write-Host "  (or press Q at any prompt to skip the tree and enter values by hand)" -ForegroundColor DarkGray
+
+        $roots        = @($tree)
+        $t0path       = [System.Collections.ArrayList]::new()
+        $t0outcomes   = [System.Collections.ArrayList]::new()
+        $script:Picks = [System.Collections.ArrayList]::new()
+
+        $t0quit = $false
+        foreach ($root in $roots) {
+            if (-not (Invoke-Walk -Node $root -Path $t0path -Outcomes $t0outcomes)) { $t0quit = $true; break }
+        }
+
+        if ($t0quit) {
+            Write-Host ""
+            Write-Host "  Decision tree skipped - will use the handoff file / manual entry." -ForegroundColor Yellow
+        } else {
+            Write-Host ""
+            Write-Host "  Your selections:" -ForegroundColor Green
+            Write-Host ("    " + ($t0path -join "  >  ")) -ForegroundColor White
+            foreach ($o in $t0outcomes) { Write-Host "    $o" -ForegroundColor White }
+        }
+
+        # LAST pick wins as the active hole spec (jiginator's model).
+        if ($script:Picks.Count -gt 0) {
+            $active  = $script:Picks[$script:Picks.Count - 1]
+            $treeDia = [double]$active.HoleDiameter
+            if ($null -ne $active.BushingLength) { try { $treeBushLen = [double]$active.BushingLength } catch {} }
+            $treeBushName = [string]$active.Bushing
+            Write-Host ("  Tree resolved: hole dia {0}`"  ({1})" -f $treeDia, $treeBushName) -ForegroundColor Cyan
+            if ($null -ne $treeBushLen) {
+                Write-Host ("  Bushing length {0}`" -> STAGE-1 thickness default (the jig wall = the bushing guide length)." -f $treeBushLen) -ForegroundColor Cyan
+            }
+        }
+        Write-Host ""
+    }
 }
 
 # ============================================================================
@@ -528,18 +617,26 @@ if ($null -eq $judgeCfg) {
 # Stale/absent file -> everything stays manual (the user always confirms). Pure
 # file read, no Creo. BushingLength is read if jiginator ever emits it (not in the
 # current handoff contract yet) so this is forward-compatible.
-$jigSpec = $null; $jigDia = $null; $jigBushLen = $null
-$handoffPath = Join-Path $ScriptDir 'last_jig_spec.json'
-if (Test-Path $handoffPath) {
-    try {
-        $jigSpec = Get-Content $handoffPath -Raw | ConvertFrom-Json
-        if ($null -ne $jigSpec.HoleDiameter  -and [double]$jigSpec.HoleDiameter  -gt 0) { $jigDia     = [double]$jigSpec.HoleDiameter }
-        if ($null -ne $jigSpec.BushingLength -and [double]$jigSpec.BushingLength -gt 0) { $jigBushLen = [double]$jigSpec.BushingLength }
-    } catch { $jigSpec = $null }
-    if ($null -ne $jigDia) {
-        $bn = ""
-        try { if ($jigSpec.Bushing) { $bn = " ($($jigSpec.Bushing))" } } catch {}
-        Write-Host "  jiginator handoff: hole/seat dia $jigDia$bn" -ForegroundColor DarkGray
+$jigSpec = $null; $jigDia = $null; $jigBushLen = $null; $jigBushName = $null
+# STAGE 0 (the live tree walk above) takes PRECEDENCE over the file. If the tree
+# resolved a hole spec, use it; otherwise fall back to last_jig_spec.json (an
+# earlier jiginator/drilljig walk), then to manual entry.
+if ($null -ne $treeDia) {
+    $jigDia = $treeDia; $jigBushLen = $treeBushLen; $jigBushName = $treeBushName
+    Write-Host "  Using STAGE-0 tree result: hole/seat dia $jigDia$(if ($jigBushName) { " ($jigBushName)" })" -ForegroundColor DarkGray
+} else {
+    $handoffPath = Join-Path $ScriptDir 'last_jig_spec.json'
+    if (Test-Path $handoffPath) {
+        try {
+            $jigSpec = Get-Content $handoffPath -Raw | ConvertFrom-Json
+            if ($null -ne $jigSpec.HoleDiameter  -and [double]$jigSpec.HoleDiameter  -gt 0) { $jigDia     = [double]$jigSpec.HoleDiameter }
+            if ($null -ne $jigSpec.BushingLength -and [double]$jigSpec.BushingLength -gt 0) { $jigBushLen = [double]$jigSpec.BushingLength }
+        } catch { $jigSpec = $null }
+        if ($null -ne $jigDia) {
+            $bn = ""
+            try { if ($jigSpec.Bushing) { $bn = " ($($jigSpec.Bushing))"; $jigBushName = [string]$jigSpec.Bushing } } catch {}
+            Write-Host "  jiginator handoff: hole/seat dia $jigDia$bn" -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -668,6 +765,12 @@ try {
 } catch {}
 
 $modelItemType = New-Object -ComObject pfcls.pfcModelItemType
+
+# Re-initialize the shared drilljig-core scope with the LIVE session/model now that we
+# are connected (STAGE 0 initialized it pre-connect with only the data dir). The
+# tangent-plane + curved-slot COM helpers (Invoke-TangentPlane / Invoke-CurvedSlot*)
+# read $script:DJSession/DJModel/DJType from here, exactly like Invoke-VerifiedSeedCut.
+try { Initialize-DrilljigCore -Session $session -Model $model -TypeObj $modelItemType -DataDir (Join-Path $ScriptDir 'data') } catch {}
 
 try {
 
@@ -907,9 +1010,10 @@ if ($script:blankMade) {
 
             # Orientation note (each hole's normal-reference surface now lives in its
             # $holePairs entry - per-hole in mode 2, the shared STAGE-1 surface in mode 1).
-            $orientNote = if ($DefaultOrient) { "Creo default On-Point direction (-defaultorient)" }
-                          elseif ($perHole)   { "normal to each hole's OWN surface (per-hole) - verify visually" }
-                          else                { "normal to surface $($surfIds[0]) (one surface for all - verify visually)" }
+            $orientNote = if ($DefaultOrient)  { "Creo default On-Point direction (-defaultorient)" }
+                          elseif ($TangentOrient) { "normal to a TANGENT PLANE built at each hole (tangent-orient) - normal-to-surface by construction" }
+                          elseif ($perHole)    { "normal to each hole's OWN surface (per-hole) - verify visually" }
+                          else                 { "normal to surface $($surfIds[0]) (one surface for all - verify visually)" }
 
             Write-Host ""
             Write-Host "  Ready: $($holePairs.Count) On-Point hole(s), dia $holeDia, thru all, body index $bodyIndex." -ForegroundColor Cyan
@@ -932,7 +1036,24 @@ if ($script:blankMade) {
                 foreach ($pair in $holePairs) {
                     $idx++
                     Show-Progress ([Math]::Floor(($idx / $total) * 100)) "Hole $idx/$total"
-                    $hm = Build-NormalHoleMacro -PointId $pair.PointId -SurfaceId $pair.SurfaceId -Diameter $holeDia -BodyIndex $bodyIndex -DefaultOrient:$DefaultOrient
+
+                    # --tangent-orient: build a TANGENT datum plane at (point, surface)
+                    # first; its normal IS the surface normal there, so drilling On-Point
+                    # normal to it is normal-to-surface BY CONSTRUCTION. Canary-gated: if
+                    # the plane is not created we FALL BACK to the proven surface-pre-select
+                    # macro for this hole (never assume; never block the drill). The plane
+                    # id is stashed on the pair so STAGE 3 reuses it as the slot sketch host.
+                    $orientSurfId = [int]$pair.SurfaceId
+                    if ($TangentOrient -and -not $DefaultOrient -and [int]$pair.SurfaceId -gt 0 -and [int]$pair.PointId -gt 0) {
+                        $tp = Invoke-TangentPlane -PointId ([int]$pair.PointId) -SurfaceId ([int]$pair.SurfaceId)
+                        if ($tp.Created -and [int]$tp.PlaneId -gt 0) {
+                            Add-Member -InputObject $pair -MemberType NoteProperty -Name TangentPlaneId -Value ([int]$tp.PlaneId) -Force
+                        } else {
+                            Write-Log ("tangent plane for hole $idx not created ($($tp.Reason)) - using the surface pre-select for this hole.") 'Yellow'
+                        }
+                    }
+
+                    $hm = Build-NormalHoleMacro -PointId $pair.PointId -SurfaceId $orientSurfId -Diameter $holeDia -BodyIndex $bodyIndex -DefaultOrient:$DefaultOrient
                     $hchanged = $false
                     try {
                         $hstamp = $model.VersionStamp
@@ -997,10 +1118,106 @@ if ($script:blankMade) {
                     } else {
                         Write-Host "  NOT confirmed: the measured bore count/diameter did not match $total hole(s) - inspect Creo." -ForegroundColor Yellow
                     }
-                    if (-not $DefaultOrient) {
+                    if ($TangentOrient -and -not $DefaultOrient) {
+                        Write-Host "  Orientation: drilled normal to per-hole TANGENT PLANES (normal-to-surface by construction; verify visually)." -ForegroundColor DarkGray
+                    } elseif (-not $DefaultOrient) {
                         Write-Host "  Orientation (normal-to-surface) is still a VISUAL check (see Build-NormalHoleMacro / --probe-orient roadmap)." -ForegroundColor DarkGray
                     }
+
+                    # Hand the drilled holes (+ any tangent planes) to STAGE 3 so the
+                    # curved chip-relief slot loop can arm each seed sketch on the hole's
+                    # tangent plane BY ID. Only when we actually made holes.
+                    if (-not $holeAbort -and $holesMade -gt 0) {
+                        $script:curvedHolePairs = @($holePairs)
+                        $script:curvedHoleDia   = $holeDia
+                        $script:curvedBodyIndex = $bodyIndex
+                    }
                 }
+            }
+        }
+    }
+}
+
+# ============================================================================
+# STAGE 3 - CURVED CHIP-RELIEF SLOTS (one blind rectangular slot per hole)
+# ============================================================================
+# The curved analog of the flat jig's slot relief. For each drilled hole, arm a seed
+# rectangle sketch on that hole's TANGENT PLANE (proven-live sketch-open-on-plane-by-ID
+# -- the plane is tangent at the hole so the slot cuts NORMAL to the surface, the user's
+# acceptance bar), the operator draws the rectangle, then Build-CutFinishMacro cuts it,
+# canary-gated. NO pattern (per-hole individual cuts -- there is no programmatic copy API
+# for arbitrary curved positions). Needs per-hole TANGENT PLANES, so it requires
+# --tangent-orient (which captured $pair.TangentPlaneId during drilling); otherwise it
+# reports what is missing and skips. Everything is opt-out via --no-slots.
+if (-not $NoSlots -and $null -ne $script:curvedHolePairs -and @($script:curvedHolePairs).Count -gt 0) {
+    Write-Host ""
+    Write-Host "  ====================================================================" -ForegroundColor Cyan
+    Write-Host "   STAGE 3 - curved chip-relief slots (one per hole, normal-to-surface)" -ForegroundColor Cyan
+    Write-Host "  ====================================================================" -ForegroundColor Cyan
+
+    # Build the per-hole slot-planner input: each hole needs a SketchPlaneId (its tangent
+    # plane). A hole with no captured tangent plane (drilled without --tangent-orient, or
+    # its tangent plane missed) has PlaneId 0 -> Get-CurvedSlotPlan warns + the loop
+    # SKIPS it (fall back to a hand-drawn slot), never silently cut on the wrong plane.
+    $slotHoles = @()
+    $withPlane = 0
+    foreach ($pair in @($script:curvedHolePairs)) {
+        $pid = 0
+        try { if ($null -ne $pair.TangentPlaneId) { $pid = [int]$pair.TangentPlaneId } } catch {}
+        if ($pid -gt 0) { $withPlane++ }
+        $slotHoles += [pscustomobject]@{ Id = [int]$pair.PointId; PlaneId = $pid; RowKey = $null }
+    }
+
+    if ($withPlane -eq 0) {
+        Write-Host "  No per-hole tangent planes were captured, so there is no by-ID sketch host" -ForegroundColor Yellow
+        Write-Host "  for the seed slots. Re-run with --tangent-orient (builds a tangent plane at" -ForegroundColor Yellow
+        Write-Host "  each hole) to enable hands-free curved slots. Skipping STAGE 3." -ForegroundColor Yellow
+    } else {
+        $doSlots = Read-Host "  Cut a chip-relief slot at each hole now? (y/N)"
+        if ($doSlots -notmatch '^[Yy]$') {
+            Write-Host "  Skipped chip-relief slots." -ForegroundColor DarkGray
+        } else {
+            # slot width = the hole diameter (matches the flat tool). depth default 0.25"
+            # (absolute), overridable via --slot-depth N (shared parse with drilljig.cmd).
+            $slotDepth = 0.25
+            $mSd = [regex]::Match($ScriptArgs, '(?i)--slot-depth\s+([0-9]*\.?[0-9]+)')
+            if ($mSd.Success) { $sdv = [double]$mSd.Groups[1].Value; if ($sdv -gt 0) { $slotDepth = $sdv } }
+            $slotW = [double]$script:curvedHoleDia
+
+            $plan = Get-CurvedSlotPlan -Holes $slotHoles -SlotWidth $slotW -Mode 'per-hole'
+            $gate = Test-CurvedSlotPlan -Plan $plan
+            if (-not $plan.Valid -or -not $gate.Ok) {
+                Write-Host "  Could not build a usable slot plan - skipping." -ForegroundColor Yellow
+                foreach ($e in @($plan.Errors)) { Write-Host "    $e" -ForegroundColor DarkGray }
+                foreach ($e in @($gate.Issues)) { Write-Host "    $e" -ForegroundColor DarkGray }
+            } else {
+                foreach ($w in @($plan.Warnings)) { Write-Host "    note: $w" -ForegroundColor DarkGray }
+                Write-Host ("  {0} seed(s), width {1}, depth {2}. For each: the sketcher opens on the hole's" -f $plan.Count, $slotW, $slotDepth) -ForegroundColor Cyan
+                Write-Host "  tangent plane; DRAW the rectangle, leave the sketch OPEN, then press ENTER." -ForegroundColor Cyan
+
+                # DrawPrompt: the manual pause (a RunMacro can't draw). The lib calls it as
+                # (& $DrawPrompt $seed); VerifyPrompt as (& $VerifyPrompt $seed $flip) on the
+                # FIRST cut only (undo+flip+redraw on wrong, reuse the flip for the rest).
+                $drawCb = {
+                    param($seed)
+                    Write-Host ("  Draw the rectangle over hole '$($seed.Key)', leave the sketch OPEN.") -ForegroundColor Magenta
+                    Read-Host "    Press ENTER when the rectangle is drawn"
+                }
+                $verifyCb = {
+                    param($seed, $flip)
+                    $a = Read-Host "    Did the slot cut INTO the plate at the right depth? (y = keep+reuse direction / n = undo+flip+redraw)"
+                    return ($a -match '^[Yy]')
+                }
+
+                $res = Invoke-CurvedSlotPlanRun -Plan $plan -Depth $slotDepth -BodyIndex $script:curvedBodyIndex `
+                    -DrawPrompt $drawCb -VerifyPrompt $verifyCb -OnPoll { }
+                Write-Host ""
+                Write-Host "  ----------------------------------------" -ForegroundColor DarkGray
+                Write-Host ("  Slots cut     : {0}" -f $res.SeedsCut) -ForegroundColor White
+                if ($res.SeedsSkipped -gt 0) { Write-Host ("  Skipped       : {0} (no tangent plane; draw by hand)" -f $res.SeedsSkipped) -ForegroundColor Yellow }
+                if ($res.SeedsFailed  -gt 0) { Write-Host ("  Failed        : {0} (canary miss - inspect Creo)" -f $res.SeedsFailed) -ForegroundColor Yellow }
+                foreach ($w in @($res.Warnings)) { Write-Host "    $w" -ForegroundColor DarkGray }
+                if ($res.SeedsCut -gt 0) { $script:slotsCut = $true }
             }
         }
     }
@@ -1018,6 +1235,9 @@ if ($script:macroFailures -gt 0) {
     Write-Host "  Done - offset+thicken blank created and thickness re-read at $Thickness." -ForegroundColor Green
     if ($script:holesConfirmed) {
         Write-Host "  STAGE 2 holes created (see the per-hole report above)." -ForegroundColor Green
+    }
+    if ($script:slotsCut) {
+        Write-Host "  STAGE 3 chip-relief slots cut (see the per-slot report above)." -ForegroundColor Green
     }
     Write-Host "  NOTE: dim re-read, NOT a geometric measurement of the curved slab." -ForegroundColor DarkGray
     Write-Host "  Verify the conformal jig blank (and any holes) visually in Creo." -ForegroundColor DarkGray

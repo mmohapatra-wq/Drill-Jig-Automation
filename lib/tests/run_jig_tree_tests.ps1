@@ -140,11 +140,13 @@ if (@($tp.Picks).Count -ge 1) {
 #    a synthesized pick carrying the typed OD (the "verify bushing" case).
 #    Menu order for METAL->HandDrill OD-first: N OD cards + 1 custom entry = customIdx.
 #    The catalog seeds 2 ODs (0.5, 0.75) -> customIdx = 3. Queue: material, handdrill,
-#    '3' (custom), '0.6' (typed OD), '' (recommended length).
+#    '3' (custom), '0.6' (typed OD), '1' (length menu item #1). A typed custom OD has no
+#    recommended-length preselect, so pick an explicit length item (not ENTER, which
+#    would fall through with no default).
 # ----------------------------------------------------------------------------
 Write-Host ""
 Write-Host "  -- jig_tree: custom hole OD (OD-first menu) --" -ForegroundColor White
-$cu = Invoke-ScriptedWalk -Answers @('1','2','3','0.6','')
+$cu = Invoke-ScriptedWalk -Answers @('1','2','3','0.6','1')
 Assert-True "custom OD: walk completed"                    ($cu.Cont)
 if (@($cu.Picks).Count -ge 1) {
     $cup = $cu.Picks[$cu.Picks.Count - 1]

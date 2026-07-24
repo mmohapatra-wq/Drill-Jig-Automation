@@ -78,10 +78,15 @@
 # must gate on that - a <=0 plane is a fall-back-to-pick seed, not something to arm).
 # ----------------------------------------------------------------------------
 function global:Build-CurvedSlotArmMacro {
-    param([int]$PlaneId)
-    if ($PlaneId -le 0) { return "" }
+    # Accept -SketchPlaneId (the field name every seed + caller uses) with -PlaneId as
+    # an alias so both names bind to the same value regardless of caller.
+    param(
+        [Alias('PlaneId')]
+        [int]$SketchPlaneId
+    )
+    if ($SketchPlaneId -le 0) { return "" }
     return "~ Activate ``main_dlg_cur`` ``buffer_clean``;" +
-        (Get-SelectDatumByIdMacro -FeatId ([int]$PlaneId)) +
+        (Get-SelectDatumByIdMacro -FeatId ([int]$SketchPlaneId)) +
         "~ Command ``ProCmdDatumSketCurve``;" +
         "~ Trigger ``Odui_Dlg_00`` ``t1.PlnMru`` ``0``;" +
         "~ Trigger ``Odui_Dlg_00`` ``t1.PlnMru`` ````;" +

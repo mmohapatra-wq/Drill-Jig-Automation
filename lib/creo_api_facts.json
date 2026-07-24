@@ -758,6 +758,26 @@
       "symbols": ["GetItemById", "ITEM_FEATURE", "CreateModelItemSelection", "AddSelection", "CurrentSelectionBuffer", "ProCmdGeomPattern", "Select-FeatureById", "Invoke-SlotPatternFromSeed"],
       "evidence": "CLAUDE.md slotinator FIX 4 (2026-07-23). Channel proven for ProCmdRound in lib/edge_round.ps1 (edginator, 2026-06-24). Wired into slotinator.cmd + drilljig.cmd STAGE 4 + drilljig-gui.cmd slot-b; gated by run_wizard_tests.ps1 (Invoke-SlotPatternFromSeed cases). LIVE-UNVERIFIED for the pattern target.",
       "verifiedOn": null
+    },
+    {
+      "id": "sketch-open-on-plane-by-id",
+      "category": "mapkey",
+      "status": "confirmed-live",
+      "fact": "A sketch can be opened on a datum PLANE fed purely BY ID -- NO screen pick. Select the plane by id via the DATUM-typed tree search (ProCmdMdlTreeSearch -> selspecdlg0 SelOptionRadio=Datum + LookByOptionMenu=Feature + InputIDPanel=<id> -> EvaluateBtn -> ApplyBtn -> CancelButton), then fire ProCmdDatumSketCurve -> Trigger Odui_Dlg_00 t1.PlnMru 0 (then empty) + t1.RefMru 0 (then empty) -> the sketcher opens on that plane. This replaces the @PAUSE_FOR_SCREEN_PICK the sketch-open recipe normally needs, so a per-hole seed-sketch loop can arm hands-free. Confirmed live 2026-07-24 via slotplane-probe.cmd.",
+      "antipattern": "Assuming the sketch plane must be clicked on screen (@PAUSE_FOR_SCREEN_PICK). The by-ID datum select DOES carry into the sketch dialog's t1.PlnMru MRU.",
+      "symbols": ["ProCmdDatumSketCurve", "t1.PlnMru", "t1.RefMru", "Odui_Dlg_00", "ProCmdMdlTreeSearch", "SelOptionRadio", "LookByOptionMenu", "ProCmdSketDone"],
+      "evidence": "CONFIRMED LIVE 2026-07-24 via slotplane-probe.cmd on the curved jig blank. Unblocks the per-hole curved chip-relief slot loop (arm the seed sketch on each hole's plane by ID, no screen pick). Used by lib/curved_slot_macros.ps1 Build-CurvedSlotArmMacro.",
+      "verifiedOn": "2026-07-24"
+    },
+    {
+      "id": "tangent-plane-at-point-on-surface",
+      "category": "mapkey",
+      "status": "docs-only",
+      "fact": "A datum plane can be created TANGENT to a curved SURFACE AT a datum POINT via ProCmdDatumPlane with the constraint type set to Tangent: the plane touches the surface at the point, so its NORMAL is the surface normal there. Recipe (operator recording 2026-07-24): with the surface + datum point selected as references, ProCmdDatumPlane; open+close Odui_Dlg_00 constr_type1_OPTMENU1; Select constr_type1_OPTMENU1 1 'Tangent'; Activate stdbtn_1 (OK). This is the curved-jig linchpin: fastener/layout -> datum point -> tangent plane at (point,surface) gives BOTH a genuine normal-to-surface reference for drilling AND the ideal seed-sketch host for the chip-relief slot (arm the sketch on the tangent plane by ID -- sketch-open-on-plane-by-id).",
+      "antipattern": "Guessing at a normal-to-surface reference for a curved hole (the drilljig3d surface-pre-select HYPOTHESIS). The Tangent datum plane makes the normal EXPLICIT. Also: hand-retyping these widget tokens instead of the recorded mapkey in docs\\tangent_plane_at_point_on_surface.mapkey.txt.",
+      "symbols": ["ProCmdDatumPlane", "Odui_Dlg_00", "constr_type1_OPTMENU1", "Tangent", "t1.constrs_table", "stdbtn_1"],
+      "evidence": "Operator-supplied mapkey recording 2026-07-24 (docs\\tangent_plane_at_point_on_surface.mapkey.txt). The by-ID reference feed (accumulate surface + point via Get-SelectByIdMacro -NoClear) is the SAME channel proven for point-at-3-plane-intersection-by-id + csys-at-3-plane-intersection, LIVE-UNVERIFIED for THIS command -- a tangent-plane-probe (tangent-plane-probe.cmd) must confirm the ref/row correspondence + that a new plane appears (feature-diff canary) before it is trusted. Wired into lib/tangent_plane.ps1 (Build-TangentPlaneMacro / Invoke-TangentPlane).",
+      "verifiedOn": null
     }
   ]
 }
