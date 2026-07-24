@@ -1,0 +1,101 @@
+Tangent datum plane at a datum point on a curved surface
+========================================================
+User-supplied recording (2026-07-24). A datum plane constrained TANGENT to a
+curved surface AT a datum point: the plane touches the surface at the point, so
+its normal IS the surface normal there. This is the curved-jig linchpin -- it
+gives, per hole, (a) a genuine normal-to-surface reference for drilling and
+(b) the ideal seed-sketch host for the chip-relief slot.
+
+References (the datum POINT + the curved SURFACE) are consumed from the current
+selection; the recording begins AFTER they were selected (screen-picked in the
+recorded session). The by-ID feed (accumulate the point + surface via
+Get-SelectByIdMacro / Get-SelectDatumByIdMacro, -NoClear) is the SAME channel
+proven for the 3-plane intersection point (point-at-3-plane-intersection-by-id)
+and the csys (csys-at-3-plane-intersection) -- LIVE-UNVERIFIED for THIS command,
+so a probe must confirm it before it is trusted.
+
+Raw mapkey (verbatim):
+
+  mapkey cp @MAPKEY_LABELcurved planes;\
+  mapkey(continued) ~ Trail `MiniToolbar` `MiniToolbar` `UIT_TRANSLUCENT`  `NEED_TO_CLOSE`;\
+  mapkey(continued) ~ Command `ProCmdDatumPlane` ;\
+  mapkey(continued) ~ Trigger `Odui_Dlg_00` `t1.constrs_table` 2 `0` `column_2`;\
+  mapkey(continued) ~ Trigger `Odui_Dlg_00` `t1.constrs_table` 2 `1` `column_2`;\
+  mapkey(continued) ~ Focus `Odui_Dlg_00` `t1.constrs_table`;\
+  mapkey(continued) ~ FocusIn `Odui_Dlg_00` `t1.constrs_table`;\
+  mapkey(continued) ~ Select `Odui_Dlg_00` `t1.constrs_table` 2 `1` `column_2`;\
+  mapkey(continued) ~ FocusOut `Odui_Dlg_00` `t1.constrs_table`;\
+  mapkey(continued) ~ Open `Odui_Dlg_00` `constr_type1_OPTMENU1`;\
+  mapkey(continued) ~ Trigger `Odui_Dlg_00` `t1.constrs_table` 2 `` ``;\
+  mapkey(continued) ~ Timer `` `` `CollectorWdg_FocusTimer`;\
+  mapkey(continued) ~ Close `Odui_Dlg_00` `constr_type1_OPTMENU1`;\
+  mapkey(continued) ~ Select `Odui_Dlg_00` `constr_type1_OPTMENU1` 1 `Tangent`;\
+  mapkey(continued) ~ FocusOut `Odui_Dlg_00` `t1.constrs_table`;\
+  mapkey(continued) ~ Activate `Odui_Dlg_00` `stdbtn_1`;
+
+Script-usable token sequence (drop ~ Trail / ~ Timer recording noise; the
+references are fed BY ID BEFORE ProCmdDatumPlane, accumulated -- surface first,
+then the datum point, or vice-versa; a probe settles the order):
+
+  <select curved SURFACE by ID>            (Get-SelectByIdMacro / datum-by-id, buffer_clean on the 1st)
+  <select datum POINT by ID -NoClear>      (accumulate the 2nd ref)
+  ~ Command `ProCmdDatumPlane`;
+  ~ Open  `Odui_Dlg_00` `constr_type1_OPTMENU1`;
+  ~ Close `Odui_Dlg_00` `constr_type1_OPTMENU1`;
+  ~ Select `Odui_Dlg_00` `constr_type1_OPTMENU1` 1 `Tangent`;
+  ~ Activate `Odui_Dlg_00` `stdbtn_1`;
+
+The constrs_table Trigger/Focus/Select lines in the raw recording are the UI
+settling on the 2nd constraint row (the point ref) before the type menu opens;
+the load-bearing tokens are ProCmdDatumPlane + constr_type1_OPTMENU1 = Tangent +
+stdbtn_1 (OK). The Tangent constraint applies to the SURFACE ref; the POINT ref
+is the through-point (plane passes through it). Confirm the exact ref/row
+correspondence with a probe (tangent-plane-probe): select surface + point by ID,
+fire the sequence, verify a NEW datum plane appears (feature-diff canary) and is
+visually tangent at the point.
+
+WHY THIS MATTERS (curved-jig architecture, user 2026-07-24):
+  fastener/layout -> datum POINT -> TANGENT PLANE at (point, surface)
+    -> the plane normal = surface normal -> drill the hole normal-to-surface
+    -> AND draw the chip-relief slot seed rectangle on that same tangent plane
+       (arm the sketch on it BY ID -- sketch-open-on-plane-by-id, proven live).
+
+
+-----------------------------------------------------------------------------
+RELATED: slot-creation recording (user 2026-07-24) + the acceptance bar
+-----------------------------------------------------------------------------
+User note: "as long as it's normal to the surface, it should be good." This is
+the acceptance bar for the chip-relief slot -- the cut must go normal to the
+surface. The tangent-plane approach ABOVE achieves that automatically (plane
+tangent at the hole -> its normal IS the surface normal -> a sketch on it +
+blind cut goes normal-to-surface), with NO screen pick.
+
+The operator's slot recording (verbatim), which reaches "normal to surface" the
+OTHER way -- an in-sketch TANGENT CONSTRAINT (ProCmdSketTangentConstr) -- but
+needs SCREEN PICKS a RunMacro cannot replay (so it is the MANUAL fallback, not
+the automated path):
+
+  mapkey s @MAPKEY_LABELslots;~ Command `ProCmdDatumSketCurve` ;\
+  mapkey(continued) @PAUSE_FOR_SCREEN_PICK;~ Trigger `Odui_Dlg_00` `t1.RefMru` `0`;\
+  mapkey(continued) ~ Trigger `Odui_Dlg_00` `t1.RefMru` ``;~ Activate `Odui_Dlg_00` `stdbtn_1`;\
+  mapkey(continued) ~ Command `ProCmdViewSketchView` ;~ Command `ProCmdSketRectangle`  1;\
+  mapkey(continued) @PAUSE_FOR_SCREEN_PICK;@PAUSE_FOR_SCREEN_PICK;@PAUSE_FOR_SCREEN_PICK;\
+  mapkey(continued) @PAUSE_FOR_SCREEN_PICK;\
+  mapkey(continued) ~ Key `main_dlg_cur` `proe_win` 9 945 120 65536 1536 1443 787 1920 1080 \
+  mapkey(continued) 3562572 `Esc`;@PAUSE_FOR_SCREEN_PICK;~ Command `ProCmdSketTangentConstr` ;\
+  mapkey(continued) @PAUSE_FOR_SCREEN_PICK;@PAUSE_FOR_SCREEN_PICK;
+
+Notes:
+ - This route enters the sketcher via t1.RefMru (orientation-ref MRU) + stdbtn_1;
+   the by-ID automated route (sketch-open-on-plane-by-id) uses t1.PlnMru 0 +
+   t1.RefMru 0. Either enters the sketcher; the by-ID one needs no plane pick.
+ - ProCmdSketRectangle 1 arms the rectangle; the 4 pauses are the manual corner
+   draws (this IS the "operator draws the seed" step -- unavoidable, a RunMacro
+   cannot draw geometry). Esc drops the rectangle tool.
+ - ProCmdSketTangentConstr applies a TANGENT constraint to a drawn entity vs the
+   surface -- it needs picks (which entity, which surface), so it cannot be fired
+   headless. The tangent-PLANE approach makes it unnecessary: if the sketch PLANE
+   is already tangent, the rectangle is already in the right (normal) orientation.
+ - CONCLUSION: automated path = tangent PLANE (Build-TangentPlaneMacro, above) +
+   arm the sketch by ID + operator draws the rectangle + Build-CutFinishMacro.
+   The in-sketch ProCmdSketTangentConstr is a manual refinement only.
