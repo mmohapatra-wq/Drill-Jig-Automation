@@ -179,6 +179,7 @@ function New-FuzzCtx {
         WillSlot=$null; ReliefPad=0.0
         SlotDepth=[double]0.25; SlotSpaceMode=$null; SlotDepthFromFlag=$false; SlotDepthValid=$true
         SlotRowAxis=$null; SlotDirFromFlag=$false
+        SlotFaceMode=$null; SlotFaceFromFlag=$false
         EdgeMargin=$null; EdgeMarginMode=$null; EdgeMarginValid=$true
         FastenerRawPoints=$null; FastenerAsked=$false
     }
@@ -340,6 +341,12 @@ $scenarios = @(
     @{ Name='layout-custom-smallmargin';Steps=@('layout');  Setup={ param($c) $c.HoleDia=0.5; $c.BushingLen=0.75; $c.PointMode='custom'; $c.LayoutMode='custom'; $c.EdgeMargin=0.125; $c.EdgeMarginMode='custom' } }
     @{ Name='layout-fastener';     Steps=@('layout');       Setup={ param($c) $c.HoleDia=0.5; $c.LayoutMode='fastener' } }
     @{ Name='layout-fast-captured';Steps=@('layout');       Setup={ param($c) $c.HoleDia=0.5; $c.FastenerRawPoints=@([pscustomobject]@{X=0.5;Z=0.5},[pscustomobject]@{X=2.5;Z=0.5},[pscustomobject]@{X=0.5;Z=2.0}) } }
+    # Overview (3D-render page): the slot-FACE toggle lives here now (user 2026-07-24). Headless has
+    # no WinForms message loop, so the Build takes the "renders in the live GUI" note branch BEFORE
+    # the WebView2/toggle -> this just proves the payload-builder + branch don't throw on a valid
+    # layout, for both faces. (The live toggle + 3D push are only reachable in the real GUI.)
+    @{ Name='overview-side';       Steps=@('overview');     Setup={ param($c) Set-OrthoLayout $c; $c.HoleDiaFinal=0.5; $c.BushingLen=0.75; $c.SlotDepth=0.25; $c.SlotFaceMode='side' } }
+    @{ Name='overview-offset';     Steps=@('overview');     Setup={ param($c) Set-OrthoLayout $c; $c.HoleDiaFinal=0.5; $c.BushingLen=0.75; $c.SlotDepth=0.25; $c.SlotFaceMode='offset' } }
     @{ Name='index-orthogrid';     Steps=@('index-choice'); Setup={ param($c) Set-OrthoLayout $c } }
     @{ Name='index-noortho';       Steps=@('index-choice'); Setup={ param($c) } }
     @{ Name='index-custom-idxrel'; Steps=@('index-choice'); Setup={ param($c) $c.HoleDia=0.5; $c.OrthoGeo = Get-IndexRelativeCustomGeometry -IndexX 0.75 -IndexZ 0.75 -OtherPoints @([pscustomobject]@{X=1.0;Z=0},[pscustomobject]@{X=0;Z=1.0}) -ClearDia 0.5 -HoleDia 0.5 -EdgeMargin 0.5; $c.OrthoValid=$true } }
@@ -357,6 +364,8 @@ $scenarios = @(
     # (renders the toggle buttons + the Z-direction relief bands in the preview Paint).
     @{ Name='layout-fast-dirZ';    Steps=@('layout');       Setup={ param($c) $c.HoleDia=0.5; $c.SlotRowAxis='Z'; $c.FastenerRawPoints=@([pscustomobject]@{X=0.5;Z=0.5},[pscustomobject]@{X=2.5;Z=0.5},[pscustomobject]@{X=0.5;Z=2.0}) } }
     @{ Name='slot-a-ready';        Steps=@('slot-a');       Setup={ param($c) Set-OrthoLayout $c; Set-Datums $c; $c.HoleDiaFinal=0.5; $c.ReliefPad=0.25; $c.WillSlot=$true } }
+    @{ Name='slot-a-face-offset';  Steps=@('slot-a');       Setup={ param($c) Set-OrthoLayout $c; Set-Datums $c; $c.HoleDiaFinal=0.5; $c.ReliefPad=0.25; $c.WillSlot=$true; $c.SlotFaceMode='offset' } }
+    @{ Name='slot-a-face-pinned';  Steps=@('slot-a');       Setup={ param($c) Set-OrthoLayout $c; Set-Datums $c; $c.HoleDiaFinal=0.5; $c.ReliefPad=0.25; $c.WillSlot=$true; $c.SlotFaceMode='side'; $c.SlotFaceFromFlag=$true } }
     @{ Name='slot-a-fastener';     Steps=@('slot-a');       Setup={ param($c) Set-OrthoLayout $c; Set-Datums $c; $c.PointMode='fastener'; $c.SlotRowAxis='Z'; $c.HoleDiaFinal=0.5; $c.ReliefPad=0.25; $c.WillSlot=$true } }
     @{ Name='slot-a-armed';        Steps=@('slot-a');       Setup={ param($c) Set-OrthoLayout $c; Set-Datums $c; $c.SlotArmed=$true } }
     @{ Name='slot-b-pattern';      Steps=@('slot-b');       Setup={ param($c) Set-OrthoLayout $c; Set-Datums $c; $c.SlotArmed=$true; $c.SlotPlan=@{Mode='pattern';SeedRow=[pscustomobject]@{CrossCoord=0.5;SlotLen=10.0;Corner0=@{X=0;Z=0.5};Corner1=@{X=10;Z=0.5}};Patterns=@([pscustomobject]@{Increment=0.75;Count=3;Offsets=@(0.75,1.5)},[pscustomobject]@{Increment=4.0;Count=2;Offsets=@(4.0)});SlotWidth=0.5;RowAxis='X';CrossAxis='Z';Depth=0.25;FaceId=102;DirDatumId=413;DirName='FRONT'} } }

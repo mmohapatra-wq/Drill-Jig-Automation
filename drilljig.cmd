@@ -34,7 +34,9 @@ exit /b %errorlevel%
 #             rectangular remove-material slot per hole ROW (slotinator method:
 #             seed-drawn once then patterned). Needs a GUI layout; skipped for
 #             PREDEFINED points. REPLACES the old coaxial relief holes + relief
-#             paths (both removed).
+#             paths (both removed). --slot-face side|offset picks WHICH plate face
+#             the relief is cut on (side = near/SIDE datum [default]; offset = far/
+#             SIDE offset plane); prompted when relief is added if the flag is absent.
 #
 # This is a MERGE of three working tools (jiginator.cmd / plane-probe.cmd /
 # holeinator.cmd). Those three are LEFT UNTOUCHED and still run standalone. The
@@ -200,7 +202,7 @@ function Invoke-BushingPick {
             # --- stage 1: distinct ODs (= the drilled hole), ascending; plus a trailing
             #     "Custom hole OD" entry so the operator can type any diameter. ---
             Write-Host ""
-            Write-Host "  Select OD (removable bushing = the drilled hole diameter):" -ForegroundColor Cyan
+            Write-Host "  Select removable bushing OD:" -ForegroundColor Cyan
             for ($i = 0; $i -lt $odGroups.Count; $i++) {
                 $og = $odGroups[$i]
                 Write-Host ("    {0,3}) OD {1,-7}   (-> hole {2:0.###}`")" -f ($i + 1), $og.ODLabel, $og.OD) -ForegroundColor White
@@ -295,7 +297,7 @@ function Invoke-BushingPick {
         #     OD" entry so the operator can type any diameter instead of a catalog bore. ---
         # The resolved-hole preview lives on the ID card now (OD no longer keys on length).
         Write-Host ""
-        Write-Host "  Select ID (bore size):" -ForegroundColor Cyan
+        Write-Host "  Select DJ hole diameter:" -ForegroundColor Cyan
         for ($i = 0; $i -lt $byId.Count; $i++) {
             $g = $byId[$i]
             $ods = Get-IdOdOptions -IdGroup $g
@@ -1183,6 +1185,30 @@ if ($willSlotRelief -and $null -ne $bushingLen) {
         [Math]::Round([double]$bushingLen,4), $SLOT_DEPTH_ABS, [Math]::Round([double]$bushingLen+$reliefPad,4)) -ForegroundColor Green
 }
 Write-Host ""
+
+# ----------------------------------------------------------------------------
+# CHIP-RELIEF SLOT FACE (user 2026-07-24) -- WHICH plate face the relief is cut on:
+#   side   (DEFAULT) = the SIDE default datum   = the NEAR face (holes open onto it) -- as before.
+#   offset           = the SIDE offset plane    = the FAR face, bushingLen from the datum.
+# The depth invariant is symmetric and the cut direction is operator-verified per seed, so this
+# is purely which face the relief opens onto (no depth/pad/guide/pattern math changes). --slot-face
+# side|offset|near|far pins it (skips the prompt); else, ONLY when relief will actually be cut, ask.
+# $slotFaceMode defaults to 'side' so every existing run is byte-identical.
+$slotFaceMode = 'side'
+$mSlotFace = [regex]::Match($ScriptArgs, '(?i)--slot-face\s+(side|offset|near|far)')
+if ($mSlotFace.Success) {
+    $slotFaceMode = Resolve-SlotFaceMode -Text $mSlotFace.Groups[1].Value
+    Write-Host ("  Chip-relief slot face = {0} (from --slot-face): cut on the {1}." -f `
+        $slotFaceMode, $(if ($slotFaceMode -eq 'offset') { 'SIDE offset plane (far face)' } else { 'SIDE plane (near face)' })) -ForegroundColor DarkGray
+} elseif ($willSlotRelief) {
+    Write-Host "  Chip-relief slots are cut on one plate face -- choose which:" -ForegroundColor Cyan
+    Write-Host "    side   = the SIDE plane (near face, the one the holes open onto)   [default]" -ForegroundColor White
+    Write-Host "    offset = the SIDE offset plane (far face, bushing length away)" -ForegroundColor White
+    $sfRaw = Read-Host "  Slot face - side (default) or offset (blank -> side)"
+    $slotFaceMode = Resolve-SlotFaceMode -Text $sfRaw
+    Write-Host ("  Chip-relief slot face: {0}." -f $(if ($slotFaceMode -eq 'offset') { 'SIDE offset plane (far face)' } else { 'SIDE plane (near face)' })) -ForegroundColor Green
+    Write-Host ""
+}
 
 # ============================================================================
 # CONNECT ONCE (single session) -- wraps STAGES 2 + 3
@@ -2454,10 +2480,16 @@ if ($doSlots) {
         } else {
             Write-Host ("  Slot depth = {0}"" (bushing length unknown this run -- guide depth not reported)." -f $slotDepth) -ForegroundColor Yellow
         }
-        # --- sketch face = the SIDE default datum (the box near face, in BOTH modes:
-        # the csys box now also sketches on the SIDE datum). Pattern direction datum
+        # --- sketch face = the SIDE plate face chosen by $slotFaceMode: 'side' = the SIDE
+        # default datum ($sidePlane.BaseId, near face, DEFAULT); 'offset' = the SIDE offset
+        # plane ($sidePlane.FeatId, far face). Both are set together at box build; offset
+        # falls back to BaseId if the offset id is somehow missing. Pattern direction datum
         # from the march axis: CrossAxis Z -> FRONT, X -> TOP ---
-        $slotFaceId = if ($null -ne $sidePlane -and $null -ne $sidePlane.BaseId) { [int]$sidePlane.BaseId } else { $null }
+        $slotFaceId =
+            if ($slotFaceMode -eq 'offset' -and $null -ne $sidePlane -and $null -ne $sidePlane.FeatId) { [int]$sidePlane.FeatId }
+            elseif ($null -ne $sidePlane -and $null -ne $sidePlane.BaseId) { [int]$sidePlane.BaseId }
+            else { $null }
+        $slotFaceName = if ($slotFaceMode -eq 'offset' -and $null -ne $sidePlane -and $null -ne $sidePlane.FeatId -and [int]$sidePlane.FeatId -eq $slotFaceId) { 'SIDE offset plane (far face)' } else { 'SIDE plane (near face)' }
         $frontBase = @($made | Where-Object { $_.Label -eq "Front" }); $frontBase = if ($frontBase.Count -gt 0) { $frontBase[0] } else { $null }
         $topBase   = @($made | Where-Object { $_.Label -eq "Top" });   $topBase   = if ($topBase.Count -gt 0) { $topBase[0] } else { $null }
         $dirDatumId = $null; $dirName = $null
@@ -2468,7 +2500,7 @@ if ($doSlots) {
             Write-Host "  The SIDE datum was not captured this run -- cannot sketch the slots. Skipping." -ForegroundColor Yellow
         } else {
             $depthNote = if ($slotDepth -gt 0) { "$slotDepth""" } else { "Creo default depth" }
-            Write-Host ("  {0} slot row(s), width {1}"" (= hole dia), {2}, sketched on the SIDE face (id {3})." -f @($slots.Rows).Count, $slots.SlotWidth, $depthNote, $slotFaceId) -ForegroundColor Cyan
+            Write-Host ("  {0} slot row(s), width {1}"" (= hole dia), {2}, sketched on the {3} (id {4})." -f @($slots.Rows).Count, $slots.SlotWidth, $depthNote, $slotFaceName, $slotFaceId) -ForegroundColor Cyan
 
             $patPlan = Get-SlotPatternPlan -Rows $slots.Rows
             $usePattern = ($patPlan.CanPattern -and -not $slotNoPattern -and @($slots.Rows).Count -ge 2 -and $null -ne $dirDatumId)
@@ -2490,9 +2522,13 @@ if ($doSlots) {
             }
 
             # --- SEED slot (row 1): draw + verify direction/depth; learn the flip ---
+            # The SIDE OFFSET (far) face's default cut points AWAY from the part, so start it
+            # flipped so the seed cuts INTO the plate on the first try; --slot-flip still toggles
+            # relative to that face-appropriate default. The SIDE (near) face is unchanged.
             $seedRow = $slots.Rows[0]
+            $slotSeedFlip = Get-SlotSeedFlipDefault -FaceMode $slotFaceMode -FlipFlag $slotFlip
             $seed = Invoke-VerifiedSeedCut -FaceId $slotFaceId -Depth $slotDepth -BodyIndex $bodyIndex `
-                -Flip $slotFlip -RowLabel "row 1 (seed)" -DrawInfo @{
+                -Flip $slotSeedFlip -RowLabel "row 1 (seed)" -DrawInfo @{
                     SlotLen = $seedRow.SlotLen; RowAxis = $slots.RowAxis; SlotWidth = $slots.SlotWidth
                     CrossAxis = $slots.CrossAxis; CrossCoord = $seedRow.CrossCoord; HasPlanes = $slotHasPlanes }
 

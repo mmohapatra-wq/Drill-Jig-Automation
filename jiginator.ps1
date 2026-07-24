@@ -381,7 +381,7 @@ function Invoke-BushingPick {
         $odGroups = Get-OdGroups -Rows $rows
         while ($true) {
             Write-Host ""
-            Write-Host "  Select OD (removable bushing = the drilled hole diameter):" -ForegroundColor Cyan
+            Write-Host "  Select removable bushing OD:" -ForegroundColor Cyan
             for ($i = 0; $i -lt $odGroups.Count; $i++) {
                 $og = $odGroups[$i]
                 Write-Host ("    {0,3}) OD {1,-7}   (-> hole {2:0.###}`")" -f ($i + 1), $og.ODLabel, $og.OD) -ForegroundColor White
@@ -459,7 +459,7 @@ function Invoke-BushingPick {
 
         # --- stage 1: distinct IDs (bore size), ascending ---
         Write-Host ""
-        Write-Host "  Select ID (bore size):" -ForegroundColor Cyan
+        Write-Host "  Select DJ hole diameter:" -ForegroundColor Cyan
         for ($i = 0; $i -lt $byId.Count; $i++) {
             $g = $byId[$i]
             $ods = Get-IdOdOptions -IdGroup $g

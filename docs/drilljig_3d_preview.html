@@ -340,7 +340,7 @@ runSelfTest();  // pure JS - runs even if three.js fails to load
 /* ==========================================================================
    3) UI STATE + SLIDERS
    ========================================================================== */
-const P = { CcX:0.5, CcZ:0.5, Nx:5, Nz:4, HoleDia:0.25, BushingLen:0.75, SlotDepth:0.25, Edge:0.25, RowAxis:'X' };
+const P = { CcX:0.5, CcZ:0.5, Nx:5, Nz:4, HoleDia:0.25, BushingLen:0.75, SlotDepth:0.25, Edge:0.25, RowAxis:'X', SlotFace:'side' };
 // WELCOME hero: match the fixed generic layout in computeGeo() (hole 0.5, 3x2 grid)
 if (WELCOME) { P.HoleDia = 0.5; P.BushingLen = 0.7; P.SlotDepth = 0.22; P.Edge = 0.5; P.CcX = 0.9; P.CcZ = 0.9; P.Nx = 3; P.Nz = 2; }
 
@@ -503,17 +503,21 @@ function rebuild(refit) {
   currentEdges = edges;
 
   // ---- chip-relief slots: one full-length band per hole row.
-  // Standard/overview mode recesses the slot from the TOP; WELCOME mode recesses it
-  // from the BOTTOM (opposite the bushing heads, which sit on top) so it reads as the
-  // "slot on the bottom" the operator asked for.
+  // WHICH FACE the relief opens onto is driven by P.SlotFace (host --slot-face / GUI toggle):
+  //   'side'   (near face, where the guide holes open) -> recess from the TOP (default).
+  //   'offset' (far face, bushingLen away)             -> recess from the BOTTOM.
+  // WELCOME mode always uses the bottom (opposite the bushing heads on top) so the hero shot
+  // reads as the "slot on the bottom" the operator asked for. Bottom yc = SlotDepth/2; top yc =
+  // thickness - SlotDepth/2. So the operator SEES the slot jump to the chosen face live.
   if (tglSlots.checked && geo.valid && P.SlotDepth > 0) {
     const slots = getRowSlots(geo.points, P.HoleDia, w, h, P.RowAxis);
+    const slotOnBottom = WELCOME || (('' + (P.SlotFace || 'side')).toLowerCase() === 'offset');
     for (const row of slots.rows) {
       const sx = Math.max(row.alongMax - row.alongMin, 1e-3);
       const sz = Math.max(row.crossHi - row.crossLo, 1e-3);
       const box = new THREE.BoxGeometry(sx, P.SlotDepth, sz);
       const m = new THREE.Mesh(box, slotMat);
-      const yc = WELCOME ? (P.SlotDepth / 2 - 0.002) : (thickness - P.SlotDepth / 2 + 0.002);
+      const yc = slotOnBottom ? (P.SlotDepth / 2 - 0.002) : (thickness - P.SlotDepth / 2 + 0.002);
       // group-space frame matches the rotated plate: world (X, Yup, -Z)
       m.position.set(row.centerX, yc, -row.centerZ);
       modelGroup.add(m);
@@ -654,6 +658,10 @@ window.setJigGeometry = function (p) {
     // payload without rowAxis behaves exactly as before. The band grouping + orientation
     // flow through getRowSlots(...,P.RowAxis) in rebuild(), so the slots reorient live.
     P.RowAxis = (('' + (p.rowAxis || 'X')).toUpperCase() === 'Z') ? 'Z' : 'X';
+    // chip-relief slot FACE from the host (--slot-face / the Overview toggle): 'offset' puts
+    // the slot on the FAR face, 'side' (default) on the NEAR face. rebuild() reads P.SlotFace
+    // for the slot Y, so re-pushing a payload with a changed slotFace moves the slot live.
+    P.SlotFace = (('' + (p.slotFace || 'side')).toLowerCase() === 'offset') ? 'offset' : 'side';
     if (ready) { rebuild(true); }   // else the initial startApp rebuild() reads EMBED_GEO
   } catch (e) { /* never throw into the host */ }
 };

@@ -108,7 +108,7 @@ function starter() {
   // choice changes downstream" wherever you can.
   const N = (kind, label, notes, children=[]) => ({ id: nid(), kind, label, notes: notes||"", children });
   return [
-    N("question", "Material of part being drilled?", "First branch. Does this change bushing style, plate thickness, or feed/speed callouts?", [
+    N("question", "Drill Jig Material", "First branch. Does this change bushing style, plate thickness, or feed/speed callouts?", [
       N("option", "Plastic", "", [
         N("question", "Drill method?", "PFD = portable/power feed drill; Hand drill = manual. What differs in the jig output?", [
           N("option", "PFD (power feed drill)", "What does PFD require? (e.g. nose-piece bushing style, plate thickness)", [

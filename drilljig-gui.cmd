@@ -25,7 +25,9 @@ exit /b %errorlevel%
 # drilljig.cmd is LEFT UNTOUCHED and still runs standalone; this is an additive
 # second front-end over the shared lib. Open the jig PART (not the .asm).
 #
-# Flags: --no-corner-round, --corner-radius N (same as drilljig.cmd).
+# Flags: --no-corner-round, --corner-radius N, --slot-face side|offset (which plate
+#        face the chip-relief slot is cut on; slot-a shows a toggle when unset) --
+#        same as drilljig.cmd.
 # ============================================================================
 
 $Host.UI.RawUI.WindowTitle = "DRILLJIG GUI"
@@ -102,6 +104,12 @@ $noSlotRelief    = ($ScriptArgs -match '(?i)--no-slot-relief')
 # keep 'X'. --slot-dir X|Z pins it (skips the step's cards). $slotDirFlag = 'X'|'Z'|$null.
 $mSlotDirG = [regex]::Match($ScriptArgs, '(?i)--slot-dir\s+([XZxz])')
 $slotDirFlag = if ($mSlotDirG.Success) { Resolve-SlotRowAxis -Text $mSlotDirG.Groups[1].Value } else { $null }
+# Chip-relief slot FACE (user 2026-07-24): WHICH plate face the relief is cut on -- 'side' = the
+# SIDE default datum (near face, holes open onto it, DEFAULT); 'offset' = the SIDE offset plane
+# (far face, bushingLen away). The slot-a step OFFERS a segmented toggle; --slot-face side|offset
+# pins it (skips the toggle). $slotFaceFlag = 'side'|'offset'|$null.
+$mSlotFaceG = [regex]::Match($ScriptArgs, '(?i)--slot-face\s+(side|offset|near|far)')
+$slotFaceFlag = if ($mSlotFaceG.Success) { Resolve-SlotFaceMode -Text $mSlotFaceG.Groups[1].Value } else { $null }
 # csys-referenced architecture: box + grid planes offset from a base csys (not the
 # default datums), so re-placing the base csys onto the index hole moves the grid.
 $noBaseCsys      = ($ScriptArgs -match '(?i)--no-base-csys')   # revert to legacy default-datum planes
@@ -259,6 +267,12 @@ $ctx = @{
     # --slot-dir (pins it + marks SlotDirFromFlag so the step skips the cards).
     SlotRowAxis     = $slotDirFlag                    # 'X'|'Z'|$null
     SlotDirFromFlag = ($null -ne $slotDirFlag)        # --slot-dir given -> no cards, just confirm
+    # SLOT FACE (user 2026-07-24) -- WHICH plate face the relief is cut on: 'side' = the SIDE
+    # default datum (near face, DEFAULT); 'offset' = the SIDE offset plane (far face). slot-a
+    # OFFERS a segmented toggle (Add-SlotFaceToggle) and resolves $faceId from this; slot-b reads
+    # the resolved id via $c.SlotPlan.FaceId (no change). Seeded from --slot-face (pins the toggle).
+    SlotFaceMode    = $slotFaceFlag                   # 'side'|'offset'|$null (defaults to 'side' at the cut)
+    SlotFaceFromFlag = ($null -ne $slotFaceFlag)      # --slot-face given -> no toggle, just use it
     # CHIP-RELIEF DEPTH BUDGET -- decided in box-a's OnNext (BEFORE the planes are made) so
     # the SIDE/extrude offset can be PADDED by the relief depth: plate = bushingLen + SLOT_DEPTH_ABS,
     # the slot removes SLOT_DEPTH_ABS, so the final guide depth == bushingLen. $WillSlot is
@@ -1367,6 +1381,63 @@ function Add-SlotDirToggle {
 }
 
 # ============================================================================
+# Add-SlotFaceToggle - an inline SIDE-plane / SIDE-offset-plane picker for the slot
+# FACE (user 2026-07-24: an option to flip WHICH plate face the chip-relief slot is
+# cut on). Two segmented toggle buttons ("SIDE plane" = near face / "SIDE offset plane"
+# = far face); the active one is accent-filled. Clicking sets $Context.SlotFaceMode.
+# Lives on the Overview stage (the 3D-render page, user 2026-07-24 "move up that slot
+# option to the page with the 3d render ... move the slot to the respective place") so
+# the operator SEES the relief jump to the chosen face in the 3D preview. slot-a's OnNext
+# still resolves $faceId from SlotFaceMode ('offset' -> $c.SidePlane.FeatId, else
+# $c.SidePlane.BaseId), so the choice reaches the cut; the depth invariant is symmetric.
+# -OnChange {param($mode)}: when supplied, the click runs it (the Overview live-pushes the
+# updated payload to its WebView2 so the slot moves WITHOUT tearing the browser down);
+# otherwise it falls back to $Wizard.Rerender(). Mirrors Add-SlotDirToggle. Returns bottom Y.
+# ============================================================================
+function Add-SlotFaceToggle {
+    param($Panel, $Context, $Wizard, [int]$Top, [int]$Left = 8, [scriptblock]$OnChange = $null)
+    if ($null -eq $Context.SlotFaceMode) { $Context.SlotFaceMode = 'side' }
+    $cur = if ($Context.SlotFaceMode -eq 'offset') { 'offset' } else { 'side' }
+    $thm = $script:WizTheme
+    $accent = if ($thm -and $thm.Accent) { $thm.Accent } else { [System.Drawing.Color]::FromArgb(40,90,170) }
+    $idle   = if ($thm) { $thm.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = 'Chip-relief slot face:'; $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point($Left, ($Top + 5))
+    $lbl.ForeColor = Get-UiColor ''; $lbl.BackColor = [System.Drawing.Color]::Transparent
+    $Panel.Controls.Add($lbl)
+    $bx = $Left + 175
+    # collect both buttons so a click recolors the pair in-place (segmented-control accent)
+    # WITHOUT needing a full Rerender -- the Overview uses OnChange to live-push the 3D instead.
+    $btns = @{}
+    foreach ($opt in @(@{ M='side'; T='SIDE plane' }, @{ M='offset'; T='SIDE offset plane' })) {
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $opt.T; $b.Size = New-Object System.Drawing.Size(140, 28)
+        $b.Location = New-Object System.Drawing.Point($bx, $Top)
+        $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(90,104,132)
+        $b.ForeColor = Get-UiColor ''
+        $b.BackColor = if ($opt.M -eq $cur) { $accent } else { $idle }
+        $btns[$opt.M] = $b
+        $panel_ref = $Panel
+        $Panel.Controls.Add($b)
+        $bx += 148
+    }
+    $sideBtn = $btns['side']; $offsetBtn = $btns['offset']
+    foreach ($m in @('side','offset')) {
+        $fm = $m
+        $btns[$m].Add_Click({ param($s,$e)
+            $Context.SlotFaceMode = $fm
+            # recolor the pair so the active face reads immediately (no rebuild needed)
+            $sideBtn.BackColor   = if ($fm -eq 'side')   { $accent } else { $idle }
+            $offsetBtn.BackColor = if ($fm -eq 'offset') { $accent } else { $idle }
+            if ($null -ne $OnChange) { & $OnChange $fm } else { $Wizard.Rerender() }
+        }.GetNewClosure())
+    }
+    return ($Top + 28)
+}
+
+# ============================================================================
 # Build the connection up front (before the wizard) so the breadcrumb's later
 # stages reflect a real session and pick steps have a live buffer to read. The
 # decision tree + point-source are pure WinForms and could run before connecting,
@@ -1887,7 +1958,7 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
             if ($c.BushOdFirst) {
                 $c.BushOdGroups = Get-OdGroups -Rows $rows
                 if ($c.BushStage -eq 'od1' -or $null -eq $c.BushStage) {
-                    $hdrB = (Add-Para $panel "Select the OD (removable bushing = the drilled hole):" $walkTop 0 $null $true).Bottom
+                    $hdrB = (Add-Para $panel "Select removable bushing OD:" $walkTop 0 $null $true).Bottom
                     $opts = @()
                     foreach ($og in $c.BushOdGroups) { $opts += @{ Title = ('OD ' + $og.ODLabel); Subtitle = ("-> hole {0:0.###}`"" -f $og.OD) } }
                     # trailing "Custom hole OD..." card (user 2026-07-23): type any diameter.
@@ -1917,7 +1988,7 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
             if (-not $c.BushOdFirst) { $c.Grouped = Group-CatalogByID -Rows $rows }
             if (-not $c.BushOdFirst -and ($c.BushStage -eq 'id' -or $null -eq $c.BushStage)) {
                 # ID cards carry the resolved-hole preview now (OD keys on ID, not length).
-                $hdrB = (Add-Para $panel "Select the ID (bore size):" $walkTop 0 $null $true).Bottom
+                $hdrB = (Add-Para $panel "Select DJ hole diameter:" $walkTop 0 $null $true).Bottom
                 $opts = @()
                 foreach ($g in $c.Grouped) {
                     $ods = Get-IdOdOptions -IdGroup $g
@@ -2975,33 +3046,48 @@ $overviewStep = New-WizardStep -Key 'overview' -Title '3D overview (rough)' -Sta
             return
         }
 
-        # ---- build the geometry payload from the CURRENT layout ----
+        # ---- payload builder (reusable): reads the CURRENT context so the slot-FACE toggle
+        # below can regenerate + re-push it live. Numbers use InvariantCulture (period decimal)
+        # and the points array is hand-built so it is ALWAYS a JS array (PS ConvertTo-Json drops
+        # the brackets for a single element). rowAxis = the fastener X/Z direction; slotFace =
+        # which plate face the relief opens onto ('side' near / 'offset' far), so the 3D preview
+        # puts the slot on the SAME face the operator chose. Closure so the OnChange sees $c live.
         $inv = [System.Globalization.CultureInfo]::InvariantCulture
-        $holeDia = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal }
-                   elseif ($null -ne $c.HoleDia -and [double]$c.HoleDia -gt 0) { [double]$c.HoleDia } else { 0.25 }
-        $slotDepth = if ($null -ne $c.SlotDepth -and [double]$c.SlotDepth -gt 0) { [double]$c.SlotDepth } else { 0.25 }
-        $bushingLen = if ($null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) { [double]$c.BushingLen } else { 0.5 }
-        $thickness = $bushingLen + $slotDepth
-        # points JSON built by hand so it is ALWAYS a JS array (PS ConvertTo-Json drops
-        # the brackets for a single element) and numbers use InvariantCulture (period
-        # decimal) so the JSON is valid regardless of the machine's locale.
-        $ptsJson = (@($c.OrthoGeo.Points) | ForEach-Object {
-            '{"X":' + (([double]$_.X).ToString($inv)) + ',"Z":' + (([double]$_.Z).ToString($inv)) + '}'
-        }) -join ','
-        # slot removal-path direction (fastener X/Z toggle from the Layout stage) so the
-        # 3D preview's chip-relief bands run the SAME way the operator chose; default X.
-        $rowAxisJson = if ($c.SlotRowAxis -eq 'Z') { 'Z' } else { 'X' }
-        $json = '{"valid":' + $(if ($c.OrthoGeo.Valid) { 'true' } else { 'false' }) +
-            ',"width":'    + (([double]$c.OrthoGeo.Width).ToString($inv)) +
-            ',"height":'   + (([double]$c.OrthoGeo.Height).ToString($inv)) +
-            ',"holeDia":'  + (([double]$holeDia).ToString($inv)) +
-            ',"thickness":'+ (([double]$thickness).ToString($inv)) +
-            ',"slotDepth":'+ (([double]$slotDepth).ToString($inv)) +
-            ',"rowAxis":"' + $rowAxisJson + '"' +
-            ',"points":['  + $ptsJson + ']}'
-        $c.Wv3dPayload = $json   # stashed in the persistent context so the NavigationCompleted closure reads it by reference
+        $makePayload = {
+            $holeDia = if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { [double]$c.HoleDiaFinal }
+                       elseif ($null -ne $c.HoleDia -and [double]$c.HoleDia -gt 0) { [double]$c.HoleDia } else { 0.25 }
+            $slotDepth = if ($null -ne $c.SlotDepth -and [double]$c.SlotDepth -gt 0) { [double]$c.SlotDepth } else { 0.25 }
+            $bushingLen = if ($null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) { [double]$c.BushingLen } else { 0.5 }
+            $thickness = $bushingLen + $slotDepth
+            $ptsJson = (@($c.OrthoGeo.Points) | ForEach-Object {
+                '{"X":' + (([double]$_.X).ToString($inv)) + ',"Z":' + (([double]$_.Z).ToString($inv)) + '}'
+            }) -join ','
+            $rowAxisJson = if ($c.SlotRowAxis -eq 'Z') { 'Z' } else { 'X' }
+            $slotFaceJson = if ($c.SlotFaceMode -eq 'offset') { 'offset' } else { 'side' }
+            return '{"valid":' + $(if ($c.OrthoGeo.Valid) { 'true' } else { 'false' }) +
+                ',"width":'    + (([double]$c.OrthoGeo.Width).ToString($inv)) +
+                ',"height":'   + (([double]$c.OrthoGeo.Height).ToString($inv)) +
+                ',"holeDia":'  + (([double]$holeDia).ToString($inv)) +
+                ',"thickness":'+ (([double]$thickness).ToString($inv)) +
+                ',"slotDepth":'+ (([double]$slotDepth).ToString($inv)) +
+                ',"rowAxis":"' + $rowAxisJson + '"' +
+                ',"slotFace":"'+ $slotFaceJson + '"' +
+                ',"points":['  + $ptsJson + ']}'
+        }.GetNewClosure()
+        $c.Wv3dPayload = & $makePayload   # stashed in the context so the NavigationCompleted closure reads it by reference
 
-        # ---- the WebView2 control, filling the canvas below the note ----
+        # ---- chip-relief slot FACE toggle (moved here from the Relief/slot-a step, user
+        # 2026-07-24): choosing SIDE plane (near) vs SIDE offset plane (far) moves the slot to
+        # that face in the 3D preview below (live-push, no browser rebuild). --slot-face pins it.
+        if (-not $c.SlotFaceFromFlag) {
+            $y = (Add-Para $panel ("Which plate face does the chip-relief slot open onto? (Watch the slot move in the 3D view.)") $y 0 'Gray').Bottom + 6
+        } else {
+            $faceLbl = if ($c.SlotFaceMode -eq 'offset') { 'SIDE offset plane (far face)' } else { 'SIDE plane (near face)' }
+            $y = (Add-Para $panel ("Chip-relief slot face: {0} (from --slot-face)." -f $faceLbl) $y 0 'Gray').Bottom + 6
+        }
+
+        # ---- the WebView2 control, filling the canvas below the note + toggle ----
+        $wvTop = $y + 34   # leave a row for the toggle buttons (rendered after $wv is created)
         $wv = New-Object Microsoft.Web.WebView2.WinForms.WebView2
         $props = New-Object Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties
         # DISTINCT UserDataFolder from the Welcome stage's WebView2 (shared folder = lock
@@ -3009,11 +3095,30 @@ $overviewStep = New-WizardStep -Key 'overview' -Title '3D overview (rough)' -Sta
         $props.UserDataFolder = Join-Path $env:TEMP 'drilljig_wv2_overview'
         $wv.CreationProperties = $props
         $cw = [Math]::Max(420, $panel.ClientSize.Width  - 16)
-        $ch = [Math]::Max(320, $panel.ClientSize.Height - $y - 12)
-        $wv.Location = New-Object System.Drawing.Point(8, $y)
+        $ch = [Math]::Max(320, $panel.ClientSize.Height - $wvTop - 12)
+        $wv.Location = New-Object System.Drawing.Point(8, $wvTop)
         $wv.Size = New-Object System.Drawing.Size($cw, $ch)
         $wv.Anchor = ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right)
         $panel.Controls.Add($wv)
+
+        # now the toggle (positioned in the reserved row ABOVE $wv). Its OnChange rebuilds the
+        # payload and re-pushes it to THIS $wv so the slot jumps to the chosen face LIVE -- no
+        # $Wizard.Rerender() (that would dispose + recreate the WebView2, flashing the browser
+        # and re-contending for its UserDataFolder lock). Skipped entirely when --slot-face pins it.
+        if (-not $c.SlotFaceFromFlag) {
+            $onFace = {
+                param($mode)
+                # rebuild the payload with the new SlotFaceMode + push it to the LIVE WebView2 so the
+                # slot jumps to the chosen face instantly. No $wiz.Rerender(): the toggle recolors its
+                # own buttons, and a Rerender would dispose + recreate the WebView2 (a browser reload
+                # flash + UserDataFolder lock churn) just to move one box in the scene.
+                try {
+                    $c.Wv3dPayload = & $makePayload
+                    if ($null -ne $wv -and $null -ne $wv.CoreWebView2) { $null = $wv.ExecuteScriptAsync("setJigGeometry(" + $c.Wv3dPayload + ")") }
+                } catch {}
+            }.GetNewClosure()
+            [void](Add-SlotFaceToggle -Panel $panel -Context $c -Wizard $wiz -Top $y -OnChange $onFace)
+        }
 
         # push the layout to the three.js scene once the page has loaded (setJigGeometry
         # stashes + applies whether it arrives before or after three.js finishes loading).
@@ -3782,7 +3887,15 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
         # not the (possibly re-edited) $c.SlotDepth -- so the display matches the geometry.
         $shownDepth = if ([double]$c.ReliefPad -gt 0) { [double]$c.ReliefPad } else { [double]$c.SlotDepth }
         $y = (Add-Para $panel ("One blind rectangular slot per hole ROW: length = part length, width = the hole diameter ({0}`"), depth = {1}`" (the plate was padded by this so the final guide depth = the bushing length after the cut). Draw ONE seed slot; the rest are patterned. Chip relief: {2}." -f $slotW, $shownDepth, $gate) 8 0 'Gray').Bottom + 10
-        Add-Para $panel "Press the button: Creo opens the sketcher on the SIDE face; then draw the seed rectangle over the first hole row." $y 0 'Gray'
+        # WHICH face the relief opens onto was chosen on the 3D-overview page (Add-SlotFaceToggle
+        # lives there now, user 2026-07-24), or pinned by --slot-face. Show it here for context;
+        # slot-a's OnNext reads $c.SlotFaceMode to select the sketch face. Change it on the Overview
+        # page (jump via the breadcrumb) if it's wrong.
+        $faceLbl = if ($c.SlotFaceMode -eq 'offset') { 'SIDE offset plane (far face)' } else { 'SIDE plane (near face)' }
+        $srcLbl  = if ($c.SlotFaceFromFlag) { ' (from --slot-face)' } else { ' (chosen on the 3D overview page)' }
+        $y = (Add-Para $panel ("Chip-relief slot face: {0}{1}." -f $faceLbl, $srcLbl) $y 0 'Gray').Bottom + 10
+        $faceWord = if ($c.SlotFaceMode -eq 'offset') { 'SIDE offset plane (far face)' } else { 'SIDE face (near)' }
+        Add-Para $panel ("Press the button: Creo opens the sketcher on the {0}; then draw the seed rectangle over the first hole row." -f $faceWord) $y 0 'Gray'
     } `
     -OnNext {
         param($c, $wiz)
@@ -3822,10 +3935,14 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
         # plate(bushingLen + ReliefPad) - slot(ReliefPad) == bushingLen by construction.
         # Fall back to SlotDepth only in the degenerate ReliefPad==0 case (no pad applied).
         $slotDepth = if ([double]$c.ReliefPad -gt 0) { [double]$c.ReliefPad } else { [double]$c.SlotDepth }
-        # sketch face = the SIDE default datum (the box near face, in BOTH modes: the
-        # csys box also sketches on the SIDE datum, so the slot cut into that same face
-        # sketches there too). Direction datum from the march axis below.
-        $faceId = if ($null -ne $c.SidePlane -and $null -ne $c.SidePlane.BaseId) { [int]$c.SidePlane.BaseId } else { $null }
+        # sketch face = the SIDE plate face chosen by $c.SlotFaceMode: 'side' = the SIDE
+        # default datum ($c.SidePlane.BaseId, near face, DEFAULT); 'offset' = the SIDE offset
+        # plane ($c.SidePlane.FeatId, far face). Both are set together at box build; offset
+        # falls back to BaseId if the offset id is missing. Direction datum from the march axis below.
+        $faceId =
+            if ($c.SlotFaceMode -eq 'offset' -and $null -ne $c.SidePlane -and $null -ne $c.SidePlane.FeatId) { [int]$c.SidePlane.FeatId }
+            elseif ($null -ne $c.SidePlane -and $null -ne $c.SidePlane.BaseId) { [int]$c.SidePlane.BaseId }
+            else { $null }
         $frontB = @($c.Made | Where-Object { $_.Label -eq 'Front' }); $frontB = if ($frontB.Count -gt 0) { $frontB[0] } else { $null }
         $topB   = @($c.Made | Where-Object { $_.Label -eq 'Top' });   $topB   = if ($topB.Count -gt 0) { $topB[0] } else { $null }
         $dirId = $null; $dirName = $null
@@ -3846,7 +3963,10 @@ $slotArmStep = New-WizardStep -Key 'slot-a' -Title 'Chip-relief slots: draw the 
         $c.SlotAnyCut   = $false
         $c.SlotWarn     = $false
         $c.SeedCut      = $false
-        $c.SlotFlip     = $slotFlipDefault
+        # SIDE OFFSET (far) face default cut points AWAY from the part -> start it flipped so the
+        # seed cuts INTO the plate on the first try (--slot-flip still toggles from this default).
+        # The SIDE (near) face is unchanged. slot-b's direction-verify loop can still flip live.
+        $c.SlotFlip     = Get-SlotSeedFlipDefault -FaceMode $c.SlotFaceMode -FlipFlag $slotFlipDefault
         if ($canPattern) {
             $seedPlan = Get-SlotSeedPatterns -Rows $slots.Rows
             $c.SlotPlan = @{ Mode='pattern'; SeedRow=$seedPlan.SeedRow; Patterns=@($seedPlan.Patterns)

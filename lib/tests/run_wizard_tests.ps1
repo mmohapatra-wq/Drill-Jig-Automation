@@ -319,6 +319,73 @@ $wpfSrcSD = Get-Content -Raw (Join-Path $ROOT 'lib\wpf3d_preview.ps1')
 Assert-True "slotdir(3d): Build-JigModelGroup accepts -RowAxis (default X)" ($wpfSrcSD -match '\[string\]\$RowAxis = ''X''')
 Assert-True "slotdir(3d): WPF slot build threads -RowAxis \$ra" ($wpfSrcSD -match 'Get-RowSlots[^\r\n]*-RowAxis \$ra')
 
+Write-Host "  -- core: slot FACE input (SIDE plane vs SIDE offset plane, user 2026-07-24) --" -ForegroundColor White
+# Resolve-SlotFaceMode: shared normalizer for WHICH plate face the relief is cut on.
+# blank/null/junk -> $Default; trimmed 'offset'/'far' -> 'offset'; 'side'/'near' -> 'side'.
+# NEVER throws (a typo falls back to the default).
+Assert-True "slotface: blank -> default side"      ((Resolve-SlotFaceMode -Text ''        -Default 'side')   -eq 'side')
+Assert-True "slotface: null -> default side"        ((Resolve-SlotFaceMode -Text $null      -Default 'side')   -eq 'side')
+Assert-True "slotface: whitespace -> default side"  ((Resolve-SlotFaceMode -Text '   '                       ) -eq 'side')
+Assert-True "slotface: 'offset' -> offset"          ((Resolve-SlotFaceMode -Text 'offset')                     -eq 'offset')
+Assert-True "slotface: 'OFFSET' case -> offset"     ((Resolve-SlotFaceMode -Text 'OFFSET')                     -eq 'offset')
+Assert-True "slotface: 'far' -> offset"             ((Resolve-SlotFaceMode -Text 'far')                        -eq 'offset')
+Assert-True "slotface: '  offset ' trims -> offset" ((Resolve-SlotFaceMode -Text '  offset ')                  -eq 'offset')
+Assert-True "slotface: 'side' -> side"              ((Resolve-SlotFaceMode -Text 'side')                       -eq 'side')
+Assert-True "slotface: 'near' -> side"              ((Resolve-SlotFaceMode -Text 'near')                       -eq 'side')
+Assert-True "slotface: junk 'q' -> default side"    ((Resolve-SlotFaceMode -Text 'q'        -Default 'side')   -eq 'side')
+Assert-True "slotface: blank honors Default offset" ((Resolve-SlotFaceMode -Text ''         -Default 'offset') -eq 'offset')
+Assert-True "slotface: default arg is side"         ((Resolve-SlotFaceMode -Text 'q')                          -eq 'side')
+# REGRESSION LOCK: like the other Resolve-* helpers, the GUI calls this from a .GetNewClosure()
+# handler (Add-SlotFaceToggle), so it MUST be `function global:`; and both front-ends must select
+# the SIDE OFFSET plane ($sidePlane.FeatId) in offset mode (not always the near-face BaseId), so
+# the choice actually reaches the cut. Also lock that the --slot-face flag + the GUI toggle exist.
+Assert-True "slotface: Resolve-SlotFaceMode is 'function global:'" ($coreSrcSD -match 'function\s+global:Resolve-SlotFaceMode')
+Assert-True "slotface: drilljig.cmd parses --slot-face"            ($djSrcSD  -match '(?i)--slot-face')
+Assert-True "slotface: drilljig.cmd uses Resolve-SlotFaceMode"     ($djSrcSD  -match 'Resolve-SlotFaceMode')
+Assert-True "slotface: drilljig.cmd STAGE 4 selects \$sidePlane.FeatId in offset mode" ($djSrcSD -match "slotFaceMode -eq 'offset'[^\r\n]*\`$sidePlane\.FeatId")
+Assert-True "slotface: drilljig-gui.cmd parses --slot-face"        ($guiSrcSD -match '(?i)--slot-face')
+Assert-True "slotface: drilljig-gui.cmd carries a SlotFaceMode context field" ($guiSrcSD -match 'SlotFaceMode')
+Assert-True "slotface: Add-SlotFaceToggle helper defined in the GUI" ($guiSrcSD -match 'function Add-SlotFaceToggle')
+Assert-True "slotface: Add-SlotFaceToggle accepts an -OnChange callback" ($guiSrcSD -match 'function Add-SlotFaceToggle[\s\S]{0,400}?\[scriptblock\]\$OnChange')
+Assert-True "slotface: slot-a resolves \$c.SidePlane.FeatId in offset mode" ($guiSrcSD -match "SlotFaceMode -eq 'offset'[^\r\n]*\`$c\.SidePlane\.FeatId")
+# RELOCATION LOCK (user 2026-07-24: "move up that slot option to the page with the 3d render ...
+# move the slot to the respective place"): the face toggle now lives on the OVERVIEW stage (the
+# 3D-render page), NOT slot-a. Lock (a) the Overview step renders the toggle with an -OnChange that
+# live-pushes the 3D, (b) slot-a no longer renders it (it only SHOWS the chosen face), and (c) the
+# Overview payload carries slotFace so the render moves the slot to the chosen face.
+$overviewBlockSF = if ($guiSrcSD -match "(?s)-Key\s+'overview'.*?\[void\]\`$steps\.Add\(\`$overviewStep\)") { $Matches[0] } else { '' }
+Assert-True "slotface(3d): the Overview step renders Add-SlotFaceToggle" ($overviewBlockSF -match 'Add-SlotFaceToggle -Panel \$panel -Context \$c -Wizard \$wiz')
+Assert-True "slotface(3d): the Overview toggle passes an -OnChange (live 3D push, no Rerender)" ($overviewBlockSF -match 'Add-SlotFaceToggle[^\r\n]*-OnChange \$onFace')
+Assert-True "slotface(3d): the Overview OnChange re-pushes setJigGeometry to the live WebView2" ($overviewBlockSF -match 'ExecuteScriptAsync\("setJigGeometry\(" \+ \$c\.Wv3dPayload')
+Assert-True "slotface(3d): the Overview payload carries slotFace" ($guiSrcSD -match '"slotFace":"')
+Assert-True "slotface(3d): the Overview slotFace comes from \$c.SlotFaceMode" ($guiSrcSD -match '\$slotFaceJson = if \(\$c\.SlotFaceMode -eq ''offset''\)')
+$slotABlockSF = if ($guiSrcSD -match "(?s)-Key\s+'slot-a'.*?-Key\s+'slot-b'") { $Matches[0] } else { $guiSrcSD }
+Assert-True "slotface: slot-a no longer renders the toggle (moved to Overview)" (-not ($slotABlockSF -match 'Add-SlotFaceToggle -Panel'))
+# HTML: setJigGeometry reads p.slotFace, and the slot Y (which face) is driven by it.
+Assert-True "slotface(3d): three.js setJigGeometry reads p.slotFace into P.SlotFace" ($htmlSrcSD -match 'P\.SlotFace = ')
+Assert-True "slotface(3d): three.js slot Y uses slotOnBottom (offset -> far face)" ($htmlSrcSD -match "slotOnBottom = WELCOME \|\| \(\('' \+ \(P\.SlotFace")
+
+Write-Host "  -- core: slot seed flip default (offset face cuts INTO the part, user 2026-07-24) --" -ForegroundColor White
+# Get-SlotSeedFlipDefault: the SIDE OFFSET (far) face default cut points AWAY from the part, so
+# the seed's STARTING flip is inverted for 'offset' (cuts IN on the first try); --slot-flip still
+# toggles relative to that face default (XOR). The SIDE (near) face passes the flag through.
+Assert-True "seedflip: side face, no flag -> false (unchanged)"      ((Get-SlotSeedFlipDefault -FaceMode 'side'   -FlipFlag $false) -eq $false)
+Assert-True "seedflip: side face, --slot-flip -> true (unchanged)"   ((Get-SlotSeedFlipDefault -FaceMode 'side'   -FlipFlag $true)  -eq $true)
+Assert-True "seedflip: OFFSET face, no flag -> true (inverted)"      ((Get-SlotSeedFlipDefault -FaceMode 'offset' -FlipFlag $false) -eq $true)
+Assert-True "seedflip: OFFSET face, --slot-flip -> false (XOR)"      ((Get-SlotSeedFlipDefault -FaceMode 'offset' -FlipFlag $true)  -eq $false)
+Assert-True "seedflip: 'OFFSET' case-insensitive -> true"           ((Get-SlotSeedFlipDefault -FaceMode 'OFFSET' -FlipFlag $false) -eq $true)
+Assert-True "seedflip: '  offset ' trims -> true"                    ((Get-SlotSeedFlipDefault -FaceMode '  offset ' -FlipFlag $false) -eq $true)
+Assert-True "seedflip: null face -> treated as side (flag passthrough)" ((Get-SlotSeedFlipDefault -FaceMode $null -FlipFlag $false) -eq $false)
+Assert-True "seedflip: unrecognized face -> side (flag passthrough)"  ((Get-SlotSeedFlipDefault -FaceMode 'zz'    -FlipFlag $true)  -eq $true)
+Assert-True "seedflip: defaults (no args) -> false"                  ((Get-SlotSeedFlipDefault) -eq $false)
+# REGRESSION LOCK: shared pure helper (global, may be reached from a GUI closure) + wired at BOTH
+# seed-cut sites (console Invoke-VerifiedSeedCut + GUI $c.SlotFlip seed) so the offset-face default
+# actually reaches the cut in both front-ends.
+Assert-True "seedflip: Get-SlotSeedFlipDefault is 'function global:'" ($coreSrcSD -match 'function\s+global:Get-SlotSeedFlipDefault')
+Assert-True "seedflip: drilljig.cmd seeds the console cut via Get-SlotSeedFlipDefault" ($djSrcSD -match 'Get-SlotSeedFlipDefault -FaceMode \$slotFaceMode')
+Assert-True "seedflip: drilljig.cmd feeds the resolved flip into Invoke-VerifiedSeedCut" ($djSrcSD -match '-Flip \$slotSeedFlip')
+Assert-True "seedflip: drilljig-gui.cmd seeds \$c.SlotFlip via Get-SlotSeedFlipDefault" ($guiSrcSD -match '\$c\.SlotFlip\s*=\s*Get-SlotSeedFlipDefault -FaceMode \$c\.SlotFaceMode')
+
 Write-Host "  -- core: edge-margin input (smaller hole-to-edge wall option) --" -ForegroundColor White
 # Resolve-EdgeMarginInput: the tight-space slot-depth analog for the hole-to-edge wall.
 # Blank -> default (Ok); non-numeric / <0 -> Error; 0 IS allowed (tangent); else round(4).

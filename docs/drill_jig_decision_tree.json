@@ -2,7 +2,7 @@
   {
     "id": "n15_mq6risiq",
     "kind": "question",
-    "label": "Material of part being drilled?",
+    "label": "Drill Jig Material",
     "notes": "",
     "children": [
       {
@@ -14,7 +14,7 @@
           {
             "id": "n17_mq6rjtrc",
             "kind": "question",
-            "label": "PFD or Hand Drill",
+            "label": "Drill Method",
             "notes": "",
             "children": [
               {
@@ -60,7 +60,7 @@
           {
             "id": "n23_mq6roylm",
             "kind": "question",
-            "label": "PFD or Hand Drill",
+            "label": "Drill Method",
             "notes": "",
             "children": [
               {

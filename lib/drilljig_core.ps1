@@ -153,6 +153,55 @@ function global:Resolve-SlotRowAxis {
     return $d
 }
 
+# Normalize an operator-entered / flag CHIP-RELIEF SLOT FACE to 'side' or 'offset' -- WHICH
+# plate face the chip-relief slot is sketched/cut on (user 2026-07-24: an option to flip the
+# relief onto the other face of the plate). The box build stores BOTH SIDE faces together on
+# $sidePlane:
+#   'side'   (DEFAULT) = the SIDE default datum = $sidePlane.BaseId = the NEAR plate face, the
+#                        one the guide holes open onto (today's behavior).
+#   'offset'           = the SIDE offset plane  = $sidePlane.FeatId = the FAR plate face,
+#                        bushingLen away from the datum.
+# The depth invariant is symmetric (plate = bushingLen + SLOT_DEPTH_ABS, the slot removes
+# SLOT_DEPTH_ABS from EITHER face -> bushingLen of full-thickness guide remains) and the cut
+# direction is operator-verified per seed, so this is purely which face the relief opens onto --
+# no depth/pad/guide-plane/pattern math changes. Rules (mirror the Resolve-* helpers above,
+# NEVER throws): blank / whitespace / $null / anything unrecognized -> $Default; a trimmed
+# 'offset'/'far' -> 'offset'; 'side'/'near' -> 'side'. Returns the 1-word mode string. `function
+# global:` for the same closure-resolution reason as the other Resolve-* helpers (a GUI
+# .GetNewClosure() handler may call it).
+function global:Resolve-SlotFaceMode {
+    param([string]$Text, [string]$Default = 'side')
+    $d = if (("$Default").Trim().ToLower() -eq 'offset') { 'offset' } else { 'side' }
+    if ($null -eq $Text) { return $d }
+    $t = ("$Text").Trim().ToLower()
+    if ($t -eq '')       { return $d }
+    if ($t -eq 'offset') { return 'offset' }
+    if ($t -eq 'far')    { return 'offset' }
+    if ($t -eq 'side')   { return 'side' }
+    if ($t -eq 'near')   { return 'side' }
+    return $d
+}
+
+# Resolve the SEED SLOT's STARTING cut-direction flip, given the chosen slot FACE + the
+# --slot-flip flag (user 2026-07-24: "if the slot is created on the SIDE offset plane, the
+# default direction is AWAY from the part; make the default the OTHER way for the offset face").
+# Build-CutFinishMacro fires ONE maindashInst0.flip_pb when -Flip $true (Creo's default cut
+# direction is off the extrude, which for the SIDE-datum near face already cuts INTO the plate,
+# but for the SIDE OFFSET far face points AWAY -- so the offset face needs the opposite starting
+# flip to cut into the plate on the FIRST try). This helper encodes that: the OFFSET face inverts
+# the base flip, and --slot-flip still toggles relative to the face-appropriate default (XOR), so
+# the operator override is preserved either way and the seed-verify loop still lets them flip live.
+#   side   face:  return $FlipFlag            (unchanged -- near face already cuts in by default)
+#   offset face:  return (-not $FlipFlag)      (invert -- so the far face cuts IN by default)
+# PURE, never throws. `function global:` for the same closure-resolution reason as the Resolve-*
+# helpers (a GUI handler may call it). Returns [bool].
+function global:Get-SlotSeedFlipDefault {
+    param([string]$FaceMode = 'side', [bool]$FlipFlag = $false)
+    $isOffset = ((("$FaceMode").Trim().ToLower()) -eq 'offset')
+    if ($isOffset) { return (-not $FlipFlag) }
+    return $FlipFlag
+}
+
 # Resolve the EFFECTIVE hole-to-edge margin (the required wall) to hand to
 # Get-OrthogridGeometry / Get-CustomPointsGeometry / Get-IndexRelativeCustomGeometry
 # as -EdgeMargin, given the operator's chosen value + the drilled hole diameter. PURE.
