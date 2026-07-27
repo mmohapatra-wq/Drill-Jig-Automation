@@ -152,6 +152,57 @@ foreach ($s in $steps) {
 }
 Assert-True "every step has Key/Stage/valid-Kind" $shapeOk
 
+# ----------------------------------------------------------------------------
+# 4. LINT: no assignment to a read-only automatic variable. $pid/$true/$false/
+#    $PSHome/$ShellId/$ExecutionContext are read-only or constant -- assigning to
+#    one throws "Cannot overwrite variable X because it is read-only or constant"
+#    at RUNTIME. Parse-checks + the render/build smoke above do NOT catch it (the
+#    statement is syntactically valid; it only throws when the handler executes),
+#    which is exactly how a `$pid = 0` in the drill-run OnNext slipped to a live
+#    handler error. $null is EXCLUDED ($null = ... is the valid discard sink).
+# ----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "  -- lint: no read-only automatic-variable assignments --" -ForegroundColor White
+# TOKENIZE (not regex) so a mention of "$false" inside a COMMENT or STRING is never
+# flagged -- only a real Variable token immediately followed by an assignment operator
+# ( = += -= *= /= %= ) counts. Read-only/constant automatics ($pid/$true/$false/$PSHome/
+# $ShellId/$ExecutionContext) throw on assignment; $null is EXCLUDED (valid discard sink).
+$badNames = @('pid', 'true', 'false', 'pshome', 'shellid', 'executioncontext')
+$asgnOps  = @('=', '+=', '-=', '*=', '/=', '%=')
+function Find-ReadOnlyAssignments {
+    param([string]$Raw)
+    $perr = $null
+    $toks = $null
+    try { $toks = [System.Management.Automation.PSParser]::Tokenize($Raw, [ref]$perr) } catch { return @() }
+    if ($null -eq $toks) { return @() }
+    $out = @()
+    for ($i = 0; $i -lt $toks.Count; $i++) {
+        $t = $toks[$i]
+        if ($t.Type -ne 'Variable') { continue }
+        if ($badNames -notcontains ([string]$t.Content).ToLower()) { continue }
+        # next non-newline token must be an assignment operator (member/index access,
+        # comparison -eq, or use-as-value all have a different next token)
+        $j = $i + 1
+        while ($j -lt $toks.Count -and $toks[$j].Type -eq 'NewLine') { $j++ }
+        if ($j -lt $toks.Count -and $toks[$j].Type -eq 'Operator' -and ($asgnOps -contains [string]$toks[$j].Content)) {
+            $out += ('$' + $t.Content + ' (line ' + $t.StartLine + ')')
+        }
+    }
+    return @($out)
+}
+$lintTargets = @($files)
+foreach ($rel in $lintTargets) {
+    $p = Join-Path $root $rel
+    if (-not (Test-Path $p)) { continue }
+    $bad = Find-ReadOnlyAssignments (Get-Content -Raw $p)
+    Assert-True "no read-only automatic assignment in $rel" (@($bad).Count -eq 0) ("(" + (@($bad) -join ', ') + ")")
+}
+# and the shell .cmd
+if ($null -ne $guiRaw) {
+    $bad = Find-ReadOnlyAssignments $guiRaw
+    Assert-True "no read-only automatic assignment in drilljig3d-gui.cmd" (@($bad).Count -eq 0) ("(" + (@($bad) -join ', ') + ")")
+}
+
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor Cyan
 Write-Host ("  drilljig3d-gui smoke tests: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

@@ -374,15 +374,18 @@ function global:Add-CurvedDrillSteps {
                 # by construction. Canary-gated inside Invoke-TangentPlane: on a miss we fall
                 # back to the surface id for THIS hole (never assume; never block the drill).
                 # The plane id is stashed on the pair so the Relief stage hosts the slot on it.
-                $pid = 0
-                try { $pid = [int]$pair.PointId } catch { $pid = 0 }
+                # NOTE: use $ptId, NOT $pid -- $PID is a PowerShell read-only automatic
+                # variable (the process id); assigning to it throws "Cannot overwrite
+                # variable PID because it is read-only or constant".
+                $ptId = 0
+                try { $ptId = [int]$pair.PointId } catch { $ptId = 0 }
                 $sid = 0
                 try { $sid = [int]$pair.SurfaceId } catch { $sid = 0 }
                 $orientRef = $sid   # default orientation reference is the surface id
 
-                if ($c.TangentOrient -and -not $c.DefaultOrient -and $sid -gt 0 -and $pid -gt 0) {
+                if ($c.TangentOrient -and -not $c.DefaultOrient -and $sid -gt 0 -and $ptId -gt 0) {
                     $tp = $null
-                    try { $tp = Invoke-TangentPlane -PointId $pid -SurfaceId $sid -OnPoll $poll } catch { $tp = $null }
+                    try { $tp = Invoke-TangentPlane -PointId $ptId -SurfaceId $sid -OnPoll $poll } catch { $tp = $null }
                     if ($null -ne $tp -and $tp.Created -and [int]$tp.PlaneId -gt 0) {
                         try { $pair.TangentPlaneId = [int]$tp.PlaneId } catch {}
                         $orientRef = [int]$tp.PlaneId
@@ -398,7 +401,7 @@ function global:Add-CurvedDrillSteps {
                 # Build + fire the On-Point normal-hole macro. -SurfaceId here is the
                 # ORIENTATION reference (a tangent plane feat id when we made one, else the
                 # surface id). Canary via Wait-ModelModified on the VersionStamp.
-                $hm = Build-NormalHoleMacro -PointId $pid -SurfaceId $orientRef -Diameter $dia -BodyIndex $bodyIx -DefaultOrient:$c.DefaultOrient
+                $hm = Build-NormalHoleMacro -PointId $ptId -SurfaceId $orientRef -Diameter $dia -BodyIndex $bodyIx -DefaultOrient:$c.DefaultOrient
                 $changed = $false
                 try {
                     $stamp = $model.VersionStamp
