@@ -44,8 +44,8 @@
 #   * ONE atomic RunMacro per dashboard (a dialog's command context does not
 #     survive across separate RunMacro calls).
 #   * ID-only: NEVER reads IpfcPoint.Point (it crashes on this build).
-#   * Get-SelectByIdMacro comes from lib\drilljig_core.ps1 (dot-source scope) --
-#     it is NOT redefined here.
+#   * Get-SelectSurfaceByIdMacro / Get-SelectPointByIdMacro come from
+#     lib\drilljig_core.ps1 (dot-source scope) -- they are NOT redefined here.
 #   * Library functions are declared `function global:` so they resolve from
 #     WinForms .GetNewClosure() handlers (a closure module can only see globals).
 #
@@ -59,9 +59,12 @@
 # 1. Build-TangentPlaneMacro  (PURE string builder -- no COM, never throws)
 # ----------------------------------------------------------------------------
 # Return the ONE atomic macro that:
-#   (1) selects the curved SURFACE + the datum POINT by ID, ACCUMULATED
-#       (first ref clears the buffer via Get-SelectByIdMacro; second ref is
-#        added with Get-SelectByIdMacro -NoClear);
+#   (1) selects the curved SURFACE (as Surface GEOMETRY) + the datum POINT (as
+#       Point) by ID, ACCUMULATED (first ref clears the buffer; the second uses
+#       -NoClear). The surface MUST go in as Surface, NOT Feature: trail proof
+#       2026-07-27 (trail.txt.11) showed a Feature-typed face gives
+#       ProCmdDatumPlane no tangent-able reference, so the `Tangent` option never
+#       appears (menu logged index 0) and the dialog cancels (0 new features);
 #   (2) fires ProCmdDatumPlane (consumes the two buffered refs);
 #   (3) sets the constraint TYPE menu to Tangent (constr_type1_OPTMENU1);
 #   (4) confirms with stdbtn_1 (OK).
@@ -85,15 +88,18 @@ function global:Build-TangentPlaneMacro {
         [int]$SurfaceId,
         [bool]$SurfaceFirst = $true
     )
-    # Accumulate the two references by ID. The FIRST call clears the buffer
-    # (fresh selection); the SECOND uses -NoClear so it adds to (does not
-    # replace) the first -- the proven multi-ref accumulate channel.
+    # Accumulate the two references by ID. The surface goes in as SURFACE
+    # geometry (Get-SelectSurfaceByIdMacro) and the point as POINT
+    # (Get-SelectPointByIdMacro) -- NOT as Feature: a Feature-typed face is not a
+    # tangent-able reference (see the docstring / trail.txt.11). The FIRST call
+    # clears the buffer; the SECOND uses -NoClear so it accumulates (does not
+    # replace) -- the proven multi-ref accumulate channel.
     if ($SurfaceFirst) {
-        $sel = (Get-SelectByIdMacro -FeatId $SurfaceId) +
-               (Get-SelectByIdMacro -FeatId $PointId -NoClear)
+        $sel = (Get-SelectSurfaceByIdMacro -FeatId $SurfaceId) +
+               (Get-SelectPointByIdMacro   -FeatId $PointId -NoClear)
     } else {
-        $sel = (Get-SelectByIdMacro -FeatId $PointId) +
-               (Get-SelectByIdMacro -FeatId $SurfaceId -NoClear)
+        $sel = (Get-SelectPointByIdMacro   -FeatId $PointId) +
+               (Get-SelectSurfaceByIdMacro -FeatId $SurfaceId -NoClear)
     }
     return $sel +
         "~ Command ``ProCmdDatumPlane``;" +

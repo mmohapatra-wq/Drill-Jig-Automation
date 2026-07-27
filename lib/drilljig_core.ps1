@@ -683,6 +683,48 @@ function Get-SelectDatumByIdMacro {
         "~ Activate ``selspecdlg0`` ``CancelButton``;"
 }
 
+# Tree-search select-by-ID for a SURFACE (the surface GEOMETRY, not the owning
+# feature). The curved-jig Tangent-plane recipe needs the surface as a GEOMETRIC
+# reference: ProCmdDatumPlane's Tangent constraint binds to a surface, and a
+# Feature-type selection of a curved face gives it nothing tangent-able. Trail
+# proof 2026-07-27 (trail.txt.11): the face fed as `Feature` -> the constraint
+# type menu had NO `Tangent` entry (logged `constr_type1_OPTMENU1 0`) -> the
+# datum-plane dialog cancelled with 0 new features. Selects SelOptionRadio =
+# Surface. -NoClear omits the leading buffer_clean (accumulate a 2nd ref).
+function Get-SelectSurfaceByIdMacro {
+    param([int]$FeatId, [switch]$NoClear)
+    $clear = if ($NoClear) { "" } else { "~ Activate ``main_dlg_cur`` ``buffer_clean``;" }
+    return $clear +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Surface``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$FeatId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;"
+}
+
+# Tree-search select-by-ID for a datum POINT (as Point geometry -- the type
+# holeinator uses for On-Point placement). Standalone + -NoClear so a datum point
+# can be an accumulated reference (e.g. the through-point of the curved Tangent
+# plane). Mirrors the point search embedded in Get-HolePointSelectMacro.
+function Get-SelectPointByIdMacro {
+    param([int]$FeatId, [switch]$NoClear)
+    $clear = if ($NoClear) { "" } else { "~ Activate ``main_dlg_cur`` ``buffer_clean``;" }
+    return $clear +
+        "~ Command ``ProCmdMdlTreeSearch``;" +
+        "~ Open ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Close ``selspecdlg0`` ``SelOptionRadio``;" +
+        "~ Select ``selspecdlg0`` ``SelOptionRadio`` 1 ``Point``;" +
+        "~ Select ``selspecdlg0`` ``RuleTab`` 1 ``Misc``;" +
+        "~ Update ``selspecdlg0`` ``ExtRulesLayout.ExtBasicIDLayout.InputIDPanel`` ``$FeatId``;" +
+        "~ Activate ``selspecdlg0`` ``EvaluateBtn``;" +
+        "~ Activate ``selspecdlg0`` ``ApplyBtn``;" +
+        "~ Activate ``selspecdlg0`` ``CancelButton``;"
+}
+
 # Internal: the point-by-ID (+ optional surface-by-ID) selection prefix shared by
 # Build-HoleMacro and Build-ReliefHoleMacro. SurfacePlaneId>0 pre-selects the SIDE
 # offset plane (Datum) as the On-Point placement surface, then the point (Point,

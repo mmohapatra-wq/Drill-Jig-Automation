@@ -145,6 +145,12 @@ Assert-True "macro (surface-first): SURFACE id appears BEFORE the POINT id" (($i
 Assert-True "macro (surface-first): buffer cleared exactly once (refs accumulate)" ((Count-Token $mSF 'buffer_clean') -eq 1)
 # both refs go through the tree-search select-by-ID channel (two InputIDPanel rows).
 Assert-True "macro (surface-first): two select-by-ID InputIDPanel feeds" ((Count-Token $mSF 'InputIDPanel') -eq 2)
+# FIX 2026-07-27 (trail.txt.11): the surface MUST be fed as Surface GEOMETRY and
+# the point as Point -- a Feature-typed face gave ProCmdDatumPlane no tangent-able
+# reference, so the `Tangent` option never appeared and the dialog cancelled.
+Assert-True "macro: surface fed as Surface type (not Feature)" ((Count-Token $mSF '`SelOptionRadio` 1 `Surface`') -eq 1)
+Assert-True "macro: point fed as Point type" ((Count-Token $mSF '`SelOptionRadio` 1 `Point`') -eq 1)
+Assert-True "macro: NEITHER ref fed as Feature (the pre-fix bug)" ((Count-Token $mSF '`SelOptionRadio` 1 `Feature`') -eq 0)
 # the Tangent select comes AFTER the plane command (constraint set on the open dialog).
 Assert-True "macro (surface-first): ProCmdDatumPlane precedes the Tangent select" ((Index-Of $mSF 'ProCmdDatumPlane') -lt (Index-Of $mSF '`Tangent`'))
 # the plane command precedes stdbtn_1 (OK is last).
