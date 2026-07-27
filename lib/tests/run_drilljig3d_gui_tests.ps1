@@ -203,6 +203,55 @@ if ($null -ne $guiRaw) {
     Assert-True "no read-only automatic assignment in drilljig3d-gui.cmd" (@($bad).Count -eq 0) ("(" + (@($bad) -join ', ') + ")")
 }
 
+# ----------------------------------------------------------------------------
+# 5. LINT: every $c.*Valid gate field a step READS is SEEDED in the shell $ctx
+#    initializer. An unseeded *Valid flag reads $null -> [bool]$null -> $false, so a
+#    -Validate/-OnNext that gates Next on it could disable Next before that step's Build
+#    runs (the ctx-contract class the runtime audit surfaced for StandOffValid/
+#    ThicknessValid). Tokenizer-based: a READ is $c/$ctx/$Context . <Member ending 'Valid'>
+#    whose next token is NOT an assignment op; a SEED is any 'Valid'-suffixed key '= ...'
+#    in the shell hash. (Property access + hashtable keys both tokenize as Member; verified.)
+# ----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "  -- lint: every `$c.*Valid gate field is seeded in the `$ctx initializer --" -ForegroundColor White
+function Get-TokensSafe { param([string]$Raw) $e = $null; try { return @([System.Management.Automation.PSParser]::Tokenize($Raw, [ref]$e)) } catch { return @() } }
+$asgn = @('=', '+=', '-=', '*=', '/=', '%=')
+# READS: $c./$ctx./$Context. <Member ...Valid> not immediately assigned, across the step libs
+$validReads = @{}
+foreach ($rel in $files) {
+    $p = Join-Path $root $rel
+    if (-not (Test-Path $p)) { continue }
+    $tk = Get-TokensSafe (Get-Content -Raw $p)
+    for ($i = 0; $i -lt $tk.Count - 2; $i++) {
+        if ($tk[$i].Type -eq 'Variable' -and (@('c', 'ctx', 'context') -contains ([string]$tk[$i].Content).ToLower()) `
+                -and $tk[$i + 1].Type -eq 'Operator' -and [string]$tk[$i + 1].Content -eq '.' `
+                -and $tk[$i + 2].Type -eq 'Member' -and ([string]$tk[$i + 2].Content) -match 'Valid$') {
+            $isWrite = ($i + 3 -lt $tk.Count -and $tk[$i + 3].Type -eq 'Operator' -and ($asgn -contains [string]$tk[$i + 3].Content))
+            if (-not $isWrite) { $validReads[[string]$tk[$i + 2].Content] = $rel }
+        }
+    }
+}
+# SEEDS: any 'Valid'-suffixed key initialized in the shell .cmd
+$seeded = @{}
+if ($null -ne $guiRaw) {
+    $tk = Get-TokensSafe $guiRaw
+    for ($i = 0; $i -lt $tk.Count - 1; $i++) {
+        $cont = [string]$tk[$i].Content
+        if ($cont -cmatch 'Valid$') {
+            $j = $i + 1
+            while ($j -lt $tk.Count -and $tk[$j].Type -eq 'NewLine') { $j++ }
+            if ($j -lt $tk.Count -and $tk[$j].Type -eq 'Operator' -and [string]$tk[$j].Content -eq '=') { $seeded[$cont] = $true }
+        }
+    }
+}
+if ($validReads.Count -eq 0) {
+    Assert-True "at least one `$c.*Valid gate field was found to check" $false "(tokenizer found none -- lint may be mis-wired)"
+} else {
+    foreach ($f in ($validReads.Keys | Sort-Object)) {
+        Assert-True "ctx gate field `$c.$f (read in $($validReads[$f])) is seeded in the `$ctx initializer" ($seeded.ContainsKey($f)) "(not seeded -> reads $null->false before its Build runs)"
+    }
+}
+
 Write-Host ""
 Write-Host "  ============================================" -ForegroundColor Cyan
 Write-Host ("  drilljig3d-gui smoke tests: {0} passed, {1} failed" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

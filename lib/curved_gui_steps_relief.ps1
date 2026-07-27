@@ -243,6 +243,9 @@ function global:Add-CurvedReliefSteps {
             # REBIND COM handles from $ctx (a bare $session read can be stale --
             # [[project_gui_scope_bugs]]). The curved-slot lib reads the core scope set
             # by Initialize-DrilljigCore, so these locals are for parity + any direct use.
+            # Initialize to $null FIRST (matching the Surface :117 / Drill :340 siblings) so
+            # a future direct use can never inherit a stale parent-scope value.
+            $session = $null; $model = $null; $pfcType = $null
             if ($null -ne $c.Session) { $session = $c.Session }
             if ($null -ne $c.Model)   { $model   = $c.Model }
             if ($null -ne $c.Type)    { $pfcType = $c.Type }
