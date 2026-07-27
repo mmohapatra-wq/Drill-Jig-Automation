@@ -30,10 +30,14 @@
 #     collection + the "any tangent plane?" test are INLINED in each step (reading
 #     only params + $c + globals), never a shared function-local scriptblock.
 #   * The DrawPrompt / VerifyPrompt scriptblocks are INVOKED BY the curved-slot
-#     lib (Invoke-CurvedSlotPlanRun) from OUTSIDE this step's scope, so they must
-#     not depend on a run-local capture: they read $script:GuiWiz, which the
-#     relief-run OnNext assigns to $wiz at its top (the same pattern drilljig-gui's
-#     slot-b uses).
+#     lib (Invoke-CurvedSlotPlanRun) from OUTSIDE this step's scope. They reach the
+#     $wiz controller via the CAPTURED LOCAL $wiz (`.GetNewClosure()` captures the
+#     OnNext's $wiz param by value; the captured value travels with the closure no
+#     matter who invokes it). They must NOT read $script:GuiWiz -- a `.GetNewClosure()`
+#     body resolves $script: against its OWN fresh (empty) module scope, so a runtime
+#     `$script:GuiWiz = $wiz` write never reaches the closure (it reads $null and the
+#     first .AskInline throws "call a method on a null-valued expression"). Verified by
+#     lib\tests\fuzz_curved_gui.ps1, which fires the prompts headless.
 #   * RUN steps REBIND the COM handles from $ctx at the top of OnNext (a bare
 #     $session read can be stale -- [[project_gui_scope_bugs]]), and never claim
 #     success on a canary miss (Invoke-CurvedSlotPlanRun already canary-gates each
@@ -250,11 +254,15 @@ function global:Add-CurvedReliefSteps {
             if ($null -ne $c.Model)   { $model   = $c.Model }
             if ($null -ne $c.Type)    { $pfcType = $c.Type }
 
-            # CAPTURE $wiz for the DrawPrompt/VerifyPrompt closures, which the slot lib
-            # invokes from OUTSIDE this scope. $script:GuiWiz is the same channel
-            # drilljig-gui's slot-b uses; the closures read it so they never depend on a
-            # run-local capture.
-            $script:GuiWiz = $wiz
+            # The DrawPrompt/VerifyPrompt closures below are invoked BY the curved-slot
+            # lib (Invoke-CurvedSlotPlanRun) from OUTSIDE this scope. They must reach the
+            # $wiz controller. IMPORTANT: they read the CAPTURED LOCAL $wiz (this OnNext's
+            # param), NOT $script:GuiWiz -- a `.GetNewClosure()` body reads $script: from
+            # its OWN fresh module scope (empty -> $null), so a runtime `$script:GuiWiz = $wiz`
+            # write does NOT reach the closure (verified: it throws "call a method on a null-
+            # valued expression" when the lib fires the prompt). `.GetNewClosure()` DOES
+            # capture the local $wiz by value, and the captured value travels with the closure
+            # regardless of which function invokes it -- so reading $wiz is correct + robust.
 
             $wiz.BeginRun('Cutting chip-relief slots...')
 
@@ -270,7 +278,7 @@ function global:Add-CurvedReliefSteps {
                 param($seed)
                 $k = 'this hole'
                 try { if ($null -ne $seed.Key) { $k = "$($seed.Key)" } } catch {}
-                [void]$script:GuiWiz.AskInline('Draw the slot',
+                [void]$wiz.AskInline('Draw the slot',
                     ("Draw the rectangle over hole '$k', leave the sketch OPEN, then click OK."),
                     'OK', $true)
             }.GetNewClosure()
@@ -279,7 +287,7 @@ function global:Add-CurvedReliefSteps {
             # Returns $true (correct) / $false (wrong -> lib undoes + flips + redraws).
             $verifyPrompt = {
                 param($seed, $flip)
-                $ans = $script:GuiWiz.AskInline('Verify slot',
+                $ans = $wiz.AskInline('Verify slot',
                     'Did the slot cut INTO the plate at the right depth?', 'YesNo')
                 return ($ans -eq 'Yes')
             }.GetNewClosure()
