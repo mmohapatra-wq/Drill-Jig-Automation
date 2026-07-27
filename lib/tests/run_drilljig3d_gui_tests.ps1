@@ -27,13 +27,26 @@ function Assert-True { param([string]$Name, [bool]$Cond, [string]$Detail = "")
     else { Write-Host "  [FAIL] $Name  $Detail" -ForegroundColor Red; $script:fail++ }
 }
 
+# Resolve a repo file that may live at the root OR under a tool subdir (a parallel
+# repo reorg moves the .cmd tools into pipeline\ / tools\ / probes\; lib\ stays at
+# root). Returns the first existing absolute path, else $null. Keeps this suite
+# robust whether or not the reorg has landed.
+function Resolve-RepoFile {
+    param([string]$Leaf, [string[]]$SubDirs = @('', 'pipeline', 'tools', 'probes', 'previews'))
+    foreach ($sd in $SubDirs) {
+        $p = if ($sd -eq '') { Join-Path $root $Leaf } else { Join-Path $root (Join-Path $sd $Leaf) }
+        if (Test-Path $p) { return $p }
+    }
+    return $null
+}
+
 # ----------------------------------------------------------------------------
-# 1. PARSE every new curved-GUI file.
+# 1. PARSE every new curved-GUI file. (.cmd may be at root or under pipeline\;
+#    the lib\*.ps1 stay at root.)
 # ----------------------------------------------------------------------------
 Write-Host ""
 Write-Host "  -- parse: curved-GUI files --" -ForegroundColor White
 $files = @(
-    'drilljig3d-gui.cmd',
     'lib\conformal_blank.ps1',
     'lib\curved_gui_helpers.ps1',
     'lib\curved_gui_steps_bushing.ps1',
@@ -41,15 +54,23 @@ $files = @(
     'lib\curved_gui_steps_drill.ps1',
     'lib\curved_gui_steps_relief.ps1'
 )
-$guiRaw = $null
 foreach ($rel in $files) {
     $p = Join-Path $root $rel
     if (-not (Test-Path $p)) { Assert-True "exists: $rel" $false "missing"; continue }
     $raw = Get-Content -Raw $p
-    if ($rel -eq 'drilljig3d-gui.cmd') { $guiRaw = $raw }
     $perr = $null
     [void][System.Management.Automation.PSParser]::Tokenize($raw, [ref]$perr)
     Assert-True "parses clean: $rel" ($perr.Count -eq 0) ("({0} errors)" -f $perr.Count)
+}
+# the shell .cmd -- found at root or under a moved-tools subdir.
+$guiPath = Resolve-RepoFile 'drilljig3d-gui.cmd'
+Assert-True "exists: drilljig3d-gui.cmd (root or pipeline\)" ($null -ne $guiPath) "missing"
+$guiRaw = $null
+if ($null -ne $guiPath) {
+    $guiRaw = Get-Content -Raw $guiPath
+    $perr = $null
+    [void][System.Management.Automation.PSParser]::Tokenize($guiRaw, [ref]$perr)
+    Assert-True "parses clean: drilljig3d-gui.cmd" ($perr.Count -eq 0) ("({0} errors)" -f $perr.Count)
 }
 
 # ----------------------------------------------------------------------------
