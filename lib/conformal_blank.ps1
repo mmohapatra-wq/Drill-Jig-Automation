@@ -55,18 +55,53 @@ function global:Get-SelectSurfacesByIdMacro {
 # "thicken -> new solid body"). A single maindashInst0.Flip grows material AWAY
 # from the part (confirmed needed live 2026-06-24). PURE.
 # ----------------------------------------------------------------------------
-function global:Get-OffsetThickenMacro {
+# RECONCILED 2026-07-27 to the operator's 'curvedworkflow' recording (MAPKEYS.md):
+# the offset+thicken is NO LONGER one atomic macro. The recording shows the offset
+# DISTANCE and the thickness are both set via GrmTextTagEmbedMRU (NOT mru_option_menu/
+# ExclSrfColl / maindashInst0.Thickness), and the offset quilt must be SHOWN before the
+# thicken can consume it. So it splits into three PURE builders that Invoke-ConformalBlank
+# fires as offset -> (find + show quilt) -> thicken, with a canary per phase. The old
+# single Get-OffsetThickenMacro (wrong widgets: mru_option_menu/ExclSrfColl + Flip/body-
+# page) is replaced. LIVE-UNVERIFIED: whether ProCmdFtOffset/ProCmdFtThicken consume a
+# pre-selected-by-ID surface here (the recording used two operator screen picks); if the
+# canary shows a phase did not fire, the fix is to make that pick an operator arm step.
+
+# Get-OffsetMacro - the OFFSET-surface leg. The caller PRE-SELECTS the surface(s) by ID
+# (Get-SelectSurfacesByIdMacro) so ProCmdFtOffset consumes them; the offset DISTANCE goes
+# in GrmTextTagEmbedMRU (Open/Close/Update), then Done. Verbatim widget order from the
+# recording (no Activate on the MRU for the offset leg). PURE.
+function global:Get-OffsetMacro {
+    param([double]$StandOff = 0.0)
+    $v = ('{0}' -f $StandOff)
     return "~ Command ``ProCmdFtOffset``;" +
-        "~ Input  ``main_dlg_cur`` ``maindashInst0.mru_option_menu`` ``0``;" +
-        "~ Update ``main_dlg_cur`` ``maindashInst0.mru_option_menu`` ``0``;" +
-        "~ Trigger ``main_dlg_cur`` ``maindashInst0.ExclSrfColl`` ``0``;" +
-        "~ Trigger ``main_dlg_cur`` ``maindashInst0.ExclSrfColl`` ````;" +
-        "~ FocusOut ``main_dlg_cur`` ``maindashInst0.mru_option_menu``;" +
-        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;" +
-        "~ Command ``ProCmdFtThicken``;" +
-        "~ Activate ``main_dlg_cur`` ``maindashInst0.Flip``;" +
-        "~ Activate ``main_dlg_cur`` ``chkbn.body_page.0`` 1;" +
-        "~ Activate ``body_page.0.0`` ``PH.bodyusechkbtnrepwdg`` 1;" +
+        "~ Open   ``main_dlg_cur`` ``GrmTextTagEmbedMRU``;" +
+        "~ Close  ``main_dlg_cur`` ``GrmTextTagEmbedMRU``;" +
+        "~ Update ``main_dlg_cur`` ``GrmTextTagEmbedMRU`` ``$v``;" +
+        "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
+}
+
+# Get-ShowByIdMacro - select a feature/surface BY ID, then ProCmdViewShow@PopupMenuTree,
+# to make the (hidden) offset quilt visible so the thicken can consume it (the recording
+# right-clicks the offset feature in the tree + Show; the by-ID select is the automatable
+# equivalent). PURE.
+function global:Get-ShowByIdMacro {
+    param([string]$TypeName, [int]$Id)
+    return (Get-SelectItemByIdMacro -TypeName $TypeName -Id $Id) +
+        "~ Command ``ProCmdViewShow@PopupMenuTree``;"
+}
+
+# Get-ThickenMacro - the THICKEN leg. The caller PRE-SELECTS the (shown) offset quilt by
+# ID so ProCmdFtThicken consumes it; the THICKNESS goes in GrmTextTagEmbedMRU (Update +
+# Activate), then blur via Enter/Exit dashInst0.Quit, then Done. Verbatim from the
+# recording (NOT maindashInst0.Thickness / Flip / body-page). PURE.
+function global:Get-ThickenMacro {
+    param([double]$Thickness)
+    $v = ('{0}' -f $Thickness)
+    return "~ Command ``ProCmdFtThicken``;" +
+        "~ Update ``main_dlg_cur`` ``GrmTextTagEmbedMRU`` ``$v``;" +
+        "~ Activate ``main_dlg_cur`` ``GrmTextTagEmbedMRU``;" +
+        "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
+        "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
         "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
 }
 
@@ -168,6 +203,29 @@ function global:Get-BodyIdSet {
     return $set
 }
 
+# Snapshot surface ids into a hashtable set. The offset creates a NEW quilt (a set of
+# new surfaces); Invoke-ConformalBlank diffs this before/after the offset to find the
+# quilt surfaces to SHOW + pre-select for the thicken. ID-only. NEVER throws.
+function global:Get-SurfaceIdSet {
+    param($Model, $TypeObj)
+    $set = @{}
+    try {
+        foreach ($s in $Model.ListItems($TypeObj.ITEM_SURFACE)) {
+            try { $set[[int]$s.Id] = $true } catch {}
+        }
+    } catch {}
+    return $set
+}
+
+# Diff the current ITEM_SURFACE set against a prior snapshot -> the @(new int ids).
+function global:Resolve-NewSurfaceIds {
+    param($Model, $TypeObj, $Before)
+    $after = Get-SurfaceIdSet -Model $Model -TypeObj $TypeObj
+    $new = @()
+    foreach ($id in $after.Keys) { if (-not $Before.ContainsKey($id)) { $new += [int]$id } }
+    return @($new | Sort-Object)
+}
+
 # ----------------------------------------------------------------------------
 # Set-DimAndConfirm - write one dim by symbol, force a regen, return the value that
 # actually stuck (or $null on a write failure). Uses Read-DimValue (creo_geometry)
@@ -254,15 +312,27 @@ function global:Resolve-SelectedPoints {
 }
 
 # ----------------------------------------------------------------------------
-# Invoke-ConformalBlank - the STAGE-1 ORCHESTRATOR: given the already-selected
-# surface ids (read by Resolve-SelectedSurfaces), fire ONE atomic offset+thicken
-# macro, canary on VersionStamp, then regenerative-dimension the offset -> $StandOff
-# and the thickness -> $Thickness, and diff for the NEW blank BODY. COM; reads the
-# passed -Session/-Model/-TypeObj (the GUI passes $c.Session/$c.Model/$c.Type).
-# NEVER throws. Returns:
-#   @{ Made=$bool; Changed=$bool; OffsetSym; ThickSym; ThicknessHeld=$bool;
-#      OffsetHeld=$bool; BodyIndex=<int|null>; BodyId; BodyName; Reason; Log=@() }
-# -OnPoll is threaded to Wait-ModelModified (GUI passes a DoEvents pump).
+# Invoke-ConformalBlank - the STAGE-1 ORCHESTRATOR, reconciled 2026-07-27 to the
+# operator's 'curvedworkflow' recording (MAPKEYS.md). TWO PHASES with a canary each
+# (the offset quilt must be SHOWN between them so the thicken can consume it):
+#   PHASE 1 (offset): pre-select the surface(s) by ID -> Get-OffsetMacro (offset
+#     distance = $StandOff via GrmTextTagEmbedMRU) -> Done. Canary on VersionStamp.
+#   BETWEEN: diff ITEM_SURFACE to find the NEW quilt surfaces; SHOW the new offset
+#     feature (Get-ShowByIdMacro) so the quilt is visible/pickable.
+#   PHASE 2 (thicken): pre-select the new quilt surfaces by ID -> Get-ThickenMacro
+#     (thickness = $Thickness via GrmTextTagEmbedMRU + blur + Done). Canary.
+#   BACKSTOP: regenerative-dimension the offset -> $StandOff and thicken -> $Thickness
+#     (Set-DimAndConfirm) in case the in-dashboard value did not stick. Then diff for
+#     the NEW blank BODY.
+# COM; reads the passed -Session/-Model/-TypeObj. NEVER throws (never assumes success
+# on a canary miss). -OnPoll threaded to Wait-ModelModified.
+#   LIVE-UNVERIFIED: whether ProCmdFtOffset/ProCmdFtThicken consume a pre-selected-by-ID
+#   surface here (the recording used two operator screen picks). If PHASE 2 does not
+#   fire (canary miss), the next fix is to make the quilt selection an operator arm/pick
+#   step (box-a/box-b split) -- Made stays $false and the caller reports honestly.
+# Returns:
+#   @{ Made; Phase1; Phase2; OffsetSym; ThickSym; OffsetHeld; ThicknessHeld;
+#      QuiltSurfIds; OffsetFeatId; BodyIndex; BodyId; BodyName; Reason }
 # ----------------------------------------------------------------------------
 function global:Invoke-ConformalBlank {
     param(
@@ -273,24 +343,44 @@ function global:Invoke-ConformalBlank {
         [scriptblock]$OnPoll = $null,
         [int]$TimeoutMs = 30000
     )
-    $res = @{ Made=$false; Changed=$false; OffsetSym=$null; ThickSym=$null;
-              ThicknessHeld=$false; OffsetHeld=$false; BodyIndex=$null; BodyId=$null;
-              BodyName=$null; Reason=''; Log=@() }
+    $res = @{ Made=$false; Phase1=$false; Phase2=$false; OffsetSym=$null; ThickSym=$null;
+              ThicknessHeld=$false; OffsetHeld=$false; QuiltSurfIds=@(); OffsetFeatId=$null;
+              BodyIndex=$null; BodyId=$null; BodyName=$null; Reason='' }
     if ($null -eq $SurfIds -or @($SurfIds).Count -lt 1) { $res.Reason = 'no surface ids to offset'; return $res }
     if ($Thickness -le 0) { $res.Reason = 'thickness must be > 0'; return $res }
 
     $beforeFeat   = Get-FeatureIdSet
+    $beforeSurf   = Get-SurfaceIdSet -Model $Model -TypeObj $TypeObj
     $beforeBodies = Get-BodyIdSet -Model $Model -TypeObj $TypeObj
-    $stamp = $null; try { $stamp = $Model.VersionStamp } catch {}
 
-    $macro = (Get-SelectSurfacesByIdMacro -SurfIds $SurfIds) + (Get-OffsetThickenMacro)
-    try { $Session.RunMacro($macro) } catch { $res.Reason = "offset+thicken macro error: $($_.Exception.Message)"; return $res }
+    # -- PHASE 1: offset (pre-selected surface consumes into ProCmdFtOffset) --
+    $stamp1 = $null; try { $stamp1 = $Model.VersionStamp } catch {}
+    $m1 = (Get-SelectSurfacesByIdMacro -SurfIds $SurfIds) + (Get-OffsetMacro -StandOff $StandOff)
+    try { $Session.RunMacro($m1) } catch { $res.Reason = "offset macro error: $($_.Exception.Message)"; return $res }
+    if ($null -ne $stamp1) { $res.Phase1 = Wait-ModelModified -Model $Model -PreviousStamp $stamp1 -TimeoutMs $TimeoutMs -OnPoll $OnPoll }
+    if (-not $res.Phase1) { $res.Reason = 'the offset did not fire (model unchanged) - check the pre-selected surface / widget names'; return $res }
 
-    if ($null -ne $stamp) { $res.Changed = Wait-ModelModified -Model $Model -PreviousStamp $stamp -TimeoutMs $TimeoutMs -OnPoll $OnPoll }
-    if (-not $res.Changed) { $res.Reason = 'the model did not change (offset/thicken did not fire, or widget drift)'; return $res }
+    # -- BETWEEN: find the new offset feature + the new quilt surfaces; SHOW the quilt --
+    $newFeatsP1 = @(Get-NewFeatureLinearDims -Model $Model -TypeObj $TypeObj -BeforeIds $beforeFeat)
+    if (@($newFeatsP1).Count -ge 1) { $res.OffsetFeatId = [int]$newFeatsP1[0].Id }
+    $res.QuiltSurfIds = @(Resolve-NewSurfaceIds -Model $Model -TypeObj $TypeObj -Before $beforeSurf)
+    if ($null -ne $res.OffsetFeatId -and [int]$res.OffsetFeatId -gt 0) {
+        try { $Session.RunMacro((Get-ShowByIdMacro -TypeName 'Feature' -Id ([int]$res.OffsetFeatId))) } catch {}
+    }
+
+    # -- PHASE 2: thicken (pre-select the new quilt surfaces, then ProCmdFtThicken) --
+    $stamp2 = $null; try { $stamp2 = $Model.VersionStamp } catch {}
+    $selQuilt = if (@($res.QuiltSurfIds).Count -ge 1) { (Get-SelectSurfacesByIdMacro -SurfIds $res.QuiltSurfIds) } else { "" }
+    $m2 = $selQuilt + (Get-ThickenMacro -Thickness $Thickness)
+    try { $Session.RunMacro($m2) } catch { $res.Reason = "thicken macro error: $($_.Exception.Message)"; return $res }
+    if ($null -ne $stamp2) { $res.Phase2 = Wait-ModelModified -Model $Model -PreviousStamp $stamp2 -TimeoutMs $TimeoutMs -OnPoll $OnPoll }
+    if (-not $res.Phase2) {
+        $res.Reason = 'the offset was created but the THICKEN did not fire (model unchanged after phase 2). The quilt may need an operator pick - re-run and pick the shown quilt, or use --default (operator pick) once wired.'
+        return $res
+    }
     $res.Made = $true
 
-    # Find the two new features + drive their dims (lower id = offset, higher = thicken).
+    # -- BACKSTOP: regenerative-dimension offset->StandOff, thicken->Thickness --
     $newFeats = @(Get-NewFeatureLinearDims -Model $Model -TypeObj $TypeObj -BeforeIds $beforeFeat)
     if (@($newFeats).Count -ge 1) {
         $offsetFeat = $newFeats[0]
@@ -307,7 +397,7 @@ function global:Invoke-ConformalBlank {
         }
     }
 
-    # Identify the NEW body (diff vs before) so the drill stage targets the blank.
+    # -- Identify the NEW body (diff vs before) so the drill stage targets the blank --
     try {
         $afterBodies = @($Model.ListItems($TypeObj.ITEM_BODY))
         for ($bi = 0; $bi -lt $afterBodies.Count; $bi++) {
