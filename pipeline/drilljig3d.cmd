@@ -488,7 +488,7 @@ function Invoke-JigEval {
     $slice = Get-GeometrySlice -Model $ModelName -Truth $truth
 
     $base = ($ModelName -replace '\.(prt|asm)(\.\d+)?$','') -replace '[^\w\-]','_'
-    $packetPath = Join-Path $RepoRoot ($base + "_eval.json")
+    $packetPath = Join-Path $RepoRoot ('artifacts\' + $base + "_eval.json")
     $when = (Get-Date).ToString("o")
     Write-EvalPacket -Path $packetPath -Claim $claim -Slice $slice -WhenIso $when | Out-Null
     Write-Host "  Eval packet -> $packetPath" -ForegroundColor DarkGray
@@ -625,7 +625,7 @@ if ($null -ne $treeDia) {
     $jigDia = $treeDia; $jigBushLen = $treeBushLen; $jigBushName = $treeBushName
     Write-Host "  Using STAGE-0 tree result: hole/seat dia $jigDia$(if ($jigBushName) { " ($jigBushName)" })" -ForegroundColor DarkGray
 } else {
-    $handoffPath = Join-Path $ScriptDir 'last_jig_spec.json'
+    $handoffPath = Join-Path $ScriptDir 'artifacts\last_jig_spec.json'
     if (Test-Path $handoffPath) {
         try {
             $jigSpec = Get-Content $handoffPath -Raw | ConvertFrom-Json

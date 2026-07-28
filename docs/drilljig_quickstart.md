@@ -171,5 +171,5 @@ from the design layout; **verify the axis SIGNS visually against the created csy
   actually appeared — never just because a macro fired. Always eyeball the result in
   Creo.
 
-See `CLAUDE.md` for the full developer notes (per-stage internals, the shared engine,
+See `context-files/CLAUDE.md` for the full developer notes (per-stage internals, the shared engine,
 the blind-evaluator convergence layer, and the API-fact registry).

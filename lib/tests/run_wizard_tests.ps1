@@ -22,6 +22,19 @@ $here   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $libDir = Split-Path -Parent $here
 $root   = Split-Path -Parent $libDir
 
+# Resolve a repo file that may live at the root OR under a tool subdir (the repo
+# reorg moves the .cmd tools into pipeline\ / tools\ / probes\ / previews\; lib\
+# stays at root). Returns the first existing path, else the root path (so a truly
+# missing file still surfaces the original "not found at root" error).
+function Resolve-RepoFile {
+    param([string]$Leaf, [string[]]$SubDirs = @('', 'pipeline', 'tools', 'probes', 'previews'))
+    foreach ($sd in $SubDirs) {
+        $p = if ($sd -eq '') { Join-Path $root $Leaf } else { Join-Path $root (Join-Path $sd $Leaf) }
+        if (Test-Path $p) { return $p }
+    }
+    return (Join-Path $root $Leaf)
+}
+
 # drilljig_core needs creo_geometry + orthogrid in scope for a couple of helpers
 # at dot-source time; load the same set the GUI loads (none of these touch Creo).
 . (Join-Path $libDir 'creo_geometry.ps1')
@@ -152,7 +165,7 @@ Assert-True "breadcrumb click: 0 width -> -1"          ((Resolve-BreadcrumbClick
 # ----------------------------------------------------------------------------
 Write-Host "  -- bushing-tree back-nav history --" -ForegroundColor White
 try {
-    $guiSrc = Get-Content -Raw (Join-Path $root 'drilljig-gui.cmd')
+    $guiSrc = Get-Content -Raw (Resolve-RepoFile 'drilljig-gui.cmd')
     $bh0 = $guiSrc.IndexOf('# STEP BUILDERS'); $bh1 = $guiSrc.IndexOf('# Build the connection up front')
     Invoke-Expression $guiSrc.Substring($bh0, $bh1 - $bh0) | Out-Null
     Assert-True "tree-hist: Push/Pop/Reset-TreeHistory resolve" (@('Push-TreeHistory','Pop-TreeHistory','Reset-TreeWalk' | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }).Count -eq 0)
@@ -265,7 +278,7 @@ $coreSrcSD = Get-Content -Raw (Join-Path $libDir 'drilljig_core.ps1')
 Assert-True "slotdepth: Resolve-SlotDepthInput is 'function global:' (resolvable from GUI closures)" ($coreSrcSD -match 'function\s+global:Resolve-SlotDepthInput')
 # and the GUI's tight-branch closure must NOT call the non-global Get-UiColor (it must
 # capture precomputed colors) -- guard that the echo closure uses captured $okCol/$warnCol.
-$guiSrcSD = Get-Content -Raw (Join-Path $ROOT 'drilljig-gui.cmd')
+$guiSrcSD = Get-Content -Raw (Resolve-RepoFile 'drilljig-gui.cmd')
 Assert-True "slotdepth: tight-field closure captures colors (no Get-UiColor inside \$updateEcho)" (($guiSrcSD -match '\$lblEcho\.ForeColor = \$okCol') -and ($guiSrcSD -match '\$lblEcho\.ForeColor = \$warnCol'))
 
 Write-Host "  -- core: slot DIRECTION input (fastener X/Z option, user 2026-07-23) --" -ForegroundColor White
@@ -285,7 +298,7 @@ Assert-True "slotdir: default arg is X"            ((Resolve-SlotRowAxis -Text '
 # their slot-cut Get-RowSlots call (not the old hardcoded -RowAxis 'X') so a fastener 'Z'
 # pick actually reaches the slots. Also lock that the --slot-dir flag + fastener choice exist.
 Assert-True "slotdir: Resolve-SlotRowAxis is 'function global:'" ($coreSrcSD -match 'function\s+global:Resolve-SlotRowAxis')
-$djSrcSD = Get-Content -Raw (Join-Path $ROOT 'drilljig.cmd')
+$djSrcSD = Get-Content -Raw (Resolve-RepoFile 'drilljig.cmd')
 Assert-True "slotdir: drilljig.cmd STAGE 4 threads -RowAxis \$slotRowAxis (not hardcoded)" ($djSrcSD -match 'Get-RowSlots[^\r\n]*-RowAxis \$slotRowAxis')
 Assert-True "slotdir: drilljig.cmd parses --slot-dir"           ($djSrcSD -match '(?i)--slot-dir')
 Assert-True "slotdir: drilljig.cmd uses Resolve-SlotRowAxis"    ($djSrcSD -match 'Resolve-SlotRowAxis')
@@ -788,7 +801,7 @@ Assert-True "slotpat: -Flip adds ui_pat_dir_1_flip" ($spF -match 'ui_pat_dir_1_f
 # PARSE + FUNCTION-RESOLVE smoke check of drilljig-gui.cmd
 # ----------------------------------------------------------------------------
 Write-Host "  -- smoke: drilljig-gui.cmd parse + resolve --" -ForegroundColor White
-$guiRaw = Get-Content -Raw (Join-Path $root 'drilljig-gui.cmd')
+$guiRaw = Get-Content -Raw (Resolve-RepoFile 'drilljig-gui.cmd')
 $perr = $null
 [void][System.Management.Automation.PSParser]::Tokenize($guiRaw, [ref]$perr)
 Assert-True "drilljig-gui.cmd parses clean" ($perr.Count -eq 0) ("({0} errors)" -f $perr.Count)
@@ -848,7 +861,7 @@ Assert-True "wizard.ps1 defines the AskInline controller method" ($wizRaw -match
 # length-pick helpers by hand and dot-source no lib, so a syntax error there is
 # invisible to the lib parse checks -- catch it here).
 foreach ($jf in @('jiginator.cmd','jiginator.ps1')) {
-    $jt = Get-Content -Raw (Join-Path $root $jf)
+    $jt = Get-Content -Raw (Resolve-RepoFile $jf)
     $je = $null
     [void][System.Management.Automation.PSParser]::Tokenize($jt, [ref]$je)
     Assert-True ("$jf parses clean") ($je.Count -eq 0) ("({0} errors)" -f $je.Count)
@@ -970,7 +983,7 @@ if (-not $wfLoaded) {
         $script:capOnPick = $null; $script:capOpts = $null
         function Add-WizardChoiceCards { param($Panel,$Options,$OnPick,$Context,$Wizard,$CardWidth,$CardHeight,$AfterPick) $script:capOnPick=$OnPick; $script:capOpts=$Options }
 
-        $src = Get-Content -Raw (Join-Path $root 'drilljig-gui.cmd')
+        $src = Get-Content -Raw (Resolve-RepoFile 'drilljig-gui.cmd')
         $h0 = $src.IndexOf('# STEP BUILDERS'); $h1 = $src.IndexOf('# Build the connection up front')
         Invoke-Expression $src.Substring($h0, $h1 - $h0) | Out-Null
         $siR = $src.IndexOf('# WIZARD STEPS'); $eiR = $src.IndexOf('# RUN THE WIZARD')
@@ -1440,7 +1453,7 @@ $body = {
     $noIndexCsys = $false; $noCsysPoints = $false   # index-a/-b Builds read these
     function Invoke-BoxEval { param($Operation,$Expected) return $true }
     $model=$null;$pfcType=$null;$session=$null
-    $src = Get-Content -Raw (Join-Path $ROOT 'drilljig-gui.cmd')
+    $src = Get-Content -Raw (Join-Path $ROOT 'pipeline\drilljig-gui.cmd')
     $h0 = $src.IndexOf('# STEP BUILDERS'); $h1 = $src.IndexOf('# Build the connection up front')
     Invoke-Expression $src.Substring($h0, $h1 - $h0) | Out-Null
     $fakeWiz = [pscustomobject]@{}
@@ -1552,7 +1565,7 @@ $body = {
 # ----------------------------------------------------------------------------
 Write-Host "  -- parity: drilljig.cmd does not re-define shared-engine functions --" -ForegroundColor White
 try {
-    $djText = Get-Content -Raw (Join-Path $root 'drilljig.cmd')
+    $djText = Get-Content -Raw (Resolve-RepoFile 'drilljig.cmd')
     $djT=$null; $djE=$null
     $djAst = [System.Management.Automation.Language.Parser]::ParseInput($djText, [ref]$djT, [ref]$djE)
     $djFns = @($djAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
@@ -1567,7 +1580,7 @@ try {
 
     # slotinator.cmd must no longer DEFINE the slot primitives moved to the lib
     # (Build-CutFinishMacro / Invoke-VerifiedSeedCut) - it uses the lib copies.
-    $slText = Get-Content -Raw (Join-Path $root 'slotinator.cmd')
+    $slText = Get-Content -Raw (Resolve-RepoFile 'slotinator.cmd')
     $slT=$null; $slE=$null
     $slAst = [System.Management.Automation.Language.Parser]::ParseInput($slText, [ref]$slT, [ref]$slE)
     $slFns = @($slAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })

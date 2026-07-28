@@ -1,0 +1,111 @@
+Curved-jig hole from a fastener's TOP/SIDE/FRONT planes (assembly workflow)
+==========================================================================
+User-supplied recording (2026-07-27), the EXACT workflow AFTER the drilljig
+conformal surface is built. In a TOP-DOWN ASSEMBLY (curved-surface part +
+fasteners part + drilljig part), each fastener part instance carries its own
+TOP/SIDE/FRONT default datum planes, positioned at the fastener. The workflow:
+
+  1. Select that fastener's 3 datum planes (TOP/SIDE/FRONT).
+  2. ProCmdDatumPointGeneral + stdbtn_1  ->  a datum POINT at the 3-plane
+     INTERSECTION (= the fastener location). SAME command proven for the flat
+     3-plane-intersection point (point-at-3-plane-intersection-by-id).
+  3. ProCmdHole placed BY REFERENCE: primary ref = the datum point (placement),
+     direction ref = a picked reference on the drilljig part that sets the hole
+     ORIENTATION -> the hole drills THROUGH the drilljig part in that direction.
+
+"remember that we know how to do fastener selection, so using those fastener IDs,
+you know where to create datum points" (user) -- the fastener component
+selection is already solved (fastener-probe / fastenator: Selection.Path /
+ComponentIds); it tells us WHICH fastener, and its 3 planes give the point.
+
+"the slot plane can be created on the TOP plane of each fastener" (user) -- for
+the curved chip-relief slot, the fastener's own TOP plane is a ready-made seed-
+sketch host (no tangent plane needed for that half).
+
+Raw mapkey (verbatim):
+
+  mapkey curvedholes ~ Select `main_dlg_cur` `PHTLeft.AssyTree` 1 `T3 6 0`;\
+  mapkey(continued) ~ Select `main_dlg_cur` `PHTLeft.AssyTree` 3 `T3 6 0` `T3 6 1` `T3 6 2`  1;\
+  mapkey(continued) ~ Trail `MiniToolbar` `MiniToolbar` `UIT_TRANSLUCENT`  `NEED_TO_CLOSE`;\
+  mapkey(continued) ~ Command `ProCmdDatumPointGeneral` ;~ Activate `Odui_Dlg_00` `stdbtn_1`;\
+  mapkey(continued) ~ Command `ProCmdHole` ;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `0`;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `1`;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` ``;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` `0`;\
+  mapkey(continued) ~ Focus `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst`;\
+  mapkey(continued) ~ Select `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` 1 `0`;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` ``;\
+  mapkey(continued) ~ Timer `` `` `CollectorWdg_FocusTimer`;@PAUSE_FOR_SCREEN_PICK;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` `0`;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` ``;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `1`;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `0`;\
+  mapkey(continued) ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` ``;\
+  mapkey(continued) ~ Enter `main_dlg_cur` `dashInst0.Quit`;\
+  mapkey(continued) ~ Exit `main_dlg_cur` `dashInst0.Quit`;\
+  mapkey(continued) ~ Activate `main_dlg_cur` `dashInst0.Done`;
+
+Decode / token map
+------------------
+* PHTLeft.AssyTree  = the ASSEMBLY model tree. The two `~ Select` lines select
+  the fastener's 3 datum planes as tree nodes (`T3 6 0/1/2`). Tree-NODE keys are
+  POSITION-DEPENDENT (tied to tree expansion/order), NOT stable feature ids, so
+  they are NOT a good automation channel -- the operator's live Ctrl-click of the
+  3 planes (the probe's approach) populates the buffer identically, and the
+  scalable automation is a path-qualified selection built from the fastener
+  component (Selection.Path + the plane items), NOT these literal node keys.
+* ProCmdDatumPointGeneral + `Odui_Dlg_00` `stdbtn_1` = create the intersection
+  point from the 3 selected planes (OK). Byte-for-byte the proven flat recipe
+  (Build-IntersectPointMacro tail); the only new thing is that the 3 planes here
+  belong to a COMPONENT in an ASSEMBLY.
+* ProCmdHole placed BY REFERENCE on page `hole_fb_plcmnt_page.3.0`:
+    - PH.ui_hole_prim_ref_cui_lst = PRIMARY reference collector = the PLACEMENT
+      (the just-created datum point; it stays selected after stdbtn_1 so the
+      hole picks it up). The `0`/`1`/`` triggers cycle/commit that collector.
+    - PH.ui_hole_ft_dir_cui_lst  = the FEATURE-DIRECTION collector = the drill
+      ORIENTATION reference. The `~ Timer ... CollectorWdg_FocusTimer;
+      @PAUSE_FOR_SCREEN_PICK` is the operator PICKING that direction reference on
+      the drilljig part -- a RunMacro CANNOT replay a screen pick, so the hole
+      recipe MUST split around this pause (like boxinator's rough-rectangle
+      draw). Whether the direction ref can instead be fed BY ID is an open
+      automation question (a follow-up probe/recording).
+    - `~ Enter`/`~ Exit main_dlg_cur dashInst0.Quit` = hover/blur events (NOT a
+      cancel -- CLAUDE.md Mapkey Patterns), then `dashInst0.Done` confirms.
+  This is a REFERENCE/DIRECTION-placed hole, DISTINCT from the On-Point
+  Build-HoleMacro recipe (ProCmdHole + hole_depth_to_type_flybtn + body_page +
+  StrHoleDepThruAll). NOTE: this recording sets NO diameter / depth / body -- it
+  takes the dashboard defaults; a production tool adds those.
+* `~ Trail`/`~ Timer` = recording noise -- dropped in the script sequence.
+
+Script-usable token sequence (planes already selected; drop Trail/Timer noise;
+split at the direction pick):
+
+  <operator selects the fastener's TOP/SIDE/FRONT planes>   (Ctrl-click, 3 planes)
+  --- POINT ---
+  ~ Command `ProCmdDatumPointGeneral`;
+  ~ Activate `Odui_Dlg_00` `stdbtn_1`;
+  --- HOLE, part A (open + placement + arm the direction collector) ---
+  ~ Command `ProCmdHole`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `0`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `1`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` ``;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` `0`;
+  ~ Focus  `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst`;
+  ~ Select `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` 1 `0`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` ``;
+  --- [operator PICKS the direction reference on the drilljig part] ---
+  --- HOLE, part B (commit the refs + confirm) ---
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` `0`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_ft_dir_cui_lst` ``;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `1`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` `0`;
+  ~ Trigger `hole_fb_plcmnt_page.3.0` `PH.ui_hole_prim_ref_cui_lst` ``;
+  ~ Enter `main_dlg_cur` `dashInst0.Quit`;
+  ~ Exit  `main_dlg_cur` `dashInst0.Quit`;
+  ~ Activate `main_dlg_cur` `dashInst0.Done`;
+
+Probe: probes\curvedhole-probe.cmd settles, live, whether this workflow builds a
+correctly-placed + correctly-oriented hole in the operator's assembly, and
+whether ProCmdDatumPointGeneral consumes the fastener-component planes. Fact:
+hole-by-reference-and-direction (docs-only until the probe confirms it live).

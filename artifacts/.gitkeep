@@ -1,0 +1,5 @@
+# This folder holds machine-generated per-run artifacts (JSON handoffs, probe
+# reports, recipes, eval packets). Its CONTENTS are gitignored (see .gitignore);
+# this .gitkeep is tracked so the folder exists in a fresh clone, because tools
+# write here via `Join-Path $ScriptDir 'artifacts\...'` and Set-Content fails if
+# the directory is missing.

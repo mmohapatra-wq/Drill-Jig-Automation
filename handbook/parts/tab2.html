@@ -1,0 +1,267 @@
+<h2 class="sec">Build &amp; Develop</h2>
+
+<p>This tab walks a newcomer from a bare Windows box to a working dev loop for <strong>both</strong> halves of the system: the <strong>Drill-Jig toolkit</strong> (the collection of hybrid <code>.cmd</code> tools that drive Creo over COM) and its companion <strong>vb-docs MCP server</strong> (a local search index over the exact Creo VB API docs). Each section says <em>what the piece does and why it exists</em> so you are not just copying commands.</p>
+
+<div class="dlrow">
+  <button class="dlbtn" onclick="dl('pl_dev_html')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg> Download DEVELOPMENT_SETUP.html (full setup guide) <span class="sz">~37 KB</span></button>
+</div>
+<p>The button grabs the same information as a standalone page you can keep right next to the repo &mdash; handy when you are offline or setting up a fresh machine.</p>
+
+<div class="callout info">
+  <div class="t">Paths reflect the working machine</div>
+  Every absolute path below is from the working box (user <code>mmohapatra</code>, Creo <code>12.4.3.0</code>). Where you see <code>mmohapatra</code> or <code>YOUR_USERNAME</code>, swap in your own Windows username. If your Creo build differs, watch for the notes about rebuilding the search index.
+</div>
+
+<hr>
+
+<section class="block">
+  <h3>1. Toolchain</h3>
+  <p><strong>What this does / why:</strong> these are the exact pieces the tools assume are present. Versions are what is proven on the working machine &mdash; newer usually works, but the two hard rules are <em>PowerShell 5.1 (not 7)</em> and a Creo build whose VB API docs match your index.</p>
+  <table>
+    <tr><th>Tool</th><th>Why</th><th>Version</th></tr>
+    <tr><td>Creo Parametric</td><td>The CAD app every tool drives over COM. The VB API docs ship <em>inside</em> Creo, and the vb-docs search index is built from them &mdash; so Creo is both the target and the source of truth.</td><td>12.4.3.0</td></tr>
+    <tr><td>Windows PowerShell</td><td>Every <code>.cmd</code> is a batch wrapper embedding a PowerShell body, launched <strong>STA</strong> for WinForms. Do <strong>not</strong> require PS7 &mdash; the tools target 5.1.</td><td>5.1</td></tr>
+    <tr><td>Python</td><td>Runs the vb-docs MCP server.</td><td>3.11.9</td></tr>
+    <tr><td>uv</td><td>Fast Python env / dependency manager (creates the venv, installs deps).</td><td>0.11.16</td></tr>
+    <tr><td>Claude Code CLI</td><td>The agent host that talks to every MCP server (vb-docs + the Leap fleet).</td><td>2.1.170</td></tr>
+    <tr><td>VS Code + PowerShell extension</td><td><code>ms-vscode.powershell</code> &mdash; enables the <kbd>F8</kbd> run-selection loop against a live Creo session.</td><td>latest</td></tr>
+    <tr><td>Git</td><td>Clones and updates both repositories.</td><td>any recent</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h3>2. What a &ldquo;hybrid .cmd&rdquo; is</h3>
+  <div class="callout tip">
+    <div class="t">One file, two languages</div>
+    Each tool is a SINGLE file that is BOTH a Windows batch script AND a PowerShell script. The batch header at the top relaunches <code>powershell.exe -STA</code> and executes the embedded body via <code>[scriptblock]::Create(...)</code>. One double-click &mdash; no install, no external <code>.ps1</code> needed.
+  </div>
+  <p>The header on line 4 re-anchors <code>$ScriptDir</code> to the <strong>repo root</strong>, so <code>lib\</code>, <code>data\</code>, <code>docs\</code> and the cross-tool handoff JSONs resolve identically no matter which subfolder the tool lives in. The <code>-STA</code> apartment state is what lets the embedded WinForms wizards work. The net effect: portable, self-contained tools that you run by double-clicking.</p>
+</section>
+
+<section class="block">
+  <h3>3. The two repositories</h3>
+  <p><strong>What this does / why:</strong> the toolkit is one repo; the docs server is a second, separate repo. You clone both.</p>
+  <table>
+    <tr><th>Repo</th><th>Origin</th><th>Upstream / baseline</th><th>Local path</th></tr>
+    <tr><td>Drill-Jig toolkit</td><td><code>github.com/mmohapatra-wq/Drill-Jig-Automation</code></td><td><code>gitlab.blueorigin.com/kbrooker/ngs-orthogrid-automation.git</code></td><td><code>C:\Users\mmohapatra\ngs-orthogrid-automation</code></td></tr>
+    <tr><td>vb-docs MCP server</td><td colspan="2"><code>gitlab.blueorigin.com/awei/creo_vb_api_docs_mcp.git</code></td><td><code>C:\Users\mmohapatra\creo_vb_api_docs_mcp</code></td></tr>
+  </table>
+  <div class="callout info">
+    <div class="t">Why a separate repo?</div>
+    The drill-jig code is version-sensitive to Creo widget names and API quirks. Rather than guess method signatures from memory (a repeated source of silent bugs), <code>CLAUDE.md</code> mandates querying the vb-docs MCP server first &mdash; that server indexes the <em>exact</em> VB API docs shipped with your Creo build. Read <code>CLAUDE.md</code>, <code>README.md</code>, and <code>DEV_NOTES.md</code> before touching code.
+  </div>
+</section>
+
+<section class="block">
+  <h3>4. Register the Creo VB API COM objects</h3>
+  <p><strong>What this does / why:</strong> the tools connect to Creo through COM objects (ProgIDs like <code>pfcls.pfcAsyncConnection</code>). Those objects have to be registered with Windows once per machine. Run this <strong>as Administrator</strong>.</p>
+  <pre><code>cd "C:\PTC\Creo 12.4.3.0\Parametric\bin"
+.\vb_api_register.bat</code></pre>
+  <div class="callout tip">
+    <div class="t">Self-healing</div>
+    Every tool retries registration automatically on first run if <code>New-Object -ComObject pfcls.pfcAsyncConnection</code> throws &mdash; so a fresh machine often just works on the second attempt.
+  </div>
+  <h4>How the connection works</h4>
+  <pre><code>Get-Process xtop                       # find the running Creo process
+  -&gt; set $Env:PRO_DIRECTORY and $Env:PRO_COMM_MSG_EXE from its path
+$async      = New-Object -ComObject pfcls.pfcAsyncConnection
+$connection = $async.Connect($null,$null,$null,$null)
+$session    = $connection.Session
+$model      = $session.GetActiveModel()</code></pre>
+  <div class="callout warn">
+    <div class="t">Environment expectations</div>
+    Tools expect exactly ONE <code>xtop.exe</code> running and the jig <strong>PART</strong> open &mdash; not an <code>.asm</code> assembly.
+  </div>
+</section>
+
+<section class="block">
+  <h3>5. vb-docs: Python env + search index</h3>
+  <p><strong>What this does / why:</strong> the MCP server needs a Python virtual environment with a few libraries, plus a prebuilt search index over the VB API docs. Building the env is one command.</p>
+  <pre><code>setup_env.bat
+  # = uv venv  +  uv pip install -r src\vb_docs\pyproject.toml
+  # produces .venv\Scripts\python.exe</code></pre>
+  <h4>Dependencies + role</h4>
+  <table>
+    <tr><th>Package</th><th>Role</th></tr>
+    <tr><td><code>mcp&gt;=1.24.0</code></td><td>Model Context Protocol SDK / server framework.</td></tr>
+    <tr><td><code>sentence-transformers&gt;=2.2.0</code></td><td>Embeddings &mdash; model <code>all-MiniLM-L6-v2</code>, 384-dim.</td></tr>
+    <tr><td><code>faiss-cpu&gt;=1.7.0</code></td><td>Vector similarity index (<code>IndexFlatIP</code>, cosine).</td></tr>
+    <tr><td><code>beautifulsoup4</code> + <code>lxml</code></td><td>Parse the VB API HTML docs.</td></tr>
+    <tr><td><code>truststore&gt;=0.10.0</code></td><td>Uses the Windows cert store &mdash; survives the corporate SSL proxy.</td></tr>
+  </table>
+  <h4>Prebuilt index <span class="pill ok">committed</span></h4>
+  <p>Already committed for Creo 12.4.3.0 &mdash; <strong>skip rebuilding unless your Creo differs.</strong></p>
+  <table>
+    <tr><th>File</th><th>Size</th><th>What it is</th></tr>
+    <tr><td><code>index/faiss.index</code></td><td>4.0 MB</td><td>Vector index.</td></tr>
+    <tr><td><code>index/chunks.pkl</code></td><td>1.3 MB</td><td>Parsed doc chunks.</td></tr>
+    <tr><td><code>index/function_lookup.json</code></td><td>63 KB</td><td>O(1) exact-name lookup (1,882 names).</td></tr>
+    <tr><td><code>index/metadata.json</code></td><td>&mdash;</td><td>Build provenance.</td></tr>
+  </table>
+  <p><strong>Index stats:</strong> 2,626 chunks = 793 API interfaces/classes/enums + 522 manual sections + 251 code examples.</p>
+  <p><strong>Only if on a different Creo version:</strong> edit <code>VBAPIDOC_PATH</code> + <code>EXAMPLES_PATH</code> in <code>build_index.bat</code>, then run it (~5&ndash;10 min). Verify with:</p>
+  <pre><code>.venv\Scripts\python.exe src\vb_docs\vb_doc_search.py
+  # try: "RunMacro", "IpfcModel", "how do I create a new part?"</code></pre>
+  <div class="callout tip">
+    <div class="t">What the semantic search actually does</div>
+    The VB API HTML docs are parsed into chunks; each chunk is embedded into a 384-dim vector by <code>all-MiniLM-L6-v2</code> and stored in a FAISS cosine index. Your query is embedded the same way and the nearest chunks are returned (&lt;0.1 ms/query). <code>function</code> mode instead does a direct name&rarr;doc lookup.
+  </div>
+</section>
+
+<section class="block">
+  <h3>6. Register vb-docs in Claude Code (stdio)</h3>
+  <p><strong>What this does / why:</strong> this tells Claude Code how to launch the local server so its one tool becomes available in your sessions.</p>
+  <div class="callout warn">
+    <div class="t">Use the direct venv python path</div>
+    Point at the <code>.venv</code> python directly &mdash; NOT <code>uv run</code>. It is more reliable: no dependency resolution at launch, no working-directory dependency.
+  </div>
+  <p>Add to <code>~/.claude.json</code>:</p>
+  <pre><code>"mcpServers": {
+  "vb-docs": {
+    "type": "stdio",
+    "command": "C:\\Users\\mmohapatra\\creo_vb_api_docs_mcp\\.venv\\Scripts\\python.exe",
+    "args": ["C:\\Users\\mmohapatra\\creo_vb_api_docs_mcp\\src\\vb_docs\\mcp_server.py"]
+  }
+}</code></pre>
+  <p>Or register via CLI:</p>
+  <pre><code>claude mcp add vb-docs --scope user -- "C:\Users\YOUR_USERNAME\creo_vb_api_docs_mcp\.venv\Scripts\python.exe" "C:\Users\YOUR_USERNAME\creo_vb_api_docs_mcp\src\vb_docs\mcp_server.py"</code></pre>
+  <p>Restart Claude Code. It exposes ONE tool: <code>query_vb_api_docs</code> (<code>query</code> required; <code>mode</code> = <code>auto</code>|<code>function</code>|<code>semantic</code>, default <code>auto</code>; <code>limit</code> 1&ndash;20, default 5).</p>
+</section>
+
+<section class="block">
+  <h3>7. What MCP is</h3>
+  <div class="callout tip">
+    <div class="t">Model Context Protocol, in one line</div>
+    MCP is a standard by which a &ldquo;server&rdquo; exposes tools/resources to Claude Code. <strong>vb-docs</strong> is a LOCAL <span class="pill local">stdio</span> server (a Python process on your machine); the Leap fleet below are HOSTED <span class="pill">http</span> servers.
+  </div>
+</section>
+
+<section class="block">
+  <h3>8. The Leap platform MCP servers</h3>
+  <p><strong>What this does / why:</strong> these hosted servers reach Blue Origin systems (PLM, GitLab, Jira, docs). They live at <code>mcp.leap.blueorigin.com</code> and auth rides your Claude Code / claude.ai login.</p>
+  <table>
+    <tr><th>Server</th><th>What it reaches</th><th>Note</th></tr>
+    <tr><td><code>bluegpt</code></td><td>BlueGPT agents, artifacts, models, SWE agent jobs.</td><td>also the judge backend</td></tr>
+    <tr><td><code>blue_docs</code></td><td>Enterprise doc KB &mdash; governance, specs, command media.</td><td></td></tr>
+    <tr><td><code>confluence</code></td><td>Pages / spaces.</td><td></td></tr>
+    <tr><td><code>gitlab</code></td><td>Blue Origin GitLab &mdash; MRs, pipelines, vulns.</td><td>upstream baseline + SWE agent</td></tr>
+    <tr><td><code>its</code></td><td>Jira / ITS &mdash; issues, sprints, service desk.</td><td></td></tr>
+    <tr><td><code>windchill</code></td><td>PLM: parts, EBOM, change notices, where-used.</td><td></td></tr>
+    <tr><td><code>nova_search</code></td><td>Enterprise knowledge search (Sinequa).</td><td></td></tr>
+    <tr><td><code>microsoft_sharepoint</code></td><td>SharePoint / OneDrive files, lists, Excel.</td><td></td></tr>
+    <tr><td><code>microsoft_teams</code></td><td>Teams.</td><td><span class="pill auth">needs auth</span> &mdash; run its <code>authenticate</code> tool</td></tr>
+  </table>
+  <p>Register each:</p>
+  <pre><code>claude mcp add --transport http SERVER https://mcp.leap.blueorigin.com/SERVER/streamable-http/mcp/ --scope user</code></pre>
+  <p>Verify the whole fleet:</p>
+  <pre><code>claude mcp list</code></pre>
+  <p>Expect every server <span class="pill ok">&#10004; Connected</span>; Teams may show <span class="pill auth">! Needs authentication</span>.</p>
+  <div class="callout info">
+    <div class="t">Most relevant to drill-jig dev</div>
+    <code>windchill</code> (part numbers, EBOMs, bushing SKUs), <code>gitlab</code> (the upstream baseline + SWE agent), <code>bluegpt</code> (also the judge backend), and <code>nova_search</code> / <code>blue_docs</code> (find the mapkey / Creo automation references).
+  </div>
+</section>
+
+<section class="block">
+  <h3>9. Efficient querying &mdash; the whole point of vb-docs</h3>
+  <p><strong>Rule from <code>CLAUDE.md</code>:</strong> when writing or debugging VB API code, verify method signatures, parameters, and return types via vb-docs BEFORE relying on memory.</p>
+  <div class="grid2">
+    <div class="card">
+      <h4>Query modes</h4>
+      <ul>
+        <li><code>mode=function</code> &mdash; exact name lookup, O(1). Use for <code>IpfcSession</code>, <code>RunMacro</code>, <code>CMpfcSelect</code>, <code>EpfcModelType</code>.</li>
+        <li><code>mode=semantic</code> &mdash; natural language. Use for &ldquo;how to create a feature&rdquo;.</li>
+        <li><code>mode=auto</code> &mdash; default; picks for you.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h4>Keep it cheap</h4>
+      <ul>
+        <li>Query narrow &mdash; one symbol or concept.</li>
+        <li>Take the top hit; use a small <code>limit</code>.</li>
+        <li>For a <code>CMpfc*</code> / <code>CCpfc*</code> class factory, confirm the real ProgID &mdash; those are <em>never</em> standalone ProgIDs.</li>
+      </ul>
+    </div>
+  </div>
+  <p>The confirmed-facts registry <code>lib\creo_api_facts.json</code> (query via <code>lib\creo_api_facts.ps1</code>) records live-verified and refuted API facts &mdash; e.g. &ldquo;plane normals read null on this build&rdquo;, &ldquo;<code>IpfcPoint.Point</code> crashes&rdquo;, &ldquo;use the <code>pfcls.pfcRegenInstructions</code> ProgID, not <code>CC*</code>&rdquo;. Auto-approve the tool so lookups never prompt &mdash; in the repo&rsquo;s <code>.claude\settings.local.json</code>: <code>permissions.allow = ["mcp__vb-docs__query_vb_api_docs"]</code>. The vb-docs repo also ships slash commands / a skill: <code>/creo-pwsh-vb-session</code>, <code>/creo-pwsh-vb-debug</code>, and the <code>creo-vb-api</code> skill.</p>
+</section>
+
+<section class="block">
+  <h3>10. The F8 interactive loop</h3>
+  <p><strong>What this does / why:</strong> instead of guessing, you run tiny snippets against the <em>live</em> Creo session and watch what real COM objects return.</p>
+  <ol class="steps">
+    <li>Open a <code>.ps1</code> in VS Code; start Creo with a model open.</li>
+    <li>Ask Claude for a snippet (e.g. the connection code).</li>
+    <li>Select the lines and press <kbd>F8</kbd> &mdash; the PowerShell extension runs the selection against the LIVE Creo session.</li>
+    <li>Explore any COM object with <code>$model | Get-Member</code>.</li>
+    <li>Iterate: Write &rarr; <kbd>F8</kbd> &rarr; Observe &rarr; Ask &rarr; repeat. Paste any error back for a docs-grounded fix.</li>
+  </ol>
+  <div class="callout info">
+    <div class="t">Mine trails, don&rsquo;t guess widgets</div>
+    Mapkey widget names come from RECORDING real Creo interactions (<code>visible_mapkeys yes</code> in <code>config.pro</code>) and reading <code>working_folder\trail.txt.N</code>. The probe/recorder <code>*-probe.cmd</code> tools capture the exact tokens.
+  </div>
+</section>
+
+<section class="block">
+  <h3>11. The BlueGPT judge / blind-evaluator convergence layer</h3>
+  <div class="callout tip">
+    <div class="t">Confirm results without seeing how they were made</div>
+    <code>lib\blind_evaluator.ps1</code> derives a claim, measures ground-truth geometry into a &ldquo;slice&rdquo;, and asks an LLM judge to confirm or refute WITHOUT seeing how the claim was produced.
+  </div>
+  <p>Config resolves first-match-wins:</p>
+  <ol>
+    <li><code>.bluegpt_judge.json</code> at the repo root (gitignored secret; optional).</li>
+    <li><code>ANTHROPIC_BASE_URL</code> + <code>ANTHROPIC_AUTH_TOKEN</code> &mdash; already set by Claude Code (they point at <code>litellm.leap.blueorigin.com</code>), so this is the <strong>zero-config path in use</strong>.</li>
+    <li><code>BLUEGPT_API_BASE</code> + <code>BLUEGPT_API_KEY</code> explicit override.</li>
+  </ol>
+  <p>If none resolve it degrades to offline (writes its packet, skips the network) &mdash; it never fails a run. Transport is LiteLLM, OpenAI-compatible: <code>POST {base}/v1/chat/completions</code>, <code>Authorization: Bearer &lt;token&gt;</code>, <code>response_format = json_schema</code> (strict). Validate the round-trip:</p>
+  <pre><code>.\plane-probe.cmd --probe-judge</code></pre>
+</section>
+
+<section class="block">
+  <h3>12. Run tools + the offline tests</h3>
+  <p><strong>What this does / why:</strong> most tools just want Creo + the jig part loaded; the test suites run with no Creo and no network so you can develop safely offline.</p>
+  <p>Double-click any <code>.cmd</code> with Creo + the jig part loaded &mdash; each connects, does its job, and disconnects.</p>
+  <p>Offline unit tests (no Creo, no network) &mdash; 17 suites:</p>
+  <pre><code>powershell -ExecutionPolicy Bypass -File lib\tests\run_tests.ps1</code></pre>
+  <p>Companion suites: <code>run_wizard_tests.ps1</code> (464 cases), <code>run_csys_tests.ps1</code> (155), <code>run_orthogrid_tests.ps1</code>, <code>run_fastener_tests.ps1</code>, plus <code>bushing</code> / <code>conformal_blank</code> / <code>curved_*</code> / <code>drilljig3d_*</code> / <code>hole_layout</code> / <code>index_frame</code> / <code>jig_tree</code> / <code>response</code> / <code>tangent_plane</code>. <code>fuzz_gui</code> / <code>fuzz_curved_gui</code> render the real wizard steps headless to catch scope/closure bugs.</p>
+</section>
+
+<section class="block">
+  <h3>13. Safety rules</h3>
+  <div class="callout danger">
+    <div class="t">Never mutate a live model without intent</div>
+    <ul>
+      <li>Do not auto-run <code>$model.Regenerate($null)</code> (can corrupt a half-committed model), <code>$model.Save()</code> (permanent), or trail commands prefixed <code>&lt;</code> <code>@</code> <code>**</code> (view-dependent / unsafe to replay).</li>
+      <li><strong>ID-only, never coordinates:</strong> <code>IpfcPoint.Point</code> crashes; foreign / imported bodies are not API-traversable &mdash; select by ID and let the human judge geometry.</li>
+      <li><strong>Atomic RunMacro:</strong> a dashboard&rsquo;s command context does NOT survive across <code>RunMacro</code> calls &mdash; fire open&rarr;set&rarr;confirm as one string.</li>
+      <li><strong>Honest verification:</strong> &ldquo;done&rdquo; means the model actually changed (a <code>VersionStamp</code> canary) or geometry was measured &mdash; never &ldquo;the macro fired&rdquo;.</li>
+      <li><strong>Close modal Creo dialogs</strong> (Parameters / Relations / Find) before an API call or it can hang.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="block">
+  <h3>14. Canary gating</h3>
+  <div class="callout tip">
+    <div class="t">A no-op macro aborts &mdash; it never lies</div>
+    Every model-mutating macro is guarded by a <code>VersionStamp</code> / feature-diff canary. A macro that changes nothing (e.g. a mis-named widget) ABORTS and reports; it never silently no-ops or falsely claims success.
+  </div>
+</section>
+
+<section class="block">
+  <h3>15. Troubleshooting</h3>
+  <table>
+    <tr><th>Symptom</th><th>Fix</th></tr>
+    <tr><td>&ldquo;Cannot create COM object <code>pfcls.pfcAsyncConnection</code>&rdquo;</td><td>Run <code>vb_api_register.bat</code> as Administrator.</td></tr>
+    <tr><td>&ldquo;Cannot find Creo process&rdquo;</td><td>Start Creo first; exactly one <code>xtop.exe</code>.</td></tr>
+    <tr><td>vb-docs not appearing</td><td>Check the venv python + <code>mcp_server.py</code> paths, restart Claude Code, <code>claude mcp list</code>.</td></tr>
+    <tr><td>&ldquo;uv not in PATH&rdquo;</td><td>Install uv, reopen the shell.</td></tr>
+    <tr><td>&ldquo;Virtual environment not found&rdquo;</td><td>Run <code>setup_env.bat</code>.</td></tr>
+    <tr><td>Poor search / wrong Creo</td><td>Update paths in <code>build_index.bat</code> and rerun.</td></tr>
+    <tr><td>SSL / cert errors</td><td><code>truststore</code> should use the Windows cert store automatically.</td></tr>
+    <tr><td><kbd>F8</kbd> does nothing</td><td>Install the VS Code PowerShell extension.</td></tr>
+    <tr><td>Creo API call hangs</td><td>Close any modal Creo dialog.</td></tr>
+    <tr><td>Teams MCP &ldquo;Needs authentication&rdquo;</td><td>Run its <code>authenticate</code> tool.</td></tr>
+  </table>
+</section>

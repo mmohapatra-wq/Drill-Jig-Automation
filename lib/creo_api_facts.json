@@ -778,6 +778,16 @@
       "symbols": ["ProCmdDatumPlane", "Odui_Dlg_00", "constr_type1_OPTMENU1", "Tangent", "t1.constrs_table", "stdbtn_1"],
       "evidence": "Operator-supplied mapkey recording 2026-07-24 (docs\\tangent_plane_at_point_on_surface.mapkey.txt). The by-ID reference feed (accumulate surface + point via Get-SelectByIdMacro -NoClear) is the SAME channel proven for point-at-3-plane-intersection-by-id + csys-at-3-plane-intersection, LIVE-UNVERIFIED for THIS command -- a tangent-plane-probe (tangent-plane-probe.cmd) must confirm the ref/row correspondence + that a new plane appears (feature-diff canary) before it is trusted. Wired into lib/tangent_plane.ps1 (Build-TangentPlaneMacro / Invoke-TangentPlane).",
       "verifiedOn": null
+    },
+    {
+      "id": "hole-by-reference-and-direction",
+      "category": "mapkey",
+      "status": "docs-only",
+      "fact": "A hole can be placed BY REFERENCE + DIRECTION (distinct from the On-Point Build-HoleMacro recipe): ProCmdHole then, on page hole_fb_plcmnt_page.3.0, PH.ui_hole_prim_ref_cui_lst = the PRIMARY/PLACEMENT reference collector (fed the datum point, which stays selected after its stdbtn_1) and PH.ui_hole_ft_dir_cui_lst = the FEATURE-DIRECTION collector (the drill orientation reference). The direction reference is an @PAUSE_FOR_SCREEN_PICK in the recording -- a picked surface/plane/axis on the drilljig part -- so the recipe MUST split around that pick (a RunMacro cannot screen-pick). Confirm with dashInst0.Done (Enter/Exit dashInst0.Quit are hover/blur, not cancel). This is the AFTER-surface curved-jig workflow: fastener TOP/SIDE/FRONT planes -> ProCmdDatumPointGeneral+stdbtn_1 intersection point -> this hole drilled THROUGH the drilljig part in the picked orientation.",
+      "antipattern": "Assuming the On-Point Build-HoleMacro (hole_depth_to_type_flybtn + StrHoleDepThruAll + body_page) is the only hole recipe -- this reference/direction placement is a different collector page (hole_fb_plcmnt_page.3.0). Also: trying to replay the direction reference as a scripted token instead of an operator screen pick (or a not-yet-recorded by-ID feed). Also: relying on the fragile PHTLeft.AssyTree tree-node keys (T3 6 0) to select the fastener planes -- select from the known fastener component (Path/ComponentIds) instead. The recording sets NO diameter/depth/body (dashboard defaults); a production tool adds those.",
+      "symbols": ["ProCmdHole", "hole_fb_plcmnt_page.3.0", "PH.ui_hole_prim_ref_cui_lst", "PH.ui_hole_ft_dir_cui_lst", "ProCmdDatumPointGeneral", "stdbtn_1", "dashInst0.Done", "dashInst0.Quit", "PHTLeft.AssyTree"],
+      "evidence": "Operator-supplied mapkey recording 2026-07-27 (docs\\curved_hole_from_fastener_planes.mapkey.txt, mapkey 'curvedholes'). The datum-point half reuses the confirmed point-at-3-plane-intersection-by-id command. LIVE-UNVERIFIED for the assembly component-plane point + this hole recipe -- probes\\curvedhole-probe.cmd settles it: select a fastener's 3 planes, fire the point (ITEM_POINT diff canary), then the hole (feature-diff canary, operator picks the direction). Related: fastener-assembly-component-path-transform (which fastener), tangent-plane-at-point-on-surface (the alternate normal-plane route).",
+      "verifiedOn": null
     }
   ]
 }

@@ -1,0 +1,138 @@
+<h2 class="sec">Roadmap</h2>
+
+<p>This tab collects candidate improvements, honestly labelled by status and effort. Items marked <span class="pill ok">done</span> are already implemented; everything else is a proposal. Where a step still needs a live Creo recording or a live probe to confirm the load-bearing assumption, it is called out explicitly. Nothing here is a promise of a ship date &mdash; it is a prioritized backlog.</p>
+
+<div class="callout info">
+  <div class="t">Sourcing caveat</div>
+  The numeric jig-design rules used below &mdash; edge margin, center distance, normality tolerance, press-fit interference, and 3-2-1 locating &mdash; are long-established jig-and-fixture practice (Hoffman, <em>Jig and Fixture Design</em>; ASME B94.33; vendor catalogs). They could <strong>not</strong> be re-verified live during the research run (WebSearch was down at the time; the only hard numbers that came through were from Carr Lane's &ldquo;Understanding Standard Drill Bushing Types&rdquo;). Treat every number below as an <strong>editable default</strong>, not a hard constant.
+</div>
+
+<section class="block">
+  <h2 class="sec">1. The curved / conformal jig (drilljig3d) &mdash; the biggest frontier</h2>
+
+  <p>A curved jig can't be a flat plate. So instead of building a box, the 3D pipeline builds a <strong>conformal blank</strong>: it copies the part's curved face (offset surface / quilt), then thickens that into a new solid body that follows the curvature. The bushing holes are then driven <em>normal to that surface</em> rather than normal to a flat top.</p>
+
+  <p>Where it stands: <strong>STAGE 1</strong> (offset-surface + thicken &rarr; new body, flipped away from the part) and <strong>STAGE 2</strong> (On-Point holes normal-to-surface via surface pre-select) are confirmed working live (2026-06-24). The biggest open correctness question is simple to state and load-bearing: <em>does pre-selecting the surface truly orient each hole normal to the face, or does Creo quietly fall back to its own default?</em></p>
+
+  <h3>Already implemented</h3>
+  <ul>
+    <li><span class="pill ok">done</span> Per-hole orientation surface (mode 2) &mdash; pairs each point with its own host surface.</li>
+    <li><span class="pill ok">done</span> Hole-count + diameter blind-evaluator gate &mdash; counts cylinders at the target radius before and after; the delta must equal the intended count.</li>
+    <li><span class="pill ok">done</span> Standoff / chip-clearance offset &mdash; default <code>0</code> = flush; a value <code>&gt;0</code> floats the jig off the part.</li>
+    <li><span class="pill ok">done</span> Bushing-OD handoff pre-fill &mdash; reads <code>last_jig_spec.json</code> to pre-fill the seat diameter.</li>
+    <li><span class="pill ok">done</span> Thickness-vs-bushing sanity guidance &mdash; soft-warns when a wall is too thin for the chosen bushing.</li>
+  </ul>
+
+  <h3>Top next recommendations (priority order)</h3>
+  <table>
+    <tr><th>Item</th><th>Effort</th><th>Needs a live recording?</th><th>What / why</th></tr>
+    <tr>
+      <td>Per-hole orientation surface</td>
+      <td>medium</td>
+      <td>no</td>
+      <td>Pair <strong>each</strong> point with its host surface so curved spans stay truly conformal. STAGE 2 currently uses the first surface's normal for every hole.</td>
+    </tr>
+    <tr>
+      <td><code>--probe-orient</code> diagnostic</td>
+      <td>medium</td>
+      <td>yes</td>
+      <td>Pin the load-bearing assumption: drill one hole, read its cylinder axis (<code>Get-CylinderAxes</code>, confirmed) and compare to the surface normal from <code>IpfcSurface.Eval3DData</code> (docs-only, needs a live check). <code>-defaultorient</code> is the existing fallback.</td>
+    </tr>
+    <tr>
+      <td>Hole-count + bore-diameter blind-evaluator gate</td>
+      <td>medium</td>
+      <td>no</td>
+      <td>Replace &ldquo;macros fired&rdquo; with measured truth: <code>Count-Cylinders</code> at the target radius, gated on count <em>and</em> diameter. Degrade to UNVERIFIED / yellow on a 0-surface walk &mdash; never green.</td>
+    </tr>
+  </table>
+
+  <h3>Quick wins</h3>
+  <ul>
+    <li>Auto-round the blank's sharp edges &mdash; reuse <code>Invoke-AutoCornerRound</code> from the flat sibling. Opt-in, since it mutates geometry.</li>
+    <li>STAGE-1 single-new-body + volume gate &mdash; assert exactly <strong>one</strong> new body of non-zero volume, catching a thicken that produced nothing or merged into the source.</li>
+  </ul>
+
+  <h3>Bigger bets</h3>
+  <div class="grid2">
+    <div class="card">
+      <h4>Counterbore / bushing-seat (stepped bore)</h4>
+      <p>What makes the jig actually <strong>hold</strong> a bushing: a counterbore at the bushing OD, depth = bushing length, over a smaller thru clearance hole.</p>
+      <p><strong>Route B</strong> (a second coaxial On-Point hole at a blind depth) reuses <code>Build-NormalHoleMacro</code> and needs only a blind-depth flyout recording. <strong>Route A</strong> (a native counterbore profile) is cleaner geometry but its widgets are unrecorded.</p>
+    </div>
+    <div class="card">
+      <h4>Headed-bushing counterbore + catalog data layer</h4>
+      <p><span class="pill wip">blocked on data, not code</span></p>
+      <p><code>HeadDia</code>, <code>HeadHeight</code>, <code>PressFitHoleDia</code>, <code>PressFitTol</code>, and <code>FitClass</code> are not in either CSV &mdash; all seeded rows are slip / liner, zero headed. Add the columns from a vendor spec plus a press-fit interference offset (Carr Lane: 0.0005&ndash;0.0008&Prime; headless, 0.0003&ndash;0.0005&Prime; headed).</p>
+    </div>
+    <div class="card">
+      <h4>Locating / registration (3-2-1)</h4>
+      <p>A conformal face alone leaves the jig free to slide and rotate. Locating-pin holes = a second labelled STAGE-2 pass at an independent diameter (zero new mapkeys).</p>
+      <p>Round-vs-diamond-pin and 3-2-1 layout stay <em>design guidance the tool surfaces</em>, not geometry it computes &mdash; keep it a human pick.</p>
+    </div>
+    <div class="card">
+      <h4>Auto-generate the hole grid on the curved face</h4>
+      <p><span class="pill wip">highest risk</span></p>
+      <p>Bridge the flat orthogrid GUI + seed&rarr;pattern into the 3D tool. The hard part: an orthogonal X/Z grid doesn't map cleanly onto a curved face, and a Direction-pattern keeps <em>direction</em>, not per-member normality. <code>Build-PointPatternMacro</code> widgets are UNVERIFIED &mdash; keep <code>Invoke-ManualPointGrid</code> as the guaranteed path.</p>
+    </div>
+    <div class="card">
+      <h4>Stamp bushing identity as Creo parameters</h4>
+      <p>Write <code>BUSHING_PN</code> / <code>OD</code> / <code>ID</code> / <code>LEN</code> / <code>DRILL_SIZE</code> so the jig self-documents.</p>
+      <p>The param-create API is unverified on this build &mdash; confirm live or fall back to a <code>*_jig_spec.json</code> sidecar.</p>
+    </div>
+  </div>
+
+  <h3>Hole-axis-normal verification gate</h3>
+  <p>High value, needs a live probe. For each drilled cylinder, read its axis (<code>Get-CylinderAxes</code>, confirmed) and compare to the local surface normal; apply a deterministic gate <code>|dot(axis, normal)| &gt;= cos(tol)</code>. This converts the currently-eyeballed normality claim into a measured one.</p>
+  <p>Blocked on the <code>Eval3DData</code> normal read being usable on this build (and on <code>IpfcForeignSurface</code>) &mdash; the <code>--probe-orient</code> item settles it. Pair it with a thru-all &ldquo;broke through&rdquo; gate via a <code>GetMassProperty().Volume</code> delta.</p>
+
+  <h3>Open questions (settle before the dependent items)</h3>
+  <ol>
+    <li>Does pre-selecting the surface orient the On-Point hole normal, or take Creo's default?</li>
+    <li>Does <code>IpfcSurface.Eval3DData(EvalParameters(p)).Normal</code> return a usable normal on this build, including <code>IpfcForeignSurface</code>?</li>
+    <li>Does an On-Point HOLE diameter dim hold a feature-level <code>DimValue</code> write, or snap back?</li>
+    <li>Is <code>.Volume</code> readable on <code>GetMassProperty($null)</code>?</li>
+    <li>Are headed / press-fit bushings actually in scope (the catalog has zero headed rows)?</li>
+  </ol>
+
+  <div class="callout warn">
+    <div class="t">Deliberately NOT recommended</div>
+    <strong>Copy / Publish Geometry</strong> &mdash; a multi-model construct that conflicts with the <code>.asm</code> guard and the ID-only-against-active-model design. <strong>Wrap / Flatten Quilt</strong> &mdash; wrong direction: these map flat geometry onto a surface, not the inverse a conformal jig needs.
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">2. Flat-pipeline reliability items still open</h2>
+  <table>
+    <tr><th>Item</th><th>Status</th><th>Note</th></tr>
+    <tr>
+      <td>Sketch-dimension writes</td>
+      <td><span class="pill wip">in progress</span></td>
+      <td>The project's hardest problem: Creo discards <code>DimValue</code> writes on sketch dims unless done with the sketch <strong>open</strong> and a <code>Regenerate</code> called while still open. diminator's Pass 2 (sketch dims) and boxinator's in-sketch <code>ProCmdSketModifyDim</code> are applied but not yet confirmed working; multiple scripts are converging on this flow.</td>
+    </tr>
+    <tr>
+      <td>Index-csys re-reference (flat step 10, optional)</td>
+      <td><span class="pill wip">live-unverified</span></td>
+      <td>Changing the base coordinate system onto the index hole via a baked file transform (<code>info.trf</code>) is canary-gated but not live-confirmed. The geometry-preserving path is to pick the index hole <strong>up front</strong> (so the base csys is built at it and nothing moves). How the plate behaves under the base transform is a live-verify item.</td>
+    </tr>
+    <tr>
+      <td>Csys-referenced datum points (optional step 11)</td>
+      <td><span class="pill wip">best-guess widgets</span></td>
+      <td>The &ldquo;Datum Point &rarr; Offset Coordinate System&rdquo; dialog widgets are a best guess (no recording yet); the step is canary-gated so it reports if it created nothing. To lock it: record one such feature with <code>visible_mapkeys yes</code> and transcribe the trail.</td>
+    </tr>
+    <tr>
+      <td>WebView2 offline 3D preview</td>
+      <td><span class="pill wip">unverified offline</span></td>
+      <td>The virtual-host mapping (serving <code>docs/</code> under <code>https://drilljig.local/</code> so the preview's ES-module three.js can import) is a strict superset that degrades to the <code>file://</code> note. Confirm it actually renders on a real GUI run.</td>
+    </tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">3. Cross-cutting ideas</h2>
+  <ul>
+    <li>Richer bushing catalog data (headed / press-fit rows, fit classes) to unlock counterbores.</li>
+    <li>Parameter-stamping the jig for traceability.</li>
+    <li>More probe-captured mapkeys, to move &ldquo;unverified&rdquo; legs to &ldquo;verified&rdquo;.</li>
+    <li>Extending the blind-evaluator gates to more stages, so &ldquo;done&rdquo; always means &ldquo;measured&rdquo;.</li>
+  </ul>
+</section>

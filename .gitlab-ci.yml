@@ -1,0 +1,46 @@
+# ============================================================================
+# Auto-publish the Drill-Jig handbook.
+# On each push to the default branch, rebuild the handbook (handbook/build.ps1)
+# from the CURRENT repo and push the fresh index.html into the separate
+# `drilljig-handbook` project, whose own `pages` job then redeploys the site.
+#
+# ONE-TIME PREREQUISITES (set these once, or the job can't run/push):
+#   1. A GitLab runner available to THIS project (Linux + Docker executor).
+#   2. CI/CD variable  HANDBOOK_PUSH_TOKEN  (Settings -> CI/CD -> Variables, MASKED):
+#        a Project Access Token created in the `drilljig-handbook` project with
+#        role = Maintainer and scope = write_repository (needed to push to its
+#        protected `main`).
+#
+# NOTE: the wizard SCREENSHOTS are committed under handbook/shots (rendering them
+# needs Windows/WinForms, which a Linux runner can't do). Refresh them when the GUI
+# changes by running `handbook/build.ps1 -Shots` on a Windows machine and committing.
+# Everything else (the downloads, the tool catalog, the dev guide) rebuilds here.
+# ============================================================================
+
+stages: [publish]
+
+publish-handbook:
+  stage: publish
+  image: mcr.microsoft.com/powershell:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git ca-certificates >/dev/null
+  script:
+    # 1. rebuild the handbook from this repo's current state
+    - pwsh -NoProfile -File handbook/build.ps1 -Out out/index.html -Sha "$CI_COMMIT_SHORT_SHA"
+    # 2. push the fresh index.html into the drilljig-handbook repo (Pages source)
+    - git clone --depth 1 "https://oauth2:${HANDBOOK_PUSH_TOKEN}@gitlab.blueorigin.com/mmohapatra/drilljig-handbook.git" hb
+    - cp out/index.html hb/public/index.html
+    - cd hb
+    - git config user.email "handbook-ci@blueorigin.com"
+    - git config user.name  "Handbook CI"
+    - git add public/index.html
+    - |
+      if git diff --cached --quiet; then
+        echo "handbook unchanged - nothing to publish"
+      else
+        git commit -m "Auto-update handbook from ngs-orthogrid-automation@${CI_COMMIT_SHORT_SHA}"
+        git push origin HEAD:main
+        echo "handbook published -> drilljig-handbook (Pages will redeploy)"
+      fi

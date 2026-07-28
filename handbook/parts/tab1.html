@@ -1,0 +1,534 @@
+<p>The flat drill-jig wizard (<code>drilljig-gui</code>) walks you screen-by-screen from a blank jig part to a fully drilled, chip-relieved guide plate. It automates a live Creo session for the geometry-build steps, while doing all the layout math and 2D/3D previews itself. This tab is the operator manual: every button, every stage, every prompt.</p>
+
+<div class="dlrow">
+  <button class="dlbtn" onclick="dl('pl_gui_zip')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg> Download drilljig-gui.zip (self-contained bundle) <span class="sz">~0.72 MB</span></button>
+</div>
+<p><small>This zip is the <code>.cmd</code> launcher plus all resources &mdash; 11 PowerShell libs, bushing catalogs, the decision tree, the WebGL preview page, vendored three.js v0.160.0, and the WebView2 SDK (x64). No network access, scavenges nothing.</small></p>
+
+<section class="block">
+  <h2 class="sec">1. What you need on the machine</h2>
+  <p>The zip is self-contained, but it cannot ship these &mdash; they must already be present on the workstation:</p>
+  <table>
+    <tr><th>Requirement</th><th>Notes</th></tr>
+    <tr><td>Creo Parametric 12.4.3.0</td><td>The CAD app the tool automates (through its built-in VB API).</td></tr>
+    <tr><td>A running Creo session</td><td>Open the jig <strong>part</strong> (<code>.prt</code>) before launching; the wizard connects to it.</td></tr>
+    <tr><td>The downloaded <code>drilljig-gui.zip</code></td><td>Extracted to a folder you can write to.</td></tr>
+    <tr><td>Windows PowerShell</td><td>Runs the launcher and the GUI. Built into Windows.</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">2. Quick start</h2>
+  <ol class="steps">
+    <li>Extract the folder anywhere <strong>writable</strong> (Desktop or Documents &mdash; not a locked/protected path).</li>
+    <li>Open Creo and open the jig <strong>PART</strong> (<code>.prt</code>, not <code>.asm</code>).</li>
+    <li>Double-click <code>drilljig-gui.cmd</code>.</li>
+    <li>Walk the wizard: Welcome &rarr; Import &rarr; Bushing &rarr; Layout &rarr; Overview &rarr; Datums &rarr; Box &rarr; Drill &rarr; Relief &rarr; Done.</li>
+  </ol>
+  <h4>Where files are written</h4>
+  <table>
+    <tr><th>Path</th><th>What</th></tr>
+    <tr><td><code>&lt;extract folder&gt;\fastener_layout.json</code></td><td>Saved layout &mdash; only when you use fastener import.</td></tr>
+    <tr><td><code>%TEMP%\drilljig-gui-error.log</code></td><td>Error log.</td></tr>
+    <tr><td><code>%TEMP%\drilljig_wv2_welcome</code></td><td>WebView2 data (Welcome render).</td></tr>
+    <tr><td><code>%TEMP%\drilljig_wv2_overview</code></td><td>WebView2 data (Overview render).</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">3. The window at a glance</h2>
+  <p>The wizard opens <strong>maximized</strong>. There are three regions:</p>
+  <div class="grid3">
+    <div class="card">
+      <h4>TOP &mdash; breadcrumb rail</h4>
+      <p>10 stage pills: Welcome, Import, Bushing, Layout, Overview, Datums, Box, Drill, Relief, Done.</p>
+      <ul>
+        <li>Done = green check</li>
+        <li>Active = blue halo</li>
+        <li>Future = hollow</li>
+      </ul>
+      <p>The rail is <strong>clickable</strong>: click a pill to jump <strong>back</strong> to any stage you have already reached. You can never skip <strong>ahead</strong> past setup you have not done.</p>
+    </div>
+    <div class="card">
+      <h4>CENTER &mdash; canvas</h4>
+      <p>Swaps per step; scrolls if a step is tall. This is where the choice cards, editors, and previews live.</p>
+    </div>
+    <div class="card">
+      <h4>BOTTOM &mdash; controls</h4>
+      <p>An honesty-chip band (status chips) + the <strong>Back / primary-button</strong> bar + a status line.</p>
+      <p>While Creo work runs, the canvas flips to a <strong>RUN view</strong> (progress marquee + live log) and <strong>all input is disabled</strong> (a busy guard) so a stray click cannot re-enter Creo.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">4. The buttons &mdash; global rules</h2>
+  <p>This is the heart of the tab. Four kinds of controls, plus the in-canvas prompts:</p>
+  <div class="grid2">
+    <div class="card">
+      <h4>PRIMARY button <span class="pill ok">right, blue</span></h4>
+      <p>Its <strong>label changes per step</strong> (Get started / Next / Continue to datums / Create planes + open sketcher / Finish + extrude / Drill the holes / Open the seed sketch / Finish the seed slot / Finish).</p>
+      <p><strong>Disabled</strong> until the step's condition is met &mdash; a bushing length chosen, a valid number typed, or a required Creo pick verified. Clicking it may run blocking Creo work (the RUN view appears).</p>
+    </div>
+    <div class="card">
+      <h4>BACK button <span class="pill local">left, slate w/ blue border</span></h4>
+      <p>Labelled <code>&lsaquo; Back</code>. Shown and enabled on <strong>every</strong> page except the first (Welcome), where there is nowhere to go.</p>
+      <p>Back is <strong>free</strong> &mdash; no confirmation dialog. Going Back <strong>never undoes Creo geometry</strong>; RUN steps are idempotent on re-entry and show an &ldquo;already built&rdquo; banner, so you can safely step back to re-read or change an earlier choice. (See &sect;6 for exactly when to use it.)</p>
+    </div>
+    <div class="card">
+      <h4>BREADCRUMB pills</h4>
+      <p>Click any <strong>already-reached</strong> stage to jump straight to it. Cannot jump forward past unfinished setup.</p>
+    </div>
+    <div class="card">
+      <h4>CHOICE CARDS</h4>
+      <p>Large clickable tiles. A <strong>green border</strong> marks the selected/preselected card, and every card <strong>lights green on hover</strong> so you always see the outline of the box you are about to pick.</p>
+      <p>Most cards act <strong>immediately</strong> when clicked (they re-render to drill deeper &mdash; e.g. the bushing tree &mdash; or advance).</p>
+      <div class="callout warn">
+        <div class="t">Exception: Layout tiles are radio-select</div>
+        Clicking a Layout tile only <strong>moves</strong> the green highlight. You press <strong>NEXT</strong> to commit the highlighted choice.
+      </div>
+    </div>
+  </div>
+  <div class="callout info">
+    <div class="t">In-canvas prompts (Yes / No / OK)</div>
+    These appear as an overlay <strong>inside</strong> the wizard window &mdash; never a separate popup that could hide behind Creo.
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">5. The honesty-chip colours (bottom band)</h2>
+  <p>The chips at the bottom report the true state of each piece of work &mdash; they never claim success they cannot back up. Legend:</p>
+  <table>
+    <tr><th>Dot</th><th>Meaning</th></tr>
+    <tr><td><span class="sw sw-gray"></span> gray</td><td>needs input &mdash; not provided yet</td></tr>
+    <tr><td><span class="sw sw-blue"></span> blue</td><td>set &mdash; provided, but not yet built in Creo</td></tr>
+    <tr><td><span class="sw sw-green"></span> green</td><td>built <strong>and</strong> verified</td></tr>
+    <tr><td><span class="sw sw-gold"></span> gold</td><td>built but could <strong>not</strong> be verified &mdash; check it in Creo</td></tr>
+    <tr><td><span class="sw sw-red"></span> red</td><td>a canary aborted the step &mdash; nothing was built</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">6. When (and how) to go back</h2>
+  <p>The wizard is built for &ldquo;change anything at any point.&rdquo; There are several backward moves, each for a different need &mdash; and going back <strong>never deletes Creo geometry</strong>, so it is always safe to look.</p>
+  <table>
+    <tr><th>Move</th><th>Where</th><th>What it does</th><th>Use it when&hellip;</th></tr>
+    <tr><td><code>&lsaquo; Back</code> (global)</td><td>bottom-left, every page after Welcome</td><td>Steps back one screen. Free; never undoes geometry.</td><td>you want to re-read or tweak the previous page.</td></tr>
+    <tr><td>Breadcrumb pill</td><td>top rail</td><td>Jumps straight to any <em>already-reached</em> stage.</td><td>you need to go several stages back (e.g. Overview &rarr; Bushing).</td></tr>
+    <tr><td><code>&lsaquo; Back</code> (in the bushing walk)</td><td>inside the Bushing cards</td><td>Undoes <strong>one</strong> tree answer (material / method / ID / OD / length).</td><td>you want to change a single bushing answer without restarting.</td></tr>
+    <tr><td>&ldquo;Start over&rdquo;</td><td>Bushing walk / confirm</td><td>Re-walks the whole tree from the material question.</td><td>you picked the wrong bushing <strong>type</strong> (see &sect;7).</td></tr>
+    <tr><td>&ldquo;Change selection&rdquo;</td><td>Bushing confirm card</td><td>Re-opens the walk.</td><td>you want a different confirmed bushing.</td></tr>
+    <tr><td>&ldquo;Change&rdquo;</td><td>Hole-to-edge margin / Slot depth</td><td>Re-opens that value&rsquo;s choice.</td><td>the margin or slot depth is wrong.</td></tr>
+    <tr><td>&ldquo;Change layout type&rdquo;</td><td>Layout editor</td><td>Returns to the four point-source tiles.</td><td>you chose the wrong point source.</td></tr>
+    <tr><td>Verify / flip prompt</td><td>first slot cut (step 15)</td><td>Flips the cut direction + reopens the sketcher.</td><td>the seed slot cut the wrong way or depth &mdash; no Back needed.</td></tr>
+  </table>
+  <div class="callout warn">
+    <div class="t">Special case &mdash; after the box is extruded (step 11)</div>
+    Once the plate is built, real geometry exists. You can still go Back (RUN steps are idempotent and show an &ldquo;already built&rdquo; banner), <strong>but re-editing an earlier value does not resize the already-built plate</strong> &mdash; e.g. the slot depth is <em>frozen</em> into the plate&rsquo;s pad at build time, and the slot-depth step then shows a &ldquo;plate already built &mdash; re-run to change&rdquo; note. To truly change a committed dimension, close and re-run the wizard (or edit the dimension in Creo).
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">7. The bushing selection, in depth</h2>
+  <p>The Bushing stage is a short decision walk that ends by resolving two numbers: the <strong>drilled hole diameter</strong> and the <strong>bushing length</strong>. What the walk shows you depends on <strong>two answers &mdash; material and drill method</strong>, because those decide <em>which kind of bushing</em> the jig is built around.</p>
+
+  <h3>The two bushing types</h3>
+  <div class="grid2">
+    <div class="card">
+      <h4>Sleeve (press-fit liner)</h4>
+      <p>A hardened sleeve is <strong>permanently pressed into the jig</strong>; the drill runs through its bore. Selection keys on the <strong>ID</strong> (the bore that guides the drill); the jig hole is bored to the sleeve&rsquo;s OD. From <code>data/bushings.csv</code>.</p>
+      <p class="muted">Used by: Metal&nbsp;&rarr;&nbsp;PFD, and both 3D-print methods.</p>
+    </div>
+    <div class="card">
+      <h4>Removable drill bushing</h4>
+      <p>A slip bushing that <strong>drops into the jig plate</strong>; the plate hole <strong>IS the bushing&rsquo;s OD</strong> (the bore ID doesn&rsquo;t matter to the plate). Selection keys on the <strong>OD</strong>, and only <code>1/2&Prime;</code> and <code>3/4&Prime;</code> ODs are offered. From <code>data/bushings_drill.csv</code>.</p>
+      <p class="muted">Used by: Metal&nbsp;&rarr;&nbsp;Hand&nbsp;drill.</p>
+    </div>
+  </div>
+
+  <h3>How material &times; drill method changes the options</h3>
+  <table>
+    <tr><th>Material</th><th>Drill method</th><th>Catalog you get</th><th>Keyed on</th><th>Sizes offered</th></tr>
+    <tr><td>Metal</td><td>PFD <span class="muted">(power-feed drill)</span></td><td>Sleeves</td><td>ID</td><td><code>3/4</code> ID</td></tr>
+    <tr><td>Metal</td><td>Hand drill</td><td>Removable drill bushings</td><td><strong>OD</strong> (= the drilled hole)</td><td><code>1/2</code>, <code>3/4</code> OD</td></tr>
+    <tr><td>3D print</td><td>PFD</td><td>Sleeves</td><td>ID</td><td><code>1/2</code>, <code>3/4</code> ID</td></tr>
+    <tr><td>3D print</td><td>Hand drill</td><td>Sleeves</td><td>ID</td><td><code>1/2</code>, <code>3/4</code> ID</td></tr>
+  </table>
+  <p><small><strong>PFD</strong> = power-feed drill (portable / power-feed); <strong>Hand drill</strong> = manual. Only <strong>Metal&nbsp;&rarr;&nbsp;Hand&nbsp;drill</strong> takes the OD-first removable path (it shows OD cards and skips the ID question, because the plate hole is the bushing OD). Every hole-size list also carries a trailing <strong>&ldquo;Custom hole OD&hellip;&rdquo;</strong> card &mdash; type any diameter and the tool shows a bold &ldquo;verify a real bushing exists&rdquo; warning, since no catalog SKU backs a typed size. And the material choice echoes later: <strong>3D-print</strong> jigs auto-add chip-relief slots, while <strong>metal</strong> jigs are asked.</small></p>
+
+  <h3>The walk, screen by screen</h3>
+  <p class="seq-cap">Click any screenshot to enlarge. The exact middle screens depend on your material &times; method answers (OD cards vs ID cards).</p>
+  <div class="shots">
+    <figure class="shot"><img loading="lazy" alt="Material card" data-shot="03-bushing-cards.png"><figcaption><b>1 &middot; Material</b> &mdash; Metal vs 3D print. This is the first card of the walk.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Drill method card" data-shot="03b-bushing-drillmethod.png"><figcaption><b>2 &middot; Drill method</b> &mdash; PFD vs Hand drill. Together with the material, this picks the catalog.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="OD catalog cards" data-shot="03c-bushing-od-cards.png"><figcaption><b>3a &middot; OD path</b> (Metal&nbsp;&rarr;&nbsp;Hand drill) &mdash; pick the removable-bushing <strong>OD</strong>; the drilled hole = that OD. No ID question.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="ID catalog cards" data-shot="03e-bushing-id-cards.png"><figcaption><b>3b &middot; ID path</b> (sleeves) &mdash; pick the <strong>ID</strong> (bore); each card previews the resolved hole. Plus a &ldquo;Custom hole OD&hellip;&rdquo; card.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Length cards with recommended highlight" data-shot="03d-bushing-length.png"><figcaption><b>4 &middot; Length</b> &mdash; a fixed menu (&frac12;, &frac34;, 1&Prime;, Custom). The <strong>recommended</strong> length is highlighted green &mdash; press Next to accept.</figcaption></figure>
+  </div>
+  <p class="seq-cap">The walk then ends in a <strong>confirmation card</strong> (the picked bushing, its part number, and a dimensioned schematic) &mdash; shown as <strong>step&nbsp;3</strong> in the reference below.</p>
+
+  <div class="callout tip">
+    <div class="t">The recommended length, and moving inside the walk</div>
+    <p>Bushing lengths are standardized to the bore/OD (a <code>1/2</code> is normally <code>1/2&Prime;</code> long, a <code>3/4</code> is <code>3/4&Prime;</code>), so the matching length card is pre-highlighted green &mdash; just press <strong>Next</strong> to take it, or click a different card / <strong>Custom&hellip;</strong> to type your own.</p>
+    <p>Inside the walk, the compact <code>&lsaquo; Back</code> undoes <strong>one</strong> answer at a time, and <strong>Start over</strong> restarts from the material question &mdash; so if you realize the wrong <em>material or drill method</em> gave you the wrong bushing type, you can back up to exactly that card. (More on going back in &sect;6.)</p>
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">8. Step-by-step reference &mdash; every screen, with its page</h2>
+  <p>The 16 screens across the 10 stages, in order &mdash; each with a real screenshot of the page beside exactly what it does, when its button turns on, and what (if anything) you do in Creo. <strong>Click any screenshot to enlarge it.</strong> The breadcrumb at the top of each shot shows how far along that page sits (green check = done, blue = current).</p>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">1</span><div class="htxt"><div class="title">Welcome to the Drill Jig Builder</div><div class="stage">Stage: Welcome</div></div><span class="btnlbl">&ldquo;Get started&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Welcome page" data-shot="01-welcome.png"><figcaption>The landing page &mdash; a plain-language walkthrough plus a rotatable 3D jig render.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The landing page. On the right is a plain-language walkthrough of the whole flow; on the left a rotatable 3D render of a finished jig (drag to spin it &mdash; if the WebView2 runtime is missing you get a placeholder note instead). Nothing here touches Creo; it is purely orientation.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always &mdash; nothing to fill in.</dd>
+          <dt>Default preselect</dt><dd>None.</dd>
+          <dt>What you do</dt><dd>Read the overview, then press <em>Get started</em>.</dd>
+          <dt>Creo pick</dt><dd>No &mdash; just have the jig PART open and Creo idle.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">2</span><div class="htxt"><div class="title">Import fastener layout <span class="pill wip">optional</span></div><div class="stage">Stage: Import</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Import page" data-shot="02-import.png"><figcaption>Optional live read of an existing part/assembly&rsquo;s hole or fastener centers.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">An optional shortcut: instead of defining the hole pattern by hand later, read it straight off an existing part or assembly. The tool asks whether to reference the <strong>holes</strong> themselves (Yes) or the <strong>fasteners</strong> (No), has you make that source model the active window in Creo, reads the centers through a throwaway <em>read-only</em> connection (your jig part is never modified), then asks you to switch Creo back to the blank jig part.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>Skip (import nothing).</dd>
+          <dt>What you do</dt><dd>Run the read (Yes = holes / No = fasteners &rarr; activate the source model &rarr; OK &rarr; switch back), <em>or</em> press Next to skip.</dd>
+          <dt>Creo pick</dt><dd>Optional &mdash; a read-only pass over the source model.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">3</span><div class="htxt"><div class="title">Bushing &amp; hole size</div><div class="stage">Stage: Bushing</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Bushing confirmation" data-shot="04-bushing-confirm.png"><figcaption>The end of the walk &mdash; the confirmed bushing + its dimensioned schematic.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">A decision tree of answer cards resolves the drilled <strong>hole diameter</strong> and the <strong>bushing length</strong>. The first card picks the material, the next the drill method, and those two choose which bushing catalog you see; later cards pick the size and length, ending in the confirmation shown here. <strong>See &sect;7 above</strong> for the full screen-by-screen walk, the difference between the bushing types, and why material &times; method changes the options.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once the tree resolves a hole size. At the length sub-stage a recommended length already exists (just press Next); a custom length needs a valid typed value; the OD tie-break is never auto-committed.</dd>
+          <dt>Default preselect</dt><dd>The <strong>recommended bushing length</strong> is highlighted &mdash; press Next to accept it.</dd>
+          <dt>What you do</dt><dd>Click through the cards until the bushing is confirmed (<code>&lsaquo; Back</code> / &ldquo;Start over&rdquo; to change an answer).</dd>
+          <dt>Creo pick</dt><dd>No &mdash; pure catalog cards.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">4</span><div class="htxt"><div class="title">Hole-to-edge margin</div><div class="stage">Stage: Bushing</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Hole-to-edge margin page" data-shot="05-edge-margin.png"><figcaption>Standard margin (one hole diameter) vs a smaller custom wall.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Sets the wall from a border hole&rsquo;s edge to the plate edge, which drives how big the plate is. <em>Standard margin</em> keeps one full hole diameter of wall on every side; <em>Smaller margin</em> lets you type a tighter wall (it seeds one hole radius as a sensible starting value and shows an editable field). A <em>Change</em> button re-opens the choice.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once a mode is set (auto-set if the hole diameter is not known yet); the Smaller option needs a valid value &ge; 0.</dd>
+          <dt>Default preselect</dt><dd>Standard margin = one full hole diameter.</dd>
+          <dt>What you do</dt><dd>Pick Standard or Smaller (and type the wall if Smaller).</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">5</span><div class="htxt"><div class="title">Chip-relief slot depth</div><div class="stage">Stage: Bushing</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Chip-relief slot depth page" data-shot="06-slot-depth.png"><figcaption>Standard clearance (0.25&Prime;) vs a thinner Tight / restricted-space depth.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Sets the chip-relief slot depth, which does double duty as the plate&rsquo;s extrude pad: the plate is built to <strong>bushing length + slot depth</strong>, then the slot removes exactly the slot depth &mdash; so the finished guide depth always equals the bushing length. A smaller slot depth therefore yields a thinner overall plate, useful for tight spaces. Launching with <code>--slot-depth</code> pins the value and skips this screen; <code>--no-slot-relief</code> leaves the depth unused.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once a mode is set; the Tight option needs a valid depth &gt; 0.</dd>
+          <dt>Default preselect</dt><dd>Standard clearance = 0.25&Prime;.</dd>
+          <dt>What you do</dt><dd>Pick Standard clearance, or Tight / restricted space and type a (usually smaller) depth.</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">6</span><div class="htxt"><div class="title">How are the hole points defined?</div><div class="stage">Stage: Layout</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <div>
+        <figure class="shot"><img loading="lazy" alt="Layout tiles" data-shot="07-layout-tiles.png"><figcaption>The four point-source tiles &mdash; Fastener-Driven is preselected (green).</figcaption></figure>
+        <figure class="shot"><img loading="lazy" alt="Orthogrid inline editor" data-shot="08-layout-orthogrid.png"><figcaption>Picking Orthogrid/User-Generated opens an inline editor + live preview.</figcaption></figure>
+      </div>
+      <div class="step-facts">
+        <p class="step-desc">Chooses where the hole points come from, via four tiles: <strong>Skeleton Model</strong> (datum points already in the part &mdash; you pick them later), <strong>Orthogrid Model</strong> (a regular N&times;N grid), <strong>User Generated Model</strong> (type each hole&rsquo;s X/Z), and <strong>Fastener-Driven Model</strong> (an existing part&rsquo;s fastener pattern). Picking Orthogrid or User-Generated opens an inline editor with a live preview and an X/Z slot-direction toggle right in the window; <em>Change layout type</em> returns to the tiles.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always (Next commits the highlighted tile).</dd>
+          <dt>Default preselect</dt><dd><strong>Fastener-Driven Model</strong>, highlighted green. The tiles are <strong>radio-select</strong> &mdash; clicking one only moves the highlight; press NEXT to open it.</dd>
+          <dt>What you do</dt><dd>Highlight a tile, press NEXT, then fill in its editor if it has one.</dd>
+          <dt>Creo pick</dt><dd>No for grid / custom / fastener; the Skeleton option defers its pick to step 12.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">7</span><div class="htxt"><div class="title">Index hole</div><div class="stage">Stage: Layout</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Index hole page" data-shot="09-index-hole.png"><figcaption>Pick which hole is the coordinate-system origin (default: the corner hole).</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Chooses which hole is the <strong>index</strong> &mdash; the origin the whole jig&rsquo;s coordinate system is referenced from. An index is <em>always</em> set (default is the corner hole); the cards let you pick a different one. Building the base coordinate system <em>at</em> the index hole up front is the geometry-preserving way to reference it (nothing is moved later). This screen self-skips for the Skeleton/predefined layout.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>The corner hole (an index is always set).</dd>
+          <dt>What you do</dt><dd>Accept the default or click a different hole&rsquo;s card.</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">8</span><div class="htxt"><div class="title">3D overview (rough)</div><div class="stage">Stage: Overview</div></div><span class="btnlbl">&ldquo;Continue to datums&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="3D overview page" data-shot="10-overview.png"><figcaption>A rough 3D preview of the plate, holes, and slots (renders live via WebView2).</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">A rough 3D preview (WebView2 + three.js) of the plate, holes, and slots for your chosen layout &mdash; drag to rotate and sanity-check the pattern before any geometry is built. This page also hosts the relief-face toggle. Headless it shows a note; in the live GUI it renders the model. <em>If the pattern looks wrong here, jump back (&sect;6) to Layout or Bushing before building.</em></p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>None.</dd>
+          <dt>What you do</dt><dd>Rotate the preview, set the relief face if needed, then continue.</dd>
+          <dt>Creo pick</dt><dd>No &mdash; in-window preview only.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">9</span><div class="htxt"><div class="title">Base datum planes</div><div class="stage">Stage: Datums</div></div><span class="btnlbl">&ldquo;Continue to box&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Base datum planes page" data-shot="11-datums.png"><figcaption>TOP / SIDE / FRONT auto-mapped by name &mdash; usually no clicks.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The jig is built against the part&rsquo;s three default datum planes. The tool <strong>auto-maps TOP / SIDE / FRONT by name</strong> &mdash; normally no clicks, and the chip reads &ldquo;datums: auto-mapped&rdquo;. Only if the auto-map can&rsquo;t find them do you <kbd>Ctrl</kbd>-click all three datums in Creo and press Verify.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once &ge; 3 planes are mapped.</dd>
+          <dt>Default preselect</dt><dd>Auto-mapped by name.</dd>
+          <dt>What you do</dt><dd>Confirm the auto-map, or do the fallback pick + verify.</dd>
+          <dt>Creo pick</dt><dd>Usually none (fallback only).</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">10</span><div class="htxt"><div class="title">Build the parametric box</div><div class="stage">Stage: Box</div></div><span class="btnlbl">&ldquo;Create planes + open sketcher&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Box arm page" data-shot="12-box-a.png"><figcaption>Arms the box &mdash; creates the offset planes and opens Creo&rsquo;s sketcher for you.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The first half of building the plate. The tool asks once (a Yes/No overlay) whether to add chip-relief slots &mdash; which pads the plate &mdash; then computes the three offset-plane distances (SIDE = bushing length + relief pad, TOP = plate width, FRONT = plate height), creates those offset planes, and opens Creo&rsquo;s sketcher for you. It is tool-driven: don&rsquo;t touch Creo while it runs.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>None (the Yes/No relief prompt appears on Next).</dd>
+          <dt>What you do</dt><dd>Press the button; answer the relief prompt.</dd>
+          <dt>Creo pick</dt><dd>Tool-driven &mdash; planes + sketcher open automatically.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">11</span><div class="htxt"><div class="title">Finish the box <span class="pill wip">commit point</span></div><div class="stage">Stage: Box</div></div><span class="btnlbl">&ldquo;Finish + extrude&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Box finish page" data-shot="13-box-b.png"><figcaption>You draw the plate rectangle in the open sketcher; then it extrudes.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The commit point. With the sketcher open, <strong>you draw the plate rectangle</strong> using Creo&rsquo;s snap-to-intersection trick, then the tool finishes the sketch and extrudes to the SIDE plane. Real geometry now exists; you can still go Back afterward, but the plate stays built (&sect;6).</p>
+        <ol class="draw-steps">
+          <li><strong>Hold <kbd>Ctrl</kbd>+<kbd>Alt</kbd> and click the two shown planes</strong> (the offset planes just created). The corner <strong>snaps</strong> to their intersection &mdash; dotted blue reference lines appear.</li>
+          <li><strong>Drag the rectangle</strong> from that snapped corner to the opposite corner.</li>
+          <li>Press <kbd>Esc</kbd>, then click <em>Finish + extrude</em>.</li>
+        </ol>
+        <dl>
+          <dt>Enabled when</dt><dd>Once the planes + sketcher are armed.</dd>
+          <dt>Default preselect</dt><dd>None.</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> &mdash; manual rectangle draw (see the snap diagram below).</dd>
+        </dl>
+      </div>
+    </div>
+    <div style="padding:0 16px 16px">
+      <figure class="diagram">
+        <svg viewBox="0 0 660 280" role="img" aria-label="Ctrl plus Alt snap-to-intersection technique">
+          <rect x="0" y="0" width="660" height="280" rx="8" fill="#0e1830"/>
+          <line x1="200" y1="24" x2="200" y2="244" stroke="#6eaaff" stroke-width="2.5" stroke-dasharray="7 5"/>
+          <line x1="60" y1="200" x2="600" y2="200" stroke="#6eaaff" stroke-width="2.5" stroke-dasharray="7 5"/>
+          <text x="210" y="40" fill="#9fb0cc" font-size="13" font-family="Segoe UI, sans-serif">shown plane</text>
+          <text x="470" y="192" fill="#9fb0cc" font-size="13" font-family="Segoe UI, sans-serif">shown plane</text>
+          <rect x="200" y="92" width="270" height="108" fill="rgba(74,163,255,0.15)" stroke="#4aa3ff" stroke-width="2.5"/>
+          <circle cx="200" cy="200" r="8" fill="#78d296"/>
+          <g font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">
+            <circle cx="120" cy="128" r="13" fill="#4aa3ff"/><text x="120" y="133" text-anchor="middle" fill="#04121f">1</text>
+            <circle cx="232" cy="228" r="13" fill="#78d296"/><text x="232" y="233" text-anchor="middle" fill="#04121f">2</text>
+            <circle cx="335" cy="146" r="13" fill="#4aa3ff"/><text x="335" y="151" text-anchor="middle" fill="#04121f">3</text>
+          </g>
+        </svg>
+        <figcaption>
+          <ol>
+            <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>-click the two shown planes / references.</li>
+            <li>The corner snaps to their intersection (green).</li>
+            <li>Drag out the rectangle from that corner.</li>
+          </ol>
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">12</span><div class="htxt"><div class="title">Target datum points <span class="pill wip">Skeleton mode only</span></div><div class="stage">Stage: Drill</div></div><span class="btnlbl">&ldquo;Continue&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Target datum points page" data-shot="14-pickpoints.png"><figcaption>Pick the existing target datum points in Creo and verify.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Only appears in Skeleton / predefined mode. You <kbd>Ctrl</kbd>-click the existing target datum points in Creo and press verify; the tool reads their IDs. Every other layout mode creates the points automatically and skips this screen.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once the picked points verify.</dd>
+          <dt>Default preselect</dt><dd>None.</dd>
+          <dt>What you do</dt><dd>Pick the target datum points in Creo, then verify.</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> (predefined mode only).</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">13</span><div class="htxt"><div class="title">Create points, round corners, and drill</div><div class="stage">Stage: Drill</div></div><span class="btnlbl">&ldquo;Drill the holes&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Drill page" data-shot="15-drill.png"><figcaption>Hands-free: creates points, rounds corners, and drills every guide hole.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">A hands-free run. The tool creates every datum point as a 3-plane intersection, rounds the box&rsquo;s vertical corners, then drills a through-hole at every point at the bushing diameter. Watch the live log &mdash; don&rsquo;t click in Creo while it runs.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>None.</dd>
+          <dt>What you do</dt><dd>Press <em>Drill the holes</em> and wait.</dd>
+          <dt>Creo pick</dt><dd>No &mdash; hands-free.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">14</span><div class="htxt"><div class="title">Chip-relief slots: draw the seed</div><div class="stage">Stage: Relief</div></div><span class="btnlbl">&ldquo;Open the seed sketch&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Chip-relief arm page" data-shot="16-slot-a.png"><figcaption>Opens the sketcher on the chosen relief face for one slot per hole row.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Arms the chip-relief cut. It self-skips if relief is off; for metal jigs it may ask Yes/No whether to add slots. Then it opens the sketcher on the chosen relief face for one blind slot per hole row (each slot&rsquo;s length = part length, width = the hole diameter).</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>None (Yes/No relief prompt for metal).</dd>
+          <dt>What you do</dt><dd>Answer the relief prompt if asked; the sketcher opens.</dd>
+          <dt>Creo pick</dt><dd>Tool-driven &mdash; sketcher opens automatically.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">15</span><div class="htxt"><div class="title">Chip-relief slots: cut + pattern</div><div class="stage">Stage: Relief</div></div><span class="btnlbl">&ldquo;Finish the seed slot&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Chip-relief cut and pattern page" data-shot="17-slot-b.png"><figcaption>Draw the seed once; it cuts (verify/flip-checked), then patterns onto every row.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">You draw <strong>one seed rectangle</strong> over the first hole row; the tool cuts it, then patterns that slot onto every remaining row hands-free. The <strong>first cut is verify/flip-checked</strong> &mdash; it asks &ldquo;Did the slot cut in at the right depth?&rdquo; and can flip the direction + reopen the sketcher if not (it may also ask you to re-select the seed cut in the model tree if auto-reselect misses).</p>
+        <ol class="draw-steps">
+          <li><strong>Hold <kbd>Ctrl</kbd>+<kbd>Alt</kbd> and click the two shown references</strong> (the row line / face edges) so the corner <strong>snaps</strong>.</li>
+          <li><strong>Drag the seed rectangle</strong> over the first hole row.</li>
+          <li>Press <kbd>Esc</kbd>, then click <em>Finish the seed slot</em>; confirm the direction if asked.</li>
+        </ol>
+        <dl>
+          <dt>Enabled when</dt><dd>Once the seed is armed (or slots were skipped).</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> &mdash; draw the seed + confirm direction (same snap trick as the box; see diagram).</dd>
+        </dl>
+      </div>
+    </div>
+    <div style="padding:0 16px 16px">
+      <figure class="diagram">
+        <svg viewBox="0 0 660 280" role="img" aria-label="Ctrl plus Alt snap for the seed slot">
+          <rect x="0" y="0" width="660" height="280" rx="8" fill="#0e1830"/>
+          <line x1="200" y1="24" x2="200" y2="244" stroke="#6eaaff" stroke-width="2.5" stroke-dasharray="7 5"/>
+          <line x1="60" y1="200" x2="600" y2="200" stroke="#6eaaff" stroke-width="2.5" stroke-dasharray="7 5"/>
+          <text x="210" y="40" fill="#9fb0cc" font-size="13" font-family="Segoe UI, sans-serif">shown reference</text>
+          <text x="455" y="192" fill="#9fb0cc" font-size="13" font-family="Segoe UI, sans-serif">shown reference (row line)</text>
+          <rect x="200" y="150" width="330" height="50" fill="rgba(74,163,255,0.15)" stroke="#4aa3ff" stroke-width="2.5"/>
+          <circle cx="200" cy="200" r="8" fill="#78d296"/>
+          <g font-family="Segoe UI, sans-serif" font-size="13" font-weight="700">
+            <circle cx="120" cy="128" r="13" fill="#4aa3ff"/><text x="120" y="133" text-anchor="middle" fill="#04121f">1</text>
+            <circle cx="232" cy="228" r="13" fill="#78d296"/><text x="232" y="233" text-anchor="middle" fill="#04121f">2</text>
+            <circle cx="365" cy="140" r="13" fill="#4aa3ff"/><text x="365" y="145" text-anchor="middle" fill="#04121f">3</text>
+          </g>
+        </svg>
+        <figcaption>
+          <ol>
+            <li><kbd>Ctrl</kbd>+<kbd>Alt</kbd>-click the two shown references so the corner snaps (green).</li>
+            <li>Drag the thin seed rectangle over the first hole row.</li>
+            <li><kbd>Esc</kbd> &rarr; <em>Finish the seed slot</em>; the rest pattern automatically.</li>
+          </ol>
+        </figcaption>
+      </figure>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">16</span><div class="htxt"><div class="title">Done</div><div class="stage">Stage: Done</div></div><span class="btnlbl">&ldquo;Finish&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Done page" data-shot="18-done.png"><figcaption>Summary of what was built, plus any honesty warnings.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">A summary of everything built, with honest warnings where they apply &mdash; e.g. if the plate was padded for relief that wasn&rsquo;t actually cut, it tells you the guide is oversized and how to fix it. Finish closes the wizard; your Creo session stays open. Always eyeball the geometry in Creo before trusting it.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>Default preselect</dt><dd>None.</dd>
+          <dt>What you do</dt><dd>Read the summary, press Finish, verify in Creo.</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <div class="t">The two moments you must draw in Creo</div>
+    <ol>
+      <li><strong>Box rectangle (step 11)</strong> &mdash; hold <kbd>Ctrl</kbd>+<kbd>Alt</kbd>, click the two shown planes to snap the corner to their intersection, drag corner-to-corner, <kbd>Esc</kbd>.</li>
+      <li><strong>Seed slot (step 15)</strong> &mdash; same snap trick: <kbd>Ctrl</kbd>+<kbd>Alt</kbd>-click the shown references, drag ONE rectangle over the first hole row, <kbd>Esc</kbd>, confirm direction; the rest pattern automatically.</li>
+    </ol>
+    Everything else the tool does itself.
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">9. Command-line flags (optional)</h2>
+  <p>Pass these to <code>drilljig-gui.cmd</code> to override defaults or skip questions:</p>
+  <table>
+    <tr><th>Flag</th><th>Effect</th></tr>
+    <tr><td><code>--no-corner-round</code></td><td>Skip the corner round.</td></tr>
+    <tr><td><code>--corner-radius N</code></td><td>Corner radius (default <code>0.25</code>).</td></tr>
+    <tr><td><code>--slot-depth N</code></td><td>Slot depth in inches (default <code>0.25</code>); pads the plate; skips the slot-depth question.</td></tr>
+    <tr><td><code>--no-slot-relief</code></td><td>Skip slots entirely.</td></tr>
+    <tr><td><code>--slot-flip</code></td><td>Flip seed-slot direction.</td></tr>
+    <tr><td><code>--pattern-flip</code></td><td>Flip pattern direction.</td></tr>
+    <tr><td><code>--no-pattern</code></td><td>Draw every slot row by hand instead of patterning.</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">10. Troubleshooting</h2>
+  <table>
+    <tr><th>Symptom</th><th>Fix</th></tr>
+    <tr><td>&ldquo;Creo (xtop.exe) is not running&rdquo;</td><td>Open Creo + the jig part; keep exactly one session.</td></tr>
+    <tr><td>&ldquo;VB API registration not found&rdquo;</td><td>Register the VB API from Creo&rsquo;s install &mdash; run <code>vb_api_register.bat</code> from <code>\Parametric\bin</code> as Administrator.</td></tr>
+    <tr><td>3D preview shows a plain note</td><td>WebView2 Evergreen Runtime is missing/old; the wizard, math, and the WPF bushing preview are unaffected.</td></tr>
+    <tr><td>&ldquo;active model is an ASSEMBLY&rdquo;</td><td>Open the jig PART (<code>.prt</code>), not the <code>.asm</code>.</td></tr>
+    <tr><td>Wizard seems stuck</td><td>Switch to Creo &mdash; it may be waiting for a pick or a manual draw. Check the RUN log / PowerShell window.</td></tr>
+    <tr><td>A step &ldquo;did nothing&rdquo;</td><td>The canary aborted a macro that changed no geometry rather than claim false success; check the reported reason (a pick wasn't armed, a widget drifted, or the wrong model/body was active).</td></tr>
+    <tr><td>A manual draw won&rsquo;t snap</td><td>Make sure you hold <kbd>Ctrl</kbd>+<kbd>Alt</kbd> <em>while clicking</em> the two shown planes/references before dragging the rectangle (steps 11 &amp; 15).</td></tr>
+  </table>
+</section>

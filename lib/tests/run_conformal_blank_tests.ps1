@@ -13,14 +13,15 @@
 #   * Get-SelectSurfacesByIdMacro -SurfIds     -> PURE tree-search "select surface(s)
 #     by id into the buffer" (buffer_clean, ProCmdMdlTreeSearch, SelOptionRadio
 #     Surface, one InputIDPanel/EvaluateBtn/ApplyBtn per id (ACCUMULATE), CancelButton).
-#   * Get-OffsetMacro [-StandOff] / Get-ThickenMacro -Thickness / Get-ShowByIdMacro
-#     -TypeName -Id  -> the THREE PURE legs reconciled to the operator's 'curvedworkflow'
-#     recording (MAPKEYS.md): the offset DISTANCE and the thickness BOTH go in
-#     GrmTextTagEmbedMRU (NOT mru_option_menu/ExclSrfColl/maindashInst0.Thickness/Flip/
-#     body-page); the offset quilt is SHOWN (ProCmdViewShow@PopupMenuTree, selected by id)
-#     between the two legs so the thicken can consume it. Offset = one ProCmdFtOffset +
-#     one dashInst0.Done; thicken = one ProCmdFtThicken + Enter/Exit dashInst0.Quit blur +
-#     one dashInst0.Done.
+#   * Get-OffsetThickenMacro [-Thickness] [-StandOff] [-Flip] -> the ONE ATOMIC builder,
+#     transcribed VERBATIM from the operator's freshest recording (trail.txt.15, the
+#     'dumbclaude' mapkeys, 2026-07-27 15:43) + drilljig3d.cmd STAGE 1 (CONFIRMED LIVE
+#     2026-06-24). Offset via mru_option_menu + ExclSrfColl; thicken via
+#     maindashInst0.Thickness; the NEW BODY via thicken_control.0 + body_page.0 +
+#     body_page.0.0 PH.bodyusechkbtnrepwdg. NO GrmTextTagEmbedMRU, NO ProCmdViewShow
+#     (the 2026-07-27-AM 'curvedworkflow' reconciliation was a mis-read + dropped the
+#     new-body widget, so the GUI Surface stage silently no-op'd). One ProCmdFtOffset +
+#     one ProCmdFtThicken + two dashInst0.Done; -Flip emits one maindashInst0.Flip.
 #   * Get-SelectItemByIdMacro -TypeName -Id [-NoClear] -> PURE generic select-by-id
 #     (default leads with buffer_clean; -NoClear OMITS it to ACCUMULATE a 2nd ref).
 #   * Build-NormalHoleMacro -PointId -SurfaceId -Diameter [-BodyIndex] [-DefaultOrient]
@@ -40,13 +41,14 @@
 #     points; a datum-point FEATURE expands via ListSubItems(ITEM_POINT); non-matching
 #     selections -> Rejected; a NULL buffer -> empty, NO throw.
 #   * Invoke-ConformalBlank -Session -Model -TypeObj -SurfIds -Thickness [-StandOff]
-#     [-OnPoll] [-TimeoutMs] -> COM orchestrator, TWO canary-gated phases (offset ->
-#     show the new quilt -> thicken). GUARDS: empty/null SurfIds -> Made=$false + Reason
-#     (no fire); Thickness<=0 -> Made=$false. Canary: a no-stamp-change on phase 1 ->
-#     Phase1=$false + early return (thicken never fires); a no-change on phase 2 ->
-#     Phase2=$false, Made=$false (a MISS, never assumed success). Happy path: 3 fires
-#     (offset, show, thicken), Phase1/Phase2/Made all true, QuiltSurfIds discovered and
-#     fed to the thicken, BodyIndex is the NEW body's index, both dims driven+held.
+#     [-Flip] [-OnPoll] [-TimeoutMs] -> COM orchestrator, ONE ATOMIC canary-gated macro
+#     (select surface by id + offset + thicken + new-body in a single RunMacro -- the
+#     thicken relies on the freshly-created offset quilt, which a dashboard does not keep
+#     across separate RunMacro calls). GUARDS: empty/null SurfIds -> Made=$false + Reason
+#     (no fire); Thickness<=0 -> Made=$false. Canary: a no-stamp-change -> Made=$false +
+#     Changed=$false + Reason (a MISS, never assumed success). Happy path: ONE fire,
+#     Made/Changed true, BodyIndex is the NEW body's index, both dims driven+held by the
+#     regen-dim backstop; -Flip forwards one maindashInst0.Flip into the macro.
 #
 # STUBBING (mirrors run_curved_slot_macros_tests.ps1): the COM helpers read the
 # $script:DJSession/DJModel/DJType scope Initialize-DrilljigCore sets. We
@@ -294,39 +296,39 @@ Assert-True "selsurf(1): one InputIDPanel" ((Count-Token $selSurf1 'InputIDPanel
 Assert-True "selsurf(1): id 77 present"    ($selSurf1 -match 'InputIDPanel.*77')
 
 # ============================================================================
-# Get-OffsetMacro / Get-ThickenMacro / Get-ShowByIdMacro  --  the 3 PURE legs
-# reconciled to the operator's 'curvedworkflow' recording (GrmTextTagEmbedMRU for
-# both the offset distance AND the thickness; SHOW the quilt between the two legs).
+# Get-OffsetThickenMacro  --  the ONE ATOMIC builder, transcribed VERBATIM from the
+# operator's freshest recording (trail.txt.15, the 'dumbclaude' mapkeys, 2026-07-27
+# 15:43) + drilljig3d.cmd STAGE 1 (CONFIRMED LIVE 2026-06-24). Offset via
+# mru_option_menu + ExclSrfColl; thicken via maindashInst0.Thickness; the NEW BODY
+# via thicken_control.0 + body_page.0 + body_page.0.0 PH.bodyusechkbtnrepwdg. NO
+# GrmTextTagEmbedMRU, NO ProCmdViewShow (the AM 'curvedworkflow' reconciliation was
+# a mis-read + dropped the new-body widget). --flip emits ONE maindashInst0.Flip.
 # ============================================================================
-Write-Host "  -- Get-OffsetMacro / Get-ThickenMacro / Get-ShowByIdMacro (recorded widgets) --" -ForegroundColor White
+Write-Host "  -- Get-OffsetThickenMacro (recorded widgets; atomic offset+thicken+new-body) --" -ForegroundColor White
 
-# OFFSET leg: one ProCmdFtOffset, the distance in GrmTextTagEmbedMRU (Open/Close/Update),
-# one dashInst0.Done, and NONE of the old wrong widgets (mru_option_menu / ExclSrfColl).
-$off = Get-OffsetMacro -StandOff 0.0
-Assert-True "offset: non-empty string"                 (($off -is [string]) -and ($off.Length -gt 0))
-Assert-True "offset: exactly one ProCmdFtOffset"       ((Count-Token $off 'ProCmdFtOffset') -eq 1)
-Assert-True "offset: uses GrmTextTagEmbedMRU (recorded)" ($off -match 'GrmTextTagEmbedMRU')
-Assert-True "offset: distance value 0 fed to the MRU"  ($off -match 'GrmTextTagEmbedMRU` `0`')
-Assert-True "offset: exactly one dashInst0.Done"       ((Count-Token $off 'dashInst0.Done') -eq 1)
-Assert-True "offset: NO stale mru_option_menu widget"  (-not ($off -match 'mru_option_menu'))
-Assert-True "offset: NO stale ExclSrfColl widget"      (-not ($off -match 'ExclSrfColl'))
-$off5 = Get-OffsetMacro -StandOff 0.05
-Assert-True "offset: a different standoff (0.05) lands" ($off5 -match 'GrmTextTagEmbedMRU` `0\.05`')
+$ot = Get-OffsetThickenMacro -Thickness 0.5
+Assert-True "offthk: non-empty string"                 (($ot -is [string]) -and ($ot.Length -gt 0))
+Assert-True "offthk: exactly one ProCmdFtOffset"       ((Count-Token $ot 'ProCmdFtOffset') -eq 1)
+Assert-True "offthk: exactly one ProCmdFtThicken"      ((Count-Token $ot 'ProCmdFtThicken') -eq 1)
+Assert-True "offthk: exactly two dashInst0.Done"       ((Count-Token $ot 'dashInst0.Done') -eq 2)
+Assert-True "offthk: offset uses mru_option_menu (recorded)" ($ot -match 'maindashInst0\.mru_option_menu')
+Assert-True "offthk: offset uses ExclSrfColl (recorded)" ($ot -match 'maindashInst0\.ExclSrfColl')
+Assert-True "offthk: thickness value .5 in maindashInst0.Thickness" ($ot -match 'maindashInst0\.Thickness` `0\.5`')
+Assert-True "offthk: NEW-BODY checkbox PH.bodyusechkbtnrepwdg present" ($ot -match 'PH\.bodyusechkbtnrepwdg')
+Assert-True "offthk: thicken_control.0 present"        ($ot -match 'chkbn\.thicken_control\.0')
+Assert-True "offthk: body_page.0 present"              ($ot -match 'chkbn\.body_page\.0')
+Assert-True "offthk: NO stale GrmTextTagEmbedMRU widget" (-not ($ot -match 'GrmTextTagEmbedMRU'))
+Assert-True "offthk: NO stale ProCmdViewShow (no show-quilt dance)" (-not ($ot -match 'ProCmdViewShow'))
+# a different thickness threads through
+$ot25 = Get-OffsetThickenMacro -Thickness 0.25
+Assert-True "offthk: a different thickness (.25) lands" ($ot25 -match 'maindashInst0\.Thickness` `0\.25`')
 
-# THICKEN leg: one ProCmdFtThicken, the thickness in GrmTextTagEmbedMRU (Update+Activate),
-# blur via Enter/Exit dashInst0.Quit, one dashInst0.Done; NONE of the old widgets.
-$thk = Get-ThickenMacro -Thickness 0.25
-Assert-True "thicken: exactly one ProCmdFtThicken"     ((Count-Token $thk 'ProCmdFtThicken') -eq 1)
-Assert-True "thicken: thickness value .25 in the MRU"  ($thk -match 'GrmTextTagEmbedMRU` `0\.25`')
-Assert-True "thicken: blur via dashInst0.Quit (Enter+Exit)" (($thk -match 'Enter.*dashInst0\.Quit') -and ($thk -match 'Exit.*dashInst0\.Quit'))
-Assert-True "thicken: exactly one dashInst0.Done"      ((Count-Token $thk 'dashInst0.Done') -eq 1)
-Assert-True "thicken: NO stale maindashInst0.Thickness" (-not ($thk -match 'maindashInst0\.Thickness'))
-Assert-True "thicken: NO stale body-page widget"       (-not ($thk -match 'PH\.bodyusechkbtnrepwdg'))
-
-# SHOW leg: select the feature by id, then ProCmdViewShow@PopupMenuTree.
-$show = Get-ShowByIdMacro -TypeName 'Feature' -Id 77
-Assert-True "show: selects by id (InputIDPanel 77)"    ($show -match 'InputIDPanel.*77')
-Assert-True "show: fires ProCmdViewShow@PopupMenuTree" ($show -match 'ProCmdViewShow@PopupMenuTree')
+# --flip OFF (default) -> NO maindashInst0.Flip; --flip ON -> exactly one.
+Assert-True "offthk: default (no -Flip) emits NO maindashInst0.Flip" (-not ($ot -match 'maindashInst0\.Flip'))
+$otF = Get-OffsetThickenMacro -Thickness 0.5 -Flip
+Assert-True "offthk(-Flip): exactly one maindashInst0.Flip" ((Count-Token $otF 'maindashInst0.Flip') -eq 1)
+# the flip lands BEFORE the body-page block (grows material, then routes to new body)
+Assert-True "offthk(-Flip): Flip precedes the new-body checkbox" ($otF.IndexOf('maindashInst0.Flip') -lt $otF.IndexOf('PH.bodyusechkbtnrepwdg'))
 
 # ============================================================================
 # Get-SelectItemByIdMacro  --  PURE generic select-by-id (clear vs accumulate)
@@ -584,11 +586,10 @@ Assert-True "conf(thickness 0): nothing fired" (@($script:cbFired).Count -eq 0)
 $gThkNeg = Invoke-ConformalBlank -Session $cbSession -Model $cbModel -TypeObj $cbType -SurfIds @(1) -Thickness -3
 Assert-True "conf(negative thickness): Made false" (-not [bool](Get-Field $gThkNeg @('Made')))
 
-# CANARY MISS (phase 1): valid inputs, the OFFSET macro fires, but the model does NOT
-# change (stamp stays). Made AND Phase1 must be $false (a MISS is never assumed success
-# - [[feedback_canary_must_not_assume_on_failure]]), and a Reason set. The offset macro
-# fired first, so cbFired[0] carries ProCmdFtOffset; the thicken must NOT have fired
-# (phase 1 returns early).
+# CANARY MISS: valid inputs, the atomic macro fires, but the model does NOT change
+# (stamp stays). Made must be $false (a MISS is never assumed success -
+# [[feedback_canary_must_not_assume_on_failure]]), Changed false, and a Reason set.
+# The ONE fired macro carries BOTH the surface select + offset AND the thicken.
 $script:cbFired = @()
 $script:cbStamp = 'vNC'
 $script:cbFeats = @(1, 2, 3)
@@ -596,55 +597,19 @@ $script:cbSurfs = @(50)
 $script:cbBodies = @(10)
 $script:cbWaitForced = $false     # force the canary to report "no change"
 $missConf = Invoke-ConformalBlank -Session $cbSession -Model $cbModel -TypeObj $cbType -SurfIds @(41) -Thickness 0.5
-Assert-True "conf(canary miss): the OFFSET macro DID fire" (@($script:cbFired).Count -ge 1)
-Assert-True "conf(canary miss): fired macro contains ProCmdFtOffset" ($script:cbFired[0] -match 'ProCmdFtOffset')
-Assert-True "conf(canary miss): the THICKEN never fired (phase 1 bailed)" (-not (@($script:cbFired) -match 'ProCmdFtThicken'))
+Assert-True "conf(canary miss): exactly ONE macro fired (atomic)" (@($script:cbFired).Count -eq 1)
+Assert-True "conf(canary miss): the fired macro contains ProCmdFtOffset" ($script:cbFired[0] -match 'ProCmdFtOffset')
+Assert-True "conf(canary miss): the SAME macro contains ProCmdFtThicken (atomic)" ($script:cbFired[0] -match 'ProCmdFtThicken')
 Assert-True "conf(canary miss): Made false (no change -> not assumed success)" (-not [bool](Get-Field $missConf @('Made')))
-Assert-True "conf(canary miss): Phase1 false" (-not [bool](Get-Field $missConf @('Phase1')))
-Assert-True "conf(canary miss): Phase2 false" (-not [bool](Get-Field $missConf @('Phase2')))
+Assert-True "conf(canary miss): Changed false" (-not [bool](Get-Field $missConf @('Changed')))
 Assert-True "conf(canary miss): a Reason is set" (-not [string]::IsNullOrEmpty([string](Get-Field $missConf @('Reason'))))
 
-# CANARY MISS (phase 2): the offset DOES fire (stamp moves + a quilt surface appears)
-# but the THICKEN does not change the model. Made=$false, Phase1=$true, Phase2=$false,
-# and the Reason names the thicken. This is the "quilt may need an operator pick" case.
-$script:cbFired = @()
-$script:cbStamp = 'vP1'
-$script:cbFeats = @(1, 2, 3)
-$script:cbSurfs = @(50)
-$script:cbBodies = @(10)
-$script:cbWaitForced = $null      # derive from the stamp; only the offset fire bumps it
-Add-Member -InputObject $cbSession -MemberType ScriptMethod -Name RunMacro -Force -Value {
-    param($x)
-    $script:cbFired += ,([string]$x)
-    if ("$x" -match 'ProCmdFtOffset') {
-        $script:cbFeats = @(1, 2, 3, 7)             # new offset feature id 7
-        $script:cbSurfs = @(50, 55)                 # new quilt surface id 55
-        $script:cbStamp = 'vP1-off'                 # stamp moves -> phase 1 passes
-    }
-    # NOTE: ProCmdFtThicken deliberately does NOT bump the stamp -> phase 2 canary miss
-}
-$miss2 = Invoke-ConformalBlank -Session $cbSession -Model $cbModel -TypeObj $cbType -SurfIds @(41) -Thickness 0.5
-Assert-True "conf(phase2 miss): Phase1 true (offset fired)"  ([bool](Get-Field $miss2 @('Phase1')))
-Assert-True "conf(phase2 miss): the THICKEN was attempted"   ((@($script:cbFired) -match 'ProCmdFtThicken').Count -ge 1)
-Assert-True "conf(phase2 miss): Phase2 false (no change)"     (-not [bool](Get-Field $miss2 @('Phase2')))
-Assert-True "conf(phase2 miss): Made false"                   (-not [bool](Get-Field $miss2 @('Made')))
-Assert-True "conf(phase2 miss): quilt surface 55 discovered"  (@(Get-Field $miss2 @('QuiltSurfIds')) -contains 55)
-Assert-True "conf(phase2 miss): a Reason is set"              (-not [string]::IsNullOrEmpty([string](Get-Field $miss2 @('Reason'))))
-# restore the plain capture-only RunMacro for the guard-order re-checks below
-Add-Member -InputObject $cbSession -MemberType ScriptMethod -Name RunMacro -Force -Value {
-    param($x) $script:cbFired += ,([string]$x)
-}
-$script:cbWaitForced = $false
-
-# HAPPY path (the reconciled 3-fire flow): offset -> (find + show the new quilt) ->
-# thicken, each canary-gated on a stamp move. We wire a RunMacro that mutates state the
-# way the real workflow does:
-#   * on ProCmdFtOffset: a NEW offset feature (id 7, Linear dim 'do') + a NEW quilt
-#     surface (id 55) appear, and the stamp moves (phase 1 passes).
-#   * on ProCmdFtThicken: a NEW thicken feature (id 9, Linear dim 'dt') + a NEW body
-#     (id 20, after-index 1) appear, and the stamp moves again (phase 2 passes).
-# Assert Made/Phase1/Phase2 all true, the quilt was discovered + SHOWN between the two
-# legs, the new body is targeted, and both dims are driven-and-held by the backstop.
+# HAPPY path (single atomic fire): the offset+thicken macro fires ONCE and mutates the
+# model the way the real workflow does:
+#   * a NEW offset feature (id 7, Linear dim 'do') + a NEW thicken feature (id 9, Linear
+#     dim 'dt') appear, a NEW body (id 20, after-index 1) appears, and the stamp moves.
+# Assert Made/Changed true, ONE fire that selects the surface + offsets + thickens in the
+# same string, the new body is targeted, and both dims are driven-and-held by the backstop.
 $script:cbFired = @()
 $script:cbStamp = 'vH'
 $script:cbFeats = @(1, 2, 3)               # before: 3 features
@@ -652,43 +617,28 @@ $script:cbSurfs = @(50)                     # before: 1 surface (the picked face
 $script:cbBodies = @(10)                    # before: 1 body (id 10) at index 0
 $script:cbDims = @{}
 $script:cbDimStore = @{}
-$script:cbWaitForced = $null                # derive from the stamp (bumped per leg)
+$script:cbWaitForced = $null                # derive from the stamp (bumped by the fire)
 Add-Member -InputObject $cbSession -MemberType ScriptMethod -Name RunMacro -Force -Value {
     param($x)
     $script:cbFired += ,([string]$x)
-    if ("$x" -match 'ProCmdFtOffset') {
-        # the offset quilt: new feature id 7 (Linear dim 'do') + new surface id 55.
-        $script:cbFeats  = @(1, 2, 3, 7)
-        $script:cbDims[7] = @( @{ Sym = 'do'; DimType = 0 } )
-        $script:cbDimStore['do'] = 5.0                     # pre-existing; backstop overwrites
-        $script:cbSurfs  = @(50, 55)
-        $script:cbStamp  = 'vH-off'
-    } elseif ("$x" -match 'ProCmdFtThicken') {
-        # the thicken: new feature id 9 (Linear dim 'dt') + a NEW body id 20 at index 1.
-        $script:cbFeats  = @(1, 2, 3, 7, 9)
-        $script:cbDims[9] = @( @{ Sym = 'dt'; DimType = 0 } )
-        $script:cbDimStore['dt'] = 5.0
-        $script:cbBodies = @(10, 20)
-        $script:cbStamp  = 'vH-thk'
-    }
+    # ONE atomic macro creates BOTH features + the new body and bumps the stamp.
+    $script:cbFeats   = @(1, 2, 3, 7, 9)
+    $script:cbDims[7] = @( @{ Sym = 'do'; DimType = 0 } )    # offset feature dim
+    $script:cbDims[9] = @( @{ Sym = 'dt'; DimType = 0 } )    # thicken feature dim
+    $script:cbDimStore['do'] = 5.0                            # pre-existing; backstop overwrites
+    $script:cbDimStore['dt'] = 5.0
+    $script:cbBodies  = @(10, 20)                             # NEW body id 20 at index 1
+    $script:cbStamp   = 'vH-done'
 }
 $okConf = Invoke-ConformalBlank -Session $cbSession -Model $cbModel -TypeObj $cbType -SurfIds @(41) -Thickness 0.75 -StandOff 0.0
-Assert-True "conf(happy): fired 3 macros (offset, show, thicken)" (@($script:cbFired).Count -eq 3) ("got {0}" -f @($script:cbFired).Count)
-Assert-True "conf(happy): Phase1 true (offset fired)"  ([bool](Get-Field $okConf @('Phase1')))
-Assert-True "conf(happy): Phase2 true (thicken fired)" ([bool](Get-Field $okConf @('Phase2')))
-Assert-True "conf(happy): Made true"                   ([bool](Get-Field $okConf @('Made')))
-# fire #1 = select surface 41 by id + offset (NO thicken yet)
-Assert-True "conf(happy): fire#1 selects surface id 41" ($script:cbFired[0] -match 'InputIDPanel.*41')
-Assert-True "conf(happy): fire#1 runs ProCmdFtOffset"   ($script:cbFired[0] -match 'ProCmdFtOffset')
-Assert-True "conf(happy): fire#1 does NOT thicken"      (-not ($script:cbFired[0] -match 'ProCmdFtThicken'))
-# the offset feature (id 7) was discovered + SHOWN between the two legs (fire #2)
-Assert-True "conf(happy): OffsetFeatId == 7"            (([int](Get-Field $okConf @('OffsetFeatId'))) -eq 7)
-Assert-True "conf(happy): fire#2 shows the quilt (ProCmdViewShow)" ($script:cbFired[1] -match 'ProCmdViewShow@PopupMenuTree')
-Assert-True "conf(happy): fire#2 selects offset feat id 7" ($script:cbFired[1] -match 'InputIDPanel.*7')
-# the new quilt surface (id 55) was found and fed to the thicken (fire #3)
-Assert-True "conf(happy): QuiltSurfIds == (55)"         (@(Get-Field $okConf @('QuiltSurfIds')) -contains 55)
-Assert-True "conf(happy): fire#3 selects quilt surface id 55" ($script:cbFired[2] -match 'InputIDPanel.*55')
-Assert-True "conf(happy): fire#3 runs ProCmdFtThicken" ($script:cbFired[2] -match 'ProCmdFtThicken')
+Assert-True "conf(happy): fired exactly ONE atomic macro" (@($script:cbFired).Count -eq 1) ("got {0}" -f @($script:cbFired).Count)
+Assert-True "conf(happy): Made true"    ([bool](Get-Field $okConf @('Made')))
+Assert-True "conf(happy): Changed true" ([bool](Get-Field $okConf @('Changed')))
+# the single fire selects surface 41 by id AND offsets AND thickens (atomic)
+Assert-True "conf(happy): fire selects surface id 41"  ($script:cbFired[0] -match 'InputIDPanel.*41')
+Assert-True "conf(happy): fire runs ProCmdFtOffset"    ($script:cbFired[0] -match 'ProCmdFtOffset')
+Assert-True "conf(happy): fire runs ProCmdFtThicken"   ($script:cbFired[0] -match 'ProCmdFtThicken')
+Assert-True "conf(happy): fire creates a NEW BODY (PH.bodyusechkbtnrepwdg)" ($script:cbFired[0] -match 'PH\.bodyusechkbtnrepwdg')
 # the NEW body (id 20) is at after-index 1 -> BodyIndex 1, BodyId 20
 Assert-True "conf(happy): BodyIndex == 1 (the new body's index)" (([int](Get-Field $okConf @('BodyIndex'))) -eq 1)
 Assert-True "conf(happy): BodyId == 20 (the new body)" (([int](Get-Field $okConf @('BodyId'))) -eq 20)
@@ -698,6 +648,15 @@ Assert-True "conf(happy): OffsetHeld true (offset driven to StandOff 0)" ([bool]
 # higher new-feature id (9) = thicken -> dim 'dt' driven to Thickness 0.75 and HELD
 Assert-True "conf(happy): ThickSym resolved to the thicken feature's dim (dt)" ([string](Get-Field $okConf @('ThickSym')) -eq 'dt')
 Assert-True "conf(happy): ThicknessHeld true (thickness driven to 0.75)" ([bool](Get-Field $okConf @('ThicknessHeld')))
+
+# --flip: the atomic macro forwards -Flip so the fired string carries maindashInst0.Flip.
+$script:cbFired = @()
+$script:cbStamp = 'vF'
+$script:cbFeats = @(1, 2, 3)
+$script:cbBodies = @(10)
+$script:cbWaitForced = $true
+$flipConf = Invoke-ConformalBlank -Session $cbSession -Model $cbModel -TypeObj $cbType -SurfIds @(41) -Thickness 0.5 -Flip
+Assert-True "conf(-Flip): the fired macro carries maindashInst0.Flip" ($script:cbFired[0] -match 'maindashInst0\.Flip')
 
 # restore the plain capture-only RunMacro
 Add-Member -InputObject $cbSession -MemberType ScriptMethod -Name RunMacro -Force -Value {

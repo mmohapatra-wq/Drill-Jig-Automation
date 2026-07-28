@@ -91,6 +91,9 @@ function Write-EvalPacket {
         slice     = $Slice.truth
     }
     $json = $packet | ConvertTo-Json -Depth 12
+    # Eval packets now live under <repo>\artifacts\; ensure the parent dir exists.
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
     Set-Content -Path $Path -Value $json -Encoding UTF8
     return $Path
 }

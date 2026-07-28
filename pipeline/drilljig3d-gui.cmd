@@ -9,12 +9,23 @@ exit /b %errorlevel%
 # drilljig3d-gui.cmd - GUI front-end for the CURVED (conformal) drill jig
 # ============================================================================
 # The curved analog of drilljig-gui.cmd: a single never-closing WinForms WIZARD
-# window that drives the SAME end-to-end curved-jig flow as drilljig3d.cmd
-# (decision tree -> conformal blank -> normal-to-surface holes -> curved chip-relief
-# slots), with no console typing. Every UNAVOIDABLE Creo mouse pick a RunMacro
-# cannot replay (pick the SURFACE, pick the target POINTS, DRAW each slot rectangle)
-# is its own "arm + verify / arm + draw" step whose Next stays disabled until the
-# selection buffer / draw validates.
+# window that drives the end-to-end curved-jig flow, re-sequenced INPUT-FIRST: the
+# operator front-loads every pick + number, then the build fires hands-free, then the
+# only remaining interaction (drawing the relief rectangles) happens at the end.
+#   Fasteners (select) -> Surface (pick) -> Conditions (all numbers) -> Build (one
+#   hands-free click: conformal blank -> corner round -> drill all holes normal to the
+#   surface) -> Slots (re-select fasteners, draw one chip-relief rectangle per hole).
+# Every UNAVOIDABLE Creo mouse pick a RunMacro cannot replay (select the FASTENERS,
+# pick the SURFACE, DRAW each relief rectangle) is its own arm/verify/draw step.
+#
+# CHIP-RELIEF (TOP-plane symmetric method): a terminal STAGE 5. STAGE 4 drills all
+# holes hands-free; STAGE 5 re-selects the fasteners (fresh component paths -- the
+# STAGE-1 paths go stale over the whole build) and, per fastener, opens a sketch on
+# that fastener's OWN TOP plane -> operator draws ONE rectangle -> SYMMETRIC
+# remove-material extrude (typed depth = 2 x relief) cuts a pocket straddling the plane
+# relief-deep each way. The conformal blank is thickened to wall + relief so there is
+# material to remove. The retired tangent-plane per-hole slot stage stays on disk
+# (lib\curved_slots.ps1 / curved_slot_macros.ps1) for the console tool drilljig3d.cmd.
 #
 # ADDITIVE + ISOLATED: this file EDITS NOTHING existing. It reuses lib\wizard.ps1
 # (the framework) + the CURVED libs (jig_tree is console-only, so the tree WALK is
@@ -24,14 +35,23 @@ exit /b %errorlevel%
 # from lib\curved_slots.ps1 + lib\curved_slot_macros.ps1). drilljig-gui.cmd and every
 # shared lib it uses are LEFT UNTOUCHED. Open the jig PART (not the .asm).
 #
-# Stages: Welcome / Bushing / Surface / Drill / Relief / Done.
+# Stages: Welcome / Fasteners / Surface / Conditions / Build / Slots / Done.
 #
 # Flags:
 #   --default-orient : drill with Creo's default On-Point direction (skip the
-#                      per-hole tangent-plane orientation). Default is tangent-orient
-#                      ON (curved slots need per-hole tangent planes anyway).
-#   --no-slots       : skip the STAGE-3 curved chip-relief slot loop.
-#   --slot-depth N   : chip-relief slot depth in inches (default 0.25).
+#                      per-hole TOP-plane orientation).
+#   --no-relief      : disable chip relief (alias --no-slots): seeds the Bushing
+#                      relief-depth field to 0 (no thicken bump, no pockets).
+#   --relief-depth N : chip-relief depth in inches (alias --slot-depth N; default
+#                      0.25). The Bushing relief-depth step prefills from this; the
+#                      symmetric pocket is cut 2N deep (N each side of the TOP plane).
+#   --no-corner-round: skip the Surface-stage auto corner-rounding of the blank.
+#   --corner-radius N: corner-round fillet radius in inches (default 0.25). Same
+#                      contract as drilljig.cmd / drilljig-gui.cmd.
+#   --no-flip        : do NOT flip the thicken side. The thicken FLIPS by DEFAULT so
+#                      the blank grows AWAY from the part (one maindashInst0.Flip,
+#                      matching the confirmed-live console drilljig3d.cmd). Use
+#                      --no-flip only if a part defaults the correct way.
 # ============================================================================
 
 $Host.UI.RawUI.WindowTitle = "CURVED DRILL JIG BUILDER"
@@ -52,10 +72,28 @@ trap {
 # FLAGS
 # ============================================================================
 $DefaultOrient = ($ScriptArgs -match '(?i)-{1,2}default-orient')
-$NoSlots       = ($ScriptArgs -match '(?i)-{1,2}no-slots')
+# --no-relief (alias --no-slots) DISABLES chip relief for the whole run (no thicken
+# bump, no pockets). It seeds the Bushing relief-depth field to 0; the operator can
+# still type a positive value there to re-enable.
+$NoSlots       = ($ScriptArgs -match '(?i)-{1,2}no-(slots|relief)')
+# Thicken direction: FLIP the material side so the blank grows AWAY from the part
+# (the operator confirmed the default thickens the wrong way). ON by default, matching
+# the confirmed-live console drilljig3d.cmd (which fires one unconditional maindashInst0.Flip
+# 2026-06-24). --no-flip reverts to the un-flipped side for a part that defaults correctly.
+$Flip          = (-not ($ScriptArgs -match '(?i)-{1,2}no-flip'))
+# Chip-relief depth default (prefills the Bushing relief-depth field). --relief-depth N
+# (alias --slot-depth N) overrides. --no-relief/--no-slots forces the default to 0.
 $SlotDepthAbs  = 0.25
-$mSd = [regex]::Match($ScriptArgs, '(?i)--slot-depth\s+([0-9]*\.?[0-9]+)')
-if ($mSd.Success) { $sdv = [double]$mSd.Groups[1].Value; if ($sdv -gt 0) { $SlotDepthAbs = $sdv } }
+$mSd = [regex]::Match($ScriptArgs, '(?i)--(slot|relief)-depth\s+([0-9]*\.?[0-9]+)')
+if ($mSd.Success) { $sdv = [double]$mSd.Groups[2].Value; if ($sdv -gt 0) { $SlotDepthAbs = $sdv } }
+if ($NoSlots) { $SlotDepthAbs = 0.0 }
+# Corner-round flags (same contract as drilljig.cmd / drilljig-gui.cmd): the Surface
+# stage auto-rounds the conformal blank's sharp corner edges after it builds. Default
+# radius 0.25; --no-corner-round skips it.
+$NoCornerRound = ($ScriptArgs -match '(?i)-{1,2}no-corner-round')
+$CornerRadius  = 0.25
+$mCr = [regex]::Match($ScriptArgs, '(?i)--corner-radius\s+([0-9]*\.?[0-9]+)')
+if ($mCr.Success) { $crv = [double]$mCr.Groups[1].Value; if ($crv -gt 0) { $CornerRadius = $crv } }
 
 # ============================================================================
 # SHARED LIBRARIES (dot-source ORDER matters: framework + pure math first, then the
@@ -67,16 +105,29 @@ if ($mSd.Success) { $sdv = [double]$mSd.Groups[1].Value; if ($sdv -gt 0) { $Slot
 . (Join-Path $ScriptDir 'lib\blind_evaluator.ps1')     # (optional hole-count gate; harmless if unused)
 . (Join-Path $ScriptDir 'lib\drilljig_core.ps1')       # catalog resolvers + shared COM primitives + Initialize-DrilljigCore
 . (Join-Path $ScriptDir 'lib\conformal_blank.ps1')     # STAGE-1 offset+thicken engine + On-Point normal-hole macro + buffer readers
+. (Join-Path $ScriptDir 'lib\edge_round.ps1')          # hands-free corner round (sweep-by-id -> filter length -> round); global:Invoke-CurvedCornerRound wraps it for the step closures
+. (Join-Path $ScriptDir 'lib\curved_fastener_hole.ps1') # fastener-plane point + reference/direction hole macros (the curvedholes workflow)
 . (Join-Path $ScriptDir 'lib\tangent_plane.ps1')       # Build-TangentPlaneMacro / Invoke-TangentPlane
-. (Join-Path $ScriptDir 'lib\curved_slots.ps1')        # Get-CurvedSlotPlan / Test-CurvedSlotPlan
-. (Join-Path $ScriptDir 'lib\curved_slot_macros.ps1')  # Invoke-CurvedSlotArm/Cut/PlanRun
+. (Join-Path $ScriptDir 'lib\curved_slots.ps1')        # Get-CurvedSlotPlan / Test-CurvedSlotPlan (kept: the console tool drilljig3d.cmd still uses these)
+. (Join-Path $ScriptDir 'lib\curved_slot_macros.ps1')  # Invoke-CurvedSlotArm/Cut/PlanRun (kept: the console tool still uses these)
+. (Join-Path $ScriptDir 'lib\curved_relief.ps1')       # Build-CurvedReliefArm/CutMacro + Invoke-FastenerRelief (TOP-plane SYMMETRIC chip-relief, cut inline per fastener)
 . (Join-Path $ScriptDir 'lib\wizard.ps1')              # New-WizardStep / Show-Wizard / the wizard framework
 . (Join-Path $ScriptDir 'lib\curved_gui_helpers.ps1')  # ported canvas helpers + bushing-tree walk state machine
-# The four step-group libs (each defines ONE global Add-Curved*Steps -Steps fn).
+# The step-group libs (each defines ONE global Add-Curved*Steps -Steps fn), plus the
+# INPUT-FIRST composition layer. Flow: front-load ALL input (Fasteners select ->
+# Surface pick -> Conditions numbers), then STAGE 4 'build-run' fires the whole build
+# hands-free (blank -> corners -> drill all holes), then STAGE 5 'slot-*' re-selects
+# the fasteners + draws each chip-relief rectangle. curved_gui_steps_compose.ps1 owns
+# the canonical step ORDER (Add-CurvedInputFirstSteps) so the shell + the offline
+# harnesses build the identical ordered inventory. The manual-datum-point Drill lib is
+# left on disk but not wired in.
 . (Join-Path $ScriptDir 'lib\curved_gui_steps_bushing.ps1')
 . (Join-Path $ScriptDir 'lib\curved_gui_steps_surface.ps1')
-. (Join-Path $ScriptDir 'lib\curved_gui_steps_drill.ps1')
-. (Join-Path $ScriptDir 'lib\curved_gui_steps_relief.ps1')
+. (Join-Path $ScriptDir 'lib\curved_gui_steps_fastener.ps1')
+. (Join-Path $ScriptDir 'lib\curved_gui_steps_build.ps1')
+. (Join-Path $ScriptDir 'lib\curved_gui_steps_slots.ps1')
+. (Join-Path $ScriptDir 'lib\curved_gui_steps_done.ps1')
+. (Join-Path $ScriptDir 'lib\curved_gui_steps_compose.ps1')
 
 # ============================================================================
 # DECISION TREE (loaded pre-connect; the Bushing stage walks it as cards)
@@ -119,7 +170,7 @@ $modelFile = ""
 try { $modelFile = [string]$model.FileName } catch {}
 if ($modelFile -match '\.asm(\.\d+)?$') {
     try { $connection.Disconnect($null) } catch {}
-    throw "The active model is an ASSEMBLY ($modelFile). This tool builds a jig blank in a single PART. Open the PART, then re-run."
+    throw ("The ACTIVE model is the top assembly ($modelFile). In the top-down assembly, ACTIVATE the drilljig PART first (right-click it in the tree -> Activate) so feature creation routes into the jig part, then re-run. (Once activated, the active model is the .prt and the tool proceeds; you can still Ctrl-click the curved surface + the fasteners' planes as external references.)")
 }
 Write-Host " Connected to $modelFile" -ForegroundColor Green
 
@@ -145,10 +196,20 @@ try { Initialize-DrilljigCore -Session $session -Model $model -TypeObj $pfcType 
 #   Thickness/StandOff       - conformal-blank inputs (Surface stage)
 #   SurfIds                  - the picked surface id(s) (Surface stage)
 #   BlankMade/BodyIndex/BodyId/BodyName  - conformal blank result (Surface stage output)
-#   DrillPerHole/HolePairs/HoleDiaDrill  - drill inputs; HolePairs = @({PointId;SurfaceId;TangentPlaneId})
-#   HolesMade/CurvedHolePairs/CurvedHoleDiaFinal  - drill output -> Relief input
-#   TangentOrient/DefaultOrient/NoSlots/SlotDepthAbs  - flags
-#   SlotSkip/SlotPlan/SlotsCut  - relief state
+#   FastenerComponents/FastenerSurfId  - STAGE-1 fastener select (components picked once;
+#                                        FastenerComponents = @({Path;CompIds;Origin}),
+#                                        FastenerSurfId defaulted in the Surface stage)
+#   FastenerHoleDia/FastenerHoleDiaValid/FastenerHolesMade  - fastener drill state
+#   CurvedHolePairs/CurvedHoleDiaFinal  - STAGE-4 drill output;
+#                                         CurvedHolePairs = @({PointId;TopPlaneId;ViaPlane;ReliefCut})
+#   TangentOrient/DefaultOrient/FlipThicken/NoSlots/SlotDepthAbs  - flags
+#   NoCornerRound/CornerRadius/CornersRounded/BlankThickness  - corner-round state (STAGE-4 build)
+#   ReliefDepth/ReliefDepthValid  - chip-relief depth `r` (Conditions stage): the STAGE-4
+#                                   thicken grows to wall + r; STAGE 5 cuts a symmetric 2r
+#                                   pocket on each fastener's TOP plane; 0 = no relief.
+#   ReliefComponents  - STAGE-5 fresh fastener re-selection for the relief sketch (separate
+#                       from FastenerComponents so the drill record is not clobbered)
+#   ReliefsCut  - count of relief pockets cut (tallied in STAGE 5)
 # ============================================================================
 $ctx = @{
     Session = $session; Model = $model; Type = $pfcType
@@ -169,11 +230,35 @@ $ctx = @{
     Thickness = $null; ThicknessValid = $false; StandOff = 0.0; StandOffValid = $true
     SurfIds = @(); BlankMade = $false; SurfaceArmed = $false
     BodyIndex = $null; BodyId = $null; BodyName = $null
+    # guided offset->pick->finish state (Surface stage; before-sets + stamps for the canary/diff)
+    BlankBeforeFeat = @{}; BlankBeforeSurf = @{}; BlankBeforeBodies = @{}
+    BlankStamp = $null; BlankStamp2 = $null; OffsetFeatId = $null; QuiltSurfIds = @()
+    # fastener-plane hole stage (the dumbclaude workflow: select components once,
+    # loop each, resolve TOP/SIDE/FRONT by ID, drill normal-to-surface via tangent planes)
+    FastenerComponents = @(); FastenerSurfId = $null
+    FastenerHoleDia = $null; FastenerHoleDiaValid = $false; FastenerHolesMade = 0
     DrillPerHole = $false; HolePairs = @(); HoleDiaDrill = $null; HoleDiaDrillValid = $false; DrillArmed = $false
     HolesMade = 0; CurvedHolePairs = @(); CurvedHoleDiaFinal = $null
     TangentOrient = (-not $DefaultOrient); DefaultOrient = [bool]$DefaultOrient
+    FlipThicken = [bool]$Flip
     NoSlots = [bool]$NoSlots; SlotDepthAbs = [double]$SlotDepthAbs
     SlotSkip = $false; SlotPlan = $null; SlotsCut = $false
+    # chip-relief (Bushing stage input -> Surface thicken bump + Fasteners inline cut).
+    # ReliefDepth seeds from the --relief-depth/--slot-depth flag (0 when --no-relief);
+    # the Bushing relief-depth step lets the operator change it. A seeded numeric default
+    # is VALID (0 = disabled is a valid choice). ReliefsCut tallies the pockets actually cut.
+    ReliefDepth = [double]$SlotDepthAbs; ReliefDepthValid = $true; ReliefsCut = 0
+    # STAGE-5 chip-relief re-selection: the operator re-picks the fasteners in the Slots
+    # stage (fresh component paths -- the STAGE-1 selection's paths went stale over the
+    # whole build), stored SEPARATELY so the drill record (FastenerComponents) is untouched.
+    ReliefComponents = @()
+    # corner-round state (Surface stage, after blank-build): CornerRadius/NoCornerRound
+    # are the flag values; CornersRounded is the done-flag the step sets on a verified
+    # round (gates the idempotent revisit + the RebuiltNotice).
+    NoCornerRound = [bool]$NoCornerRound; CornerRadius = [double]$CornerRadius; CornersRounded = $false
+    # the ACTUAL thicken applied to the blank (wall + relief), recorded by blank-build so
+    # corner-round targets the blank's true through-thickness edge length (not wall alone).
+    BlankThickness = $null
     Is3dPrint = $false
 }
 
@@ -181,15 +266,16 @@ $ctx = @{
 # BUILD THE STEP LIST (each group lib appends its steps in stage order)
 # ============================================================================
 $steps = New-Object System.Collections.ArrayList
-Add-CurvedBushingSteps -Steps $steps   # Welcome + Bushing (tree, thickness, standoff)
-Add-CurvedSurfaceSteps -Steps $steps   # Surface (arm pick, offset+thicken run)
-Add-CurvedDrillSteps   -Steps $steps   # Drill (mode, arm points, diameter, drill run)
-Add-CurvedReliefSteps  -Steps $steps   # Relief (intro, plan, run) + Done
+# INPUT-FIRST composition: ONE adder builds every step in the canonical order
+# (Welcome / Fasteners select / Surface pick / Conditions inputs / Build batch /
+# Slots relief / Done). curved_gui_steps_compose.ps1 owns the order so the shell +
+# the offline harnesses see the identical inventory.
+Add-CurvedInputFirstSteps   -Steps $steps
 
 # ============================================================================
 # RUN THE WIZARD
 # ============================================================================
-$stages = @('Welcome','Bushing','Surface','Drill','Relief','Done')
+$stages = @('Welcome','Fasteners','Surface','Conditions','Build','Slots','Done')
 $subtitle = "Curved jig - Connected: $([System.IO.Path]::GetFileName($modelFile))"
 
 try {

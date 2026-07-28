@@ -1,0 +1,188 @@
+<p>Every tool in the toolkit besides the flat drill-jig wizard lives here. If you just want the whole thing, grab the complete repo below and keep the folder structure intact. Individual scripts are listed further down for grabbing or inspecting one file at a time.</p>
+
+<div class="dlrow">
+  <button class="dlbtn" onclick="dl('pl_toolkit_zip')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg> Download ngs-orthogrid-toolkit.zip (complete repo) <span class="sz">~1.39 MB</span></button>
+</div>
+
+<div class="callout warn">
+  <div class="t">Read before downloading single scripts</div>
+  <p>The complete toolkit zip contains everything: <code>pipeline\</code>, <code>tools\</code>, <code>previews\</code>, <code>probes\</code>, the shared <code>lib\</code>, <code>data\</code> catalogs, <code>docs\</code>, and the <code>CLAUDE.md</code> / <code>DEV_NOTES.md</code> / <code>MAPKEYS.md</code> reference. Extract it and <strong>keep the folder structure</strong> &mdash; each <code>.cmd</code> re-anchors <code>$ScriptDir</code> to the repo root so <code>lib\</code>, <code>data\</code> and <code>docs\</code> resolve.</p>
+  <p>The individual per-tool buttons below are for grabbing or inspecting <strong>one</strong> script. A lone <code>.cmd</code> still needs the toolkit's <code>lib\</code> + <code>data\</code> + <code>docs\</code> beside it to <strong>run</strong>.</p>
+</div>
+
+<section class="block">
+  <h2 class="sec">Pipeline &mdash; end-to-end flow + bushing selector</h2>
+  <p>The production flows that chain the primitives together, plus the standalone bushing selector that feeds them.</p>
+  <table>
+    <tr><th>Tool</th><th>What it does</th></tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_drilljig')">drilljig.cmd</button></td>
+      <td>Flat drill-jig CONSOLE flow &mdash; bushing pick &rarr; parametric box &rarr; corner round &rarr; datum points &rarr; On-Point drilling &rarr; chip-relief slots in one connect/build/drill/slot pass. Supports all four point modes. Flags: <code>--slot-depth N</code>, <code>--slot-dir X|Z</code>, <code>--slot-face</code>, <code>--corner-radius N</code>, <code>--no-corner-round</code>, <code>--no-base-csys</code>, <code>--fastener-index</code>.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_drilljig3d')">drilljig3d.cmd</button></td>
+      <td>Curved / conformal CONSOLE flow &mdash; pick a surface &rarr; offset (at a standoff) &rarr; thicken into a new body &rarr; optional On-Point holes normal to the surface &rarr; optional one chip-relief slot per hole. Flags: <code>--no-tree</code>, <code>--tangent-orient</code>, <code>-defaultorient</code>, <code>--no-slots</code>, <code>--slot-depth N</code>.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_drilljig3d-gui')">drilljig3d-gui.cmd</button></td>
+      <td>The curved / conformal WinForms WIZARD (analog of the flat GUI in Tab 1). Builds a CONFORMAL BLANK (offset + thicken of the picked surface) instead of a box. Requires the jig PART to be the ACTIVE model (Activate it inside a top-down assembly first). Stages: Welcome, Bushing, Surface, Fasteners, Relief, Done. See the Roadmap tab &mdash; several curved legs are canary-gated but <span class="pill wip">unverified</span> live.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_jiginator')">jiginator.cmd</button></td>
+      <td>The bushing SELECTOR on its own &mdash; walks the decision tree + bushing catalogs to recommend a bushing OD/ID/length (OD = the drilled jig-hole diameter), with an OD-first metal path and an ID-first sleeve path. Writes <code>last_jig_spec.json</code> as a handoff to the drilling tools.</td>
+    </tr>
+  </table>
+  <p class="muted">Note: the FLAT wizard, <code>drilljig-gui</code>, is the download on the &ldquo;Using the GUI&rdquo; tab.</p>
+</section>
+
+<section class="block">
+  <h2 class="sec">Standalone primitives (tools/)</h2>
+  <p>Each proves ONE Creo capability in isolation; several are the building blocks the pipeline folds in.</p>
+  <table>
+    <tr><th>Tool</th><th>What it does</th></tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_boxinator')">boxinator.cmd</button></td>
+      <td>Rectangular extrude to exact L/W/H, measures the solid, and auto-corrects the depth dimension if it came out wrong &mdash; verified parametric geometry creation.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_cornerinator')">cornerinator.cmd</button></td>
+      <td>Auto-detects a plate's vertical corner edges and rounds them, with a manual-pick fallback.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_csysinator')">csysinator.cmd</button></td>
+      <td>Creates a datum coordinate system at the intersection of three selected planes, fed by ID.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_diminator')">diminator.cmd</button></td>
+      <td>Reads a CSV of dimensions BACK into a model (the read-back companion to gauginator), with a 2-pass verify/repair loop for sketch dims.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_fastenator')">fastenator.cmd</button></td>
+      <td>Reads fastener bore centers from an open part/assembly (cylinder-axis, the proven non-crashing read), projects to a 2D (X,Z) layout, and writes <code>fastener_layout.json</code>.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_flipenator')">flipenator.cmd</button></td>
+      <td>Batch selection capture and per-body flip/mirror redefine operations.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_gauginator')">gauginator.cmd</button></td>
+      <td>Whole-model traversal + dimension / mass-property extraction to CSV (the export half of the round-trip).</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_gripenator')">gripenator.cmd</button></td>
+      <td>Interactive fastener/nut management in an assembly &mdash; filter valid HST fasteners, change diameter/grip with matching nuts, convert coatings to the grounding variant.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_holeinator')">holeinator.cmd</button></td>
+      <td>Creates a native On-Point hole at every selected datum point, each an atomic select-by-ID + hole-dashboard macro (canary-verifies hole #1 before committing the rest).</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_holelayoutinator')">holelayoutinator.cmd</button></td>
+      <td>Read-only hole-pattern inspection &mdash; reads selected bore surfaces, projects to a tilt-safe 2D layout, analyses spacing/collision; writes <code>hole_layout.json</code>.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_nodelator')">nodelator.cmd</button></td>
+      <td>Copies a feature to many datum-point locations via Paste-Special by reference, rerouting each placement.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_pocketinator')">pocketinator.cmd</button></td>
+      <td>Cuts one connected chip-clearance pocket as a shallow blind remove-material extrude, offset inward from the plate boundary.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_radinator')">radinator.cmd</button></td>
+      <td>Pure-VB-API edge filtering (by length / curve type) feeding a batched round mapkey.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_slotinator')">slotinator.cmd</button></td>
+      <td>Cuts one blind rectangular chip-relief slot per hole row (seed drawn once, then patterned).</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_surfenator')">surfenator.cmd</button></td>
+      <td>Creates surfaces by extruding selected 3D curves between datum planes.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_thickenator')">thickenator.cmd</button></td>
+      <td>Thickens selected surface quilts into solid bodies (the pattern reused by boxinator and the conformal blank).</td>
+    </tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">Previews / visualizers (previews/)</h2>
+  <p>No Creo needed; driven by the SAME production sources the live tools use (never a re-implementation).</p>
+  <table>
+    <tr><th>Tool</th><th>What it does</th></tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_bushing-preview')">bushing-preview.cmd</button></td>
+      <td>2D bushing schematic (GDI+), rendered from OD/ID/Length via <code>lib\bushing_svg.ps1</code>.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_bushing-3d-preview')">bushing-3d-preview.cmd</button></td>
+      <td>A selected bushing as both the 2D schematic and a live 3D model (WPF Media3D, hollow bore + head flange).</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_drilljig-3d-preview')">drilljig-3d-preview.cmd</button></td>
+      <td>3D drill-jig plate with live sliders (WPF Media3D, ZERO external DLLs), dot-sourcing the real <code>lib\orthogrid.ps1</code> so it matches production. The zero-dependency fallback renderer.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_drilljig-3d-webview')">drilljig-3d-webview.cmd</button></td>
+      <td>High-fidelity 3D jig hosting the approved <code>docs\drilljig_3d_preview.html</code> (WebView2 + three.js/WebGL) via <code>lib\webview2_host.ps1</code>.</td>
+    </tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">Probes / diagnostics (probes/)</h2>
+  <p>The &ldquo;probe, don't guess&rdquo; layer. Each answers ONE live question about a VB-API read path or a mapkey widget sequence before it is trusted in a production tool. Findings are transcribed into the <code>lib\</code> helpers.</p>
+  <table>
+    <tr><th>Tool</th><th>What it does</th></tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_fastener-probe')">fastener-probe.cmd</button></td>
+      <td>Read-only fastener-center geometry dump (no mutation).</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_drilljig3d-probe')">drilljig3d-probe.cmd</button></td>
+      <td>Read-only curved-jig geometry dump.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_holeprobe')">holeprobe.cmd</button></td>
+      <td>Read-only hole geometry dump.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_slotplane-probe')">slotplane-probe.cmd</button></td>
+      <td>Read-only slot-plane read check.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_fastenerplane-probe')">fastenerplane-probe.cmd</button></td>
+      <td>Read-only fastener-plane read check.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_csystrf-probe')">csystrf-probe.cmd</button></td>
+      <td>Trail RECORDER &mdash; captures the exact csys-transform widget tokens.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_holepat-probe')">holepat-probe.cmd</button></td>
+      <td>Trail RECORDER &mdash; captures the hole-pattern widget tokens.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_slotpat-probe')">slotpat-probe.cmd</button></td>
+      <td>Trail RECORDER &mdash; captures the slot-pattern widget tokens.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_tangent-plane-probe')">tangent-plane-probe.cmd</button></td>
+      <td>Creates one throwaway tangent-plane feature under a canary to settle the recipe.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_curvedhole-probe')">curvedhole-probe.cmd</button></td>
+      <td>Creates one throwaway curved-hole feature under a canary to settle the recipe.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_csys-negoffset-probe')">csys-negoffset-probe.cmd</button></td>
+      <td>Creates one throwaway negative-offset csys under a canary to settle the recipe.</td>
+    </tr>
+    <tr>
+      <td><button class="dlbtn mini" onclick="dl('pl_cmd_onpointhole-probe')">onpointhole-probe.cmd</button></td>
+      <td>Creates one throwaway On-Point fastener hole under a canary to settle, live, whether the curved-jig <em>hands-free</em> hole orients via a pre-selected point + the <code>ft_dir</code> collector &mdash; the exact <code>Invoke-FastenerHole</code> choreography, with a selection-buffer dump after every step. (Read-only IDs; mutates one throwaway point + hole behind a y/N + canary.)</td>
+    </tr>
+  </table>
+</section>

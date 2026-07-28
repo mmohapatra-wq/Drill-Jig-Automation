@@ -57,7 +57,7 @@ $model = $fakeModel; $session = $null; $pfcType = $null; $modelFile = 'jig.prt'
 $script:model = $fakeModel; $script:session = $null; $script:connection = $null; $script:macroFailures = 0
 
 # extract the GUI helper region (defines New-BushingViewportHost, Add-Para, Get-UiColor, ...)
-$src = Get-Content -Raw (Join-Path $root 'drilljig-gui.cmd')
+$src = Get-Content -Raw (Join-Path $root 'pipeline\drilljig-gui.cmd')
 $h0 = $src.IndexOf('# STEP BUILDERS'); $h1 = $src.IndexOf('# Build the connection up front')
 if ($h0 -lt 0 -or $h1 -lt 0) { Write-Host "  [FAIL] could not find helper region markers"; exit 1 }
 Invoke-Expression $src.Substring($h0, $h1 - $h0) | Out-Null

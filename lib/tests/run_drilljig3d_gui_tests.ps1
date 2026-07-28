@@ -48,11 +48,18 @@ Write-Host ""
 Write-Host "  -- parse: curved-GUI files --" -ForegroundColor White
 $files = @(
     'lib\conformal_blank.ps1',
+    'lib\edge_round.ps1',
+    'lib\curved_fastener_hole.ps1',
     'lib\curved_gui_helpers.ps1',
     'lib\curved_gui_steps_bushing.ps1',
     'lib\curved_gui_steps_surface.ps1',
+    'lib\curved_gui_steps_fastener.ps1',
     'lib\curved_gui_steps_drill.ps1',
-    'lib\curved_gui_steps_relief.ps1'
+    'lib\curved_relief.ps1',
+    'lib\curved_gui_steps_build.ps1',
+    'lib\curved_gui_steps_slots.ps1',
+    'lib\curved_gui_steps_compose.ps1',
+    'lib\curved_gui_steps_done.ps1'
 )
 foreach ($rel in $files) {
     $p = Join-Path $root $rel
@@ -80,18 +87,21 @@ Write-Host ""
 Write-Host "  -- shell contract: drilljig3d-gui.cmd --" -ForegroundColor White
 if ($null -ne $guiRaw) {
     Assert-True "launcher uses -STA (WinForms)"           ($guiRaw -match '(?m)powershell .*-STA')
-    Assert-True 'stages = Welcome/Bushing/Surface/Drill/Relief/Done' `
-        ($guiRaw -match "\`$stages\s*=\s*@\(\s*'Welcome'\s*,\s*'Bushing'\s*,\s*'Surface'\s*,\s*'Drill'\s*,\s*'Relief'\s*,\s*'Done'\s*\)")
-    Assert-True "dot-sources lib\wizard.ps1"              ($guiRaw -match 'lib\\wizard\.ps1')
-    Assert-True "dot-sources lib\conformal_blank.ps1"     ($guiRaw -match 'lib\\conformal_blank\.ps1')
-    Assert-True "dot-sources lib\tangent_plane.ps1"       ($guiRaw -match 'lib\\tangent_plane\.ps1')
-    Assert-True "dot-sources lib\curved_slots.ps1"        ($guiRaw -match 'lib\\curved_slots\.ps1')
-    Assert-True "dot-sources lib\curved_slot_macros.ps1"  ($guiRaw -match 'lib\\curved_slot_macros\.ps1')
-    Assert-True "dot-sources lib\curved_gui_helpers.ps1"  ($guiRaw -match 'lib\\curved_gui_helpers\.ps1')
-    Assert-True "calls Add-CurvedBushingSteps"            ($guiRaw -match 'Add-CurvedBushingSteps')
-    Assert-True "calls Add-CurvedSurfaceSteps"            ($guiRaw -match 'Add-CurvedSurfaceSteps')
-    Assert-True "calls Add-CurvedDrillSteps"              ($guiRaw -match 'Add-CurvedDrillSteps')
-    Assert-True "calls Add-CurvedReliefSteps"             ($guiRaw -match 'Add-CurvedReliefSteps')
+    Assert-True 'stages = Welcome/Fasteners/Surface/Conditions/Build/Slots/Done' `
+        ($guiRaw -match "\`$stages\s*=\s*@\(\s*'Welcome'\s*,\s*'Fasteners'\s*,\s*'Surface'\s*,\s*'Conditions'\s*,\s*'Build'\s*,\s*'Slots'\s*,\s*'Done'\s*\)")
+    Assert-True "dot-sources lib\wizard.ps1"                ($guiRaw -match 'lib\\wizard\.ps1')
+    Assert-True "dot-sources lib\conformal_blank.ps1"       ($guiRaw -match 'lib\\conformal_blank\.ps1')
+    Assert-True "dot-sources lib\edge_round.ps1"            ($guiRaw -match 'lib\\edge_round\.ps1')
+    Assert-True "dot-sources lib\curved_fastener_hole.ps1"  ($guiRaw -match 'lib\\curved_fastener_hole\.ps1')
+    Assert-True "dot-sources lib\tangent_plane.ps1"         ($guiRaw -match 'lib\\tangent_plane\.ps1')
+    Assert-True "dot-sources lib\curved_slots.ps1"          ($guiRaw -match 'lib\\curved_slots\.ps1')
+    Assert-True "dot-sources lib\curved_slot_macros.ps1"    ($guiRaw -match 'lib\\curved_slot_macros\.ps1')
+    Assert-True "dot-sources lib\curved_relief.ps1"         ($guiRaw -match 'lib\\curved_relief\.ps1')
+    Assert-True "dot-sources lib\curved_gui_steps_build.ps1"   ($guiRaw -match 'lib\\curved_gui_steps_build\.ps1')
+    Assert-True "dot-sources lib\curved_gui_steps_slots.ps1"   ($guiRaw -match 'lib\\curved_gui_steps_slots\.ps1')
+    Assert-True "dot-sources lib\curved_gui_steps_compose.ps1" ($guiRaw -match 'lib\\curved_gui_steps_compose\.ps1')
+    Assert-True "dot-sources lib\curved_gui_helpers.ps1"    ($guiRaw -match 'lib\\curved_gui_helpers\.ps1')
+    Assert-True "calls Add-CurvedInputFirstSteps (the input-first composition)" ($guiRaw -match 'Add-CurvedInputFirstSteps')
     Assert-True "re-inits DrilljigCore with the live session" ($guiRaw -match 'Initialize-DrilljigCore\s+-Session\s+\$session')
     Assert-True ".asm mode guard present"                 ($guiRaw -match '\\.asm')
     # It must not INVOKE/dot-source drilljig-gui.cmd (a comment MENTION of it as "the
@@ -106,25 +116,38 @@ if ($null -ne $guiRaw) {
 Write-Host ""
 Write-Host "  -- resolve + build: Add-Curved*Steps append the expected steps --" -ForegroundColor White
 foreach ($dep in @('creo_geometry.ps1','orthogrid.ps1','orthogrid_points.ps1','drilljig_core.ps1',
-                   'conformal_blank.ps1','tangent_plane.ps1','curved_slots.ps1','curved_slot_macros.ps1',
+                   'conformal_blank.ps1','edge_round.ps1','curved_fastener_hole.ps1','tangent_plane.ps1','curved_slots.ps1','curved_slot_macros.ps1','curved_relief.ps1',
                    'wizard.ps1','curved_gui_helpers.ps1',
                    'curved_gui_steps_bushing.ps1','curved_gui_steps_surface.ps1',
-                   'curved_gui_steps_drill.ps1','curved_gui_steps_relief.ps1')) {
+                   'curved_gui_steps_fastener.ps1','curved_gui_steps_build.ps1','curved_gui_steps_slots.ps1',
+                   'curved_gui_steps_done.ps1','curved_gui_steps_compose.ps1')) {
     $p = Join-Path $libDir $dep
     if (Test-Path $p) { try { . $p } catch { Write-Host "    (load note: $dep -> $($_.Exception.Message))" -ForegroundColor DarkGray } }
 }
-foreach ($fn in @('Add-CurvedBushingSteps','Add-CurvedSurfaceSteps','Add-CurvedDrillSteps','Add-CurvedReliefSteps')) {
+# the input-first composition adder + the per-stage adders it calls must all resolve.
+foreach ($fn in @('Add-CurvedInputFirstSteps','Add-CurvedBushingSteps','Add-CurvedSurfaceSteps','Add-CurvedFastenerHoleSteps','Add-CurvedBuildSteps','Add-CurvedSlotSteps','Add-CurvedDoneSteps')) {
     Assert-True "resolves: $fn" ($null -ne (Get-Command $fn -ErrorAction SilentlyContinue))
 }
+# the STAGE-4 batch action helpers + the TOP-plane symmetric chip-relief engine must be
+# GLOBAL so the build-run OnNext + the slot-loop Add_Click closure resolve them (the
+# closure-scope rule -- Section 6 lints the calls; this asserts they exist).
+foreach ($fn in @('Invoke-CurvedBlankAction','Invoke-CurvedCornerAction','Invoke-CurvedDrillAll',
+                  'Build-CurvedReliefArmMacro','Build-CurvedReliefCutMacro','Invoke-FastenerRelief')) {
+    Assert-True "resolves: $fn (global)" ($null -ne (Get-Command $fn -ErrorAction SilentlyContinue))
+}
+# the corner-round step's OnNext calls the GLOBAL wrapper Invoke-CurvedCornerRound; a
+# curved-GUI step closure can only resolve `function global:` names, so assert it is
+# GLOBAL-scoped + resolvable (a plain Invoke-AutoCornerRound would be invisible to the
+# closure at runtime -- the exact scope wall Section 6 below lints for).
+$ccr = Get-Command Invoke-CurvedCornerRound -ErrorAction SilentlyContinue
+Assert-True "resolves: Invoke-CurvedCornerRound (global wrapper for the step closure)" ($null -ne $ccr)
 
+# Build the ordered list via the SINGLE input-first composition adder (exactly what the
+# shell + fuzz call), so the inventory + order asserts reflect what the operator sees.
 $steps = New-Object System.Collections.ArrayList
 $built = $true
-foreach ($adder in @('Add-CurvedBushingSteps','Add-CurvedSurfaceSteps','Add-CurvedDrillSteps','Add-CurvedReliefSteps')) {
-    if ($null -ne (Get-Command $adder -ErrorAction SilentlyContinue)) {
-        try { & $adder -Steps $steps } catch { $built = $false; Write-Host "    ($adder threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
-    }
-}
-Assert-True "all four adders ran without throwing" $built
+try { Add-CurvedInputFirstSteps -Steps $steps } catch { $built = $false; Write-Host "    (Add-CurvedInputFirstSteps threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
+Assert-True "Add-CurvedInputFirstSteps ran without throwing" $built
 Assert-True "produced >= 12 steps" (@($steps).Count -ge 12) ("got {0}" -f @($steps).Count)
 
 # collect the (Key, Stage) inventory
@@ -132,17 +155,26 @@ $keys   = @($steps | ForEach-Object { [string]$_.Key })
 $stagesSeen = @($steps | ForEach-Object { [string]$_.Stage } | Select-Object -Unique)
 Write-Host ("    steps: " + ($keys -join ', ')) -ForegroundColor DarkGray
 
-foreach ($k in @('welcome','tree','thickness','standoff','surface-arm','surface-run',
-                 'drill-mode','drill-arm-points','drill-diameter','drill-run',
-                 'relief-intro','relief-plan','relief-run','done')) {
+foreach ($k in @('welcome','fastener-select','surface-arm',
+                 'tree','thickness','standoff','relief-depth','fastener-dia',
+                 'build-run','slot-select','slot-loop','done')) {
     Assert-True "has step '$k'" ($keys -contains $k)
 }
-foreach ($stg in @('Welcome','Bushing','Surface','Drill','Relief','Done')) {
+foreach ($stg in @('Welcome','Fasteners','Surface','Conditions','Build','Slots','Done')) {
     Assert-True "stage '$stg' is covered by >=1 step" ($stagesSeen -contains $stg)
 }
 # welcome first, done last
 Assert-True "first step is 'welcome'" (@($keys)[0] -eq 'welcome')
 Assert-True "last step is 'done'"     (@($keys)[-1] -eq 'done')
+# INPUT-FIRST ORDER: fasteners + surface come BEFORE the conditions/build/slots.
+$idx = @{}; for ($ii=0; $ii -lt $keys.Count; $ii++) { $idx[$keys[$ii]] = $ii }
+Assert-True "order: fastener-select before surface-arm before tree/build-run" `
+    (($idx['fastener-select'] -lt $idx['surface-arm']) -and ($idx['surface-arm'] -lt $idx['tree']) -and ($idx['tree'] -lt $idx['build-run']) -and ($idx['build-run'] -lt $idx['slot-loop']))
+# STAGE CONTIGUITY: each stage's steps are contiguous in the array (the breadcrumb needs it).
+$stageSeq = @($steps | ForEach-Object { [string]$_.Stage })
+$seenStages = @(); $contig = $true
+foreach ($st in $stageSeq) { if (@($seenStages)[-1] -ne $st) { if ($seenStages -contains $st) { $contig = $false; break }; $seenStages += $st } }
+Assert-True "each stage's steps are contiguous in the step list" $contig
 
 # every step object has the framework shape
 $shapeOk = $true
@@ -250,6 +282,43 @@ if ($validReads.Count -eq 0) {
     foreach ($f in ($validReads.Keys | Sort-Object)) {
         Assert-True "ctx gate field `$c.$f (read in $($validReads[$f])) is seeded in the `$ctx initializer" ($seeded.ContainsKey($f)) "(not seeded -> reads $null->false before its Build runs)"
     }
+}
+
+# ----------------------------------------------------------------------------
+# 6. LINT: no curved-GUI STEP file may CALL a non-global drilljig_core COM primitive
+#    directly. Get-FeatureIdSet / Wait-ModelModified / Invoke-Macro / Invoke-ForceRegen
+#    are `function` (NOT `function global:`) in drilljig_core.ps1, so a step's
+#    .GetNewClosure() Build/Add_Click handler CANNOT resolve them -- calling one from a
+#    closure throws "The term '<fn>' is not recognized" at RUNTIME (the live 2026-07-27
+#    18:15 fastener-loop handler error). They MUST be reached through a `function global:`
+#    curved-lib wrapper (Invoke-ConformalBlank / Invoke-FastenerPoint / Invoke-FastenerHole
+#    / Invoke-TangentPlane / Invoke-CurvedSlot*). The fuzz harness MASKS this because it
+#    defines those primitives as global test stubs, so this static lint is the real guard.
+#    Tokenizer-based: flag a Command token whose name is one of the primitives inside a
+#    step file (comments/strings never tokenize as Command, so a doc mention is safe).
+# ----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "  -- lint: step files never call a non-global COM primitive from a closure --" -ForegroundColor White
+# edge_round.ps1's functions are PLAIN `function` too (dot-sourced into the .cmd scope,
+# NOT global) -- a curved-GUI step closure cannot resolve them. The step MUST route
+# through the global wrapper Invoke-CurvedCornerRound, never call the orchestrator or
+# its helpers directly (that would throw "term not recognized" in a live handler).
+$closureUnsafe = @('Get-FeatureIdSet', 'Wait-ModelModified', 'Invoke-Macro', 'Invoke-ForceRegen',
+                   'Invoke-AutoCornerRound', 'Get-EdgesBySweep', 'Select-LowestDimensionEdges',
+                   'Resolve-EdgeSelectFactory', 'Add-EdgesToSelection', 'Build-EdgeRoundMacro',
+                   'Wait-EdgeModelChange', 'Get-SelectionEdgeIds')
+$stepFiles = @('lib\curved_gui_steps_bushing.ps1','lib\curved_gui_steps_surface.ps1','lib\curved_gui_steps_fastener.ps1','lib\curved_gui_steps_build.ps1','lib\curved_gui_steps_slots.ps1','lib\curved_gui_steps_done.ps1')
+foreach ($rel in $stepFiles) {
+    $p = Join-Path $root $rel
+    if (-not (Test-Path $p)) { continue }
+    $tk = Get-TokensSafe (Get-Content -Raw $p)
+    $callHits = @()
+    foreach ($t in $tk) {
+        if ($t.Type -eq 'Command' -and ($closureUnsafe -contains [string]$t.Content)) {
+            $callHits += ("{0} (line {1})" -f $t.Content, $t.StartLine)
+        }
+    }
+    Assert-True "no closure-unsafe COM primitive call in $rel" (@($callHits).Count -eq 0) ("(" + (@($callHits) -join ', ') + ") -- route via a global Invoke-* wrapper")
 }
 
 Write-Host ""

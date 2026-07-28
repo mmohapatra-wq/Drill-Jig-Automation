@@ -866,6 +866,10 @@ function global:Write-FastenerLayout {
     )
     if ($null -eq $Layout) { return $false }
     try {
+        # Ensure the destination dir exists (handoffs now live under <repo>\artifacts\;
+        # Set-Content throws on a missing parent). Also covers --out overrides.
+        $parent = Split-Path -Parent $Path
+        if ($parent -and -not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
         $ptsOut = @()
         foreach ($p in @($Layout.Points)) {
             $ptsOut += [pscustomobject]@{ X = [double]$p.X; Z = [double]$p.Z }

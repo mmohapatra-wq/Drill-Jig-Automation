@@ -130,7 +130,7 @@ $fakeSession | Add-Member ScriptMethod GetConfigOptionValues { param($k) $null }
 $fakeSession | Add-Member ScriptMethod SetConfigOption { param($k,$v) } -Force
 
 # --- extract the GUI helper region + the steps region, like the integration test
-$src = Get-Content -Raw (Join-Path $root 'drilljig-gui.cmd')
+$src = Get-Content -Raw (Join-Path $root 'pipeline\drilljig-gui.cmd')
 $h0 = $src.IndexOf('# STEP BUILDERS'); $h1 = $src.IndexOf('# Build the connection up front')
 if ($h0 -lt 0 -or $h1 -lt 0) { Fault 'extract' 'could not find helper region markers'; }
 else { Invoke-Expression $src.Substring($h0, $h1 - $h0) | Out-Null }

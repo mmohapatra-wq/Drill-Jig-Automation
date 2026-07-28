@@ -47,14 +47,15 @@ function global:Add-CurvedBushingSteps {
         -Build {
             param($panel, $c, $wiz)
             $y = 8
-            $y = (Add-Para $panel "This wizard builds a CONFORMAL (curved) drill jig that follows a part's surface, then drills bushing holes normal to that surface and cuts curved chip-relief slots." $y 0 '' $true).Bottom + 12
-            $y = (Add-Para $panel "What happens, step by step:" $y 0 'gray' $true).Bottom + 6
-            $y = (Add-Para $panel ([char]0x2022 + " Bushing & size - answer a few questions to pick the bushing and the hole diameter, and set the jig wall thickness.") $y 0 'gray').Bottom + 4
-            $y = (Add-Para $panel ([char]0x2022 + " Surface - click the part surface to follow. The tool offsets a copy of that surface and thickens it into a NEW conformal blank body of your chosen thickness.") $y 0 'gray').Bottom + 4
-            $y = (Add-Para $panel ([char]0x2022 + " Drill - pick the target points; each hole is drilled NORMAL to the surface at the bushing diameter.") $y 0 'gray').Bottom + 4
-            $y = (Add-Para $panel ([char]0x2022 + " Relief - cut curved chip-relief slots along the hole rows to clear chips/debris.") $y 0 'gray').Bottom + 12
-            $y = (Add-Para $panel "Some steps will ask you to click something in the Creo window (the surface, the points, or to draw a slot rectangle). When they do, the wizard waits and only continues once your pick checks out." $y 0 'gray').Bottom + 12
-            $y = (Add-Para $panel "Open the jig PART in Creo (not an assembly), then press Get started." $y 0 '' $true).Bottom + 8
+            $y = (Add-Para $panel "This wizard builds a CONFORMAL (curved) drill jig that follows a part's surface, drills bushing holes normal to that surface, and cuts chip-relief pockets. It is INPUT-FIRST: you make all the picks + enter all the numbers up front, then it builds everything hands-free." $y 0 '' $true).Bottom + 12
+            $y = (Add-Para $panel "What happens, in order:" $y 0 'gray' $true).Bottom + 6
+            $y = (Add-Para $panel ([char]0x2022 + " Fasteners - Ctrl-click the fastener components you want drilled.") $y 0 'gray').Bottom + 4
+            $y = (Add-Para $panel ([char]0x2022 + " Surface - click the part surface the jig should follow.") $y 0 'gray').Bottom + 4
+            $y = (Add-Para $panel ([char]0x2022 + " Conditions - pick the bushing + hole size, and enter the wall thickness, standoff, and chip-relief depth.") $y 0 'gray').Bottom + 4
+            $y = (Add-Para $panel ([char]0x2022 + " Build - one click: the tool builds the conformal blank, rounds the corners, and drills every hole NORMAL to the surface. No Creo picks.") $y 0 'gray').Bottom + 4
+            $y = (Add-Para $panel ([char]0x2022 + " Slots - re-select the fasteners once, then draw one chip-relief rectangle per hole (the only remaining interaction).") $y 0 'gray').Bottom + 12
+            $y = (Add-Para $panel "When a step asks you to click in Creo (the fasteners, the surface, or to draw a rectangle), the wizard waits until your pick checks out. Activate the drilljig PART inside the assembly first, then press Get started." $y 0 'gray').Bottom + 12
+            $y = (Add-Para $panel "Activate the jig PART in Creo (the fastener planes + surface are external references), then press Get started." $y 0 '' $true).Bottom + 8
         }
     [void]$Steps.Add($welcomeStep)
 
@@ -62,7 +63,7 @@ function global:Add-CurvedBushingSteps {
     # STEP 2 - TREE (Stage 'Bushing'): the decision-tree card walk. PORTED from
     # drilljig-gui.cmd ~1737-2340 (schematic omitted - see file header).
     # ========================================================================
-    $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bushing' -Kind 'choice' -PrimaryText 'Next' `
+    $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Conditions' -Kind 'choice' -PrimaryText 'Next' `
         -Validate {
             param($c)
             if ($c.TreeDone) { return $true }
@@ -525,7 +526,7 @@ function global:Add-CurvedBushingSteps {
     # inline-textbox pattern: precompute echo colors OUTSIDE the closure (Get-UiColor
     # is global but capturing avoids a per-keystroke resolve), write to $c.*, Refresh.
     # ========================================================================
-    $thicknessStep = New-WizardStep -Key 'thickness' -Title 'Jig wall thickness' -Stage 'Bushing' -Kind 'info' -PrimaryText 'Next' `
+    $thicknessStep = New-WizardStep -Key 'thickness' -Title 'Jig wall thickness' -Stage 'Conditions' -Kind 'info' -PrimaryText 'Next' `
         -Validate { param($c) return [bool]$c.ThicknessValid } `
         -Build {
             param($panel, $c, $wiz)
@@ -594,7 +595,7 @@ function global:Add-CurvedBushingSteps {
     # chip-clearance offset. Default 0 (flush). Live-validate a NON-NEGATIVE number
     # into $c.StandOff (blank == 0 is OK). Store the validity flag in $c.StandOffValid.
     # ========================================================================
-    $standoffStep = New-WizardStep -Key 'standoff' -Title 'Standoff / chip clearance' -Stage 'Bushing' -Kind 'info' -PrimaryText 'Next' `
+    $standoffStep = New-WizardStep -Key 'standoff' -Title 'Standoff / chip clearance' -Stage 'Conditions' -Kind 'info' -PrimaryText 'Next' `
         -Validate { param($c) return [bool]$c.StandOffValid } `
         -Build {
             param($panel, $c, $wiz)
@@ -649,4 +650,81 @@ function global:Add-CurvedBushingSteps {
         } `
         -OnNext { param($c, $wiz) return [bool]$c.StandOffValid }
     [void]$Steps.Add($standoffStep)
+
+    # ========================================================================
+    # STEP 5 - RELIEF DEPTH (Stage 'Bushing'): inline textbox for the chip-relief
+    # depth. Each fastener gets a SYMMETRIC remove-material pocket on its TOP plane
+    # `relief`-deep each way; the conformal blank thicken grows to wall + relief so
+    # there is material to remove. Default 0.25" (prefilled from $c.SlotDepthAbs, the
+    # --slot-depth/--relief-depth flag). 0 = NO chip relief (no thicken bump, no cuts).
+    # Live-validate a NON-NEGATIVE number into $c.ReliefDepth (0 is valid = disabled);
+    # store the validity flag in $c.ReliefDepthValid. Mirrors the standoff/thickness
+    # inline-textbox pattern: precompute echo colors OUTSIDE the closure, write $c.*, Refresh.
+    # ========================================================================
+    $reliefStep = New-WizardStep -Key 'relief-depth' -Title 'Chip-relief depth' -Stage 'Conditions' -Kind 'info' -PrimaryText 'Next' `
+        -Validate { param($c) return [bool]$c.ReliefDepthValid } `
+        -Build {
+            param($panel, $c, $wiz)
+            # Seed the default from the flag ($c.SlotDepthAbs) on first entry if unset.
+            if ($null -eq $c.ReliefDepth) {
+                $seed = 0.25
+                try { if ($null -ne $c.SlotDepthAbs -and [double]$c.SlotDepthAbs -gt 0) { $seed = [double]$c.SlotDepthAbs } } catch { $seed = 0.25 }
+                $c.ReliefDepth = [double]$seed
+            }
+            # A seeded numeric default is valid, so the step can pass with no typing.
+            if ($null -eq $c.ReliefDepthValid) { $c.ReliefDepthValid = $true }
+            $y = 8
+            $y = (Add-Para $panel "Chip-relief: each fastener hole gets a shallow rectangular pocket cut on its TOP plane to clear chips/debris while drilling. The pocket is a SYMMETRIC cut, this deep on each side of the plane." $y 0 'gray').Bottom + 6
+            $y = (Add-Para $panel "The conformal blank is thickened to wall + this relief so there is material to remove. Enter 0 for NO chip relief." $y 0 'gray').Bottom + 8
+            $lab = New-Object System.Windows.Forms.Label
+            $lab.Text = 'Relief depth (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(120, 20)
+            $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
+            $panel.Controls.Add($lab)
+            $tb = New-Object System.Windows.Forms.TextBox
+            $tb.Location = New-Object System.Drawing.Point(132, $y); $tb.Size = New-Object System.Drawing.Size(90, 24)
+            $tb.Text = if ($null -ne $c.ReliefDepth) { [string]$c.ReliefDepth } else { '0.25' }
+            $tb.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tb.ForeColor = Get-UiColor ''; $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+            $panel.Controls.Add($tb)
+            $lblEcho = New-Object System.Windows.Forms.Label
+            $lblEcho.AutoSize = $true; $lblEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
+            $lblEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblEcho.BackColor = [System.Drawing.Color]::Transparent
+            $panel.Controls.Add($lblEcho)
+            # Precompute echo colors OUTSIDE the closure (same pattern as thickness/standoff).
+            $okCol   = Get-UiColor 'green'
+            $grayCol = Get-UiColor 'gray'
+            $errCol  = Get-UiColor 'firebrick'
+            $updateEcho = {
+                $t = [string]$tb.Text
+                if ([string]::IsNullOrWhiteSpace($t)) {
+                    # blank == the 0.25 default (a positive relief), matching the prefill.
+                    $c.ReliefDepth = 0.25; $c.ReliefDepthValid = $true
+                    $lblEcho.ForeColor = $okCol
+                    $lblEcho.Text = ('Relief 0.25" (symmetric cut 0.5"). Press Next.')
+                    $wiz.SetChip('relief', 'relief 0.25"', 'set')
+                } else {
+                    $v = $null
+                    try { $v = [double]::Parse($t.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) } catch { $v = $null }
+                    if ($null -eq $v -or [double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0) {
+                        $c.ReliefDepthValid = $false
+                        $lblEcho.ForeColor = $errCol
+                        $lblEcho.Text = 'Enter 0 (no relief) or a positive depth in inches (e.g. 0.25).'
+                    } elseif ($v -eq 0) {
+                        $c.ReliefDepth = 0.0; $c.ReliefDepthValid = $true
+                        $lblEcho.ForeColor = $grayCol
+                        $lblEcho.Text = 'No chip relief (0). Blank thickens to the wall only; no pockets are cut. Press Next.'
+                        $wiz.SetChip('relief', 'relief: none', 'set')
+                    } else {
+                        $c.ReliefDepth = [double]$v; $c.ReliefDepthValid = $true
+                        $lblEcho.ForeColor = $okCol
+                        $lblEcho.Text = ("Relief {0:0.###}`" (symmetric cut {1:0.###}`"). Blank thickens to wall + {0:0.###}`". Press Next." -f [double]$v, (2.0 * [double]$v))
+                        $wiz.SetChip('relief', ("relief {0:0.###}`"" -f [double]$v), 'set')
+                    }
+                }
+                try { $wiz.Refresh() } catch {}
+            }.GetNewClosure()
+            $tb.Add_TextChanged({ param($s,$e) & $updateEcho }.GetNewClosure())
+            & $updateEcho
+        } `
+        -OnNext { param($c, $wiz) return [bool]$c.ReliefDepthValid }
+    [void]$Steps.Add($reliefStep)
 }

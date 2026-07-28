@@ -35,8 +35,11 @@ function Build-EdgeRoundMacro {
 }
 
 # $true if VersionStamp changed within the timeout (the round modified the model).
+# -OnPoll (optional) is invoked each poll gap so a WinForms caller can pump its message
+# loop (DoEvents) and stay responsive while Creo regenerates the round -- ADDITIVE:
+# it defaults to $null and the flat/console callers that omit it are unchanged.
 function Wait-EdgeModelChange {
-    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000)
+    param($Model, [string]$PreviousStamp, [int]$TimeoutMs = 30000, [scriptblock]$OnPoll = $null)
     $deadline = [DateTime]::Now.AddMilliseconds($TimeoutMs)
     while ([DateTime]::Now -lt $deadline) {
         try { if ($Model.VersionStamp -ne $PreviousStamp) { return $true } } catch {}
@@ -44,6 +47,7 @@ function Wait-EdgeModelChange {
         # busy-waits, pegging a CPU core AND flooding Creo with COM VersionStamp reads
         # *during* the round-feature regen it is polling for -- which slows the very
         # operation. 40ms is far finer than any Creo regen; detection stays instant.
+        if ($null -ne $OnPoll) { try { & $OnPoll } catch {} }
         Start-Sleep -Milliseconds 40
     }
     return $false
@@ -153,15 +157,29 @@ function Invoke-AutoCornerRound {
         [double]$Target = -1,
         [double]$Tol = 0.01,
         [int]$SweepMax = 5000,
-        [int]$BatchSize = 40
+        [int]$BatchSize = 40,
+        [scriptblock]$OnPoll = $null
     )
     $res = @{ Found = 0; Target = $null; Matched = 0; SelfTestOk = $false;
-        BatchesFired = 0; ModelChanged = 0; TotalBatches = 0; Aborted = $false; Reason = "" }
+        BatchesFired = 0; ModelChanged = 0; TotalBatches = 0; Aborted = $false; Reason = "";
+        Lengths = @(); LengthSummary = "" }
 
     # 1. DISCOVER
     $cand = @(Get-EdgesBySweep -Model $Model -TypeObj $TypeObj -MaxId $SweepMax)
     $res.Found = $cand.Count
     if ($cand.Count -eq 0) { $res.Reason = "sweep found no edges (GetItemById dead, or ids exceed $SweepMax)"; return $res }
+
+    # DIAGNOSTIC: distinct edge lengths present (rounded to 3dp) + counts. Set BEFORE any
+    # early return so a caller that matched nothing can still SEE what lengths the body
+    # actually has -- the single most useful clue when a corner round "does nothing" (was
+    # the target simply not a real edge length?). Cheap; pure.
+    $hist = @{}
+    foreach ($e in $cand) {
+        $L = [math]::Round([double]$e.Length, 3)
+        if ($hist.ContainsKey($L)) { $hist[$L] = [int]$hist[$L] + 1 } else { $hist[$L] = 1 }
+    }
+    $res.Lengths = @($hist.GetEnumerator() | Sort-Object { [double]$_.Name } | ForEach-Object { @{ Len = [double]$_.Name; Count = [int]$_.Value } })
+    $res.LengthSummary = (@($res.Lengths | ForEach-Object { ("{0}x{1}" -f $_.Len, $_.Count) }) -join ', ')
 
     # 2. SELECT lowest dimension (or explicit target)
     $pick = Select-LowestDimensionEdges -Edges $cand -Target $Target -Tol $Tol
@@ -199,7 +217,7 @@ function Invoke-AutoCornerRound {
         try {
             $Session.RunMacro((Build-EdgeRoundMacro -Radius $Radius))
             $res.BatchesFired++
-            if ($null -ne $stamp) { $changed = Wait-EdgeModelChange -Model $Model -PreviousStamp $stamp }
+            if ($null -ne $stamp) { $changed = Wait-EdgeModelChange -Model $Model -PreviousStamp $stamp -OnPoll $OnPoll }
         } catch {}
         if ($changed) { $res.ModelChanged++ }
 
@@ -214,5 +232,68 @@ function Invoke-AutoCornerRound {
     if (-not $res.Aborted -and $res.Reason -eq "") {
         $res.Reason = "rounded $($matchEdges.Count) edge(s) of length $($pick.Target) in $($res.BatchesFired) batch(es)"
     }
+    return $res
+}
+
+# ----------------------------------------------------------------------------
+# Invoke-CurvedCornerRound - the CURVED-jig entry point (drilljig3d-gui.cmd).
+#
+# WHY A `function global:` WRAPPER (not a direct Invoke-AutoCornerRound call):
+# the curved GUI's wizard steps live in SEPARATE step-group libs
+# (curved_gui_steps_*.ps1) and run their Build/OnNext inside .GetNewClosure()
+# handlers, which resolve a bare command name against GLOBAL scope ONLY
+# ([[project_gui_scope_bugs]]; the run_drilljig3d_gui_tests Section-6 lint has
+# teeth for this). The eight functions above are PLAIN `function` (dot-sourced into
+# the .cmd's own scriptblock scope) so a curved-GUI step closure CANNOT see them --
+# calling Invoke-AutoCornerRound from a step handler would throw "the term is not
+# recognized" at runtime (the exact wall the flat GUI avoids only because ITS steps
+# are inline in the .cmd body). So the curved GUI calls THIS global wrapper, which
+# runs in a scope that CAN see the plain primitives -- identical to how
+# Invoke-ConformalBlank (global) wraps the plain Get-FeatureIdSet/Wait-ModelModified
+# core primitives (CONFIRMED LIVE 2026-06-24).
+#
+# CURVED-SPECIFIC TARGETING: the flat jig rounds the AUTO-lowest edge length (on a
+# flat plate the through-thickness verticals ARE the shortest edges). A conformal
+# offset+thicken blank is not guaranteed that property, so we TARGET the thicken
+# length directly -- a thicken's side/through-thickness edges are the constant
+# offset distance = $Thickness. When $Thickness <= 0 (not known) we fall back to
+# AUTO (-Target -1), exactly the flat behavior. -Tol defaults looser than the flat
+# 0.01 because a curved blank's through-thickness edge length can drift slightly off
+# the nominal thickness with surface curvature; still tight enough not to grab the
+# (much longer) perimeter edges.
+#
+# Returns the SAME shape as Invoke-AutoCornerRound (Found/Target/Matched/SelfTestOk/
+# BatchesFired/ModelChanged/TotalBatches/Aborted/Reason) plus a 'Mode' field
+# ('thickness' | 'auto') so the caller can report which targeting ran. Honest: it
+# NEVER fabricates success -- the underlying self-test + VersionStamp canary gate it.
+# ----------------------------------------------------------------------------
+function global:Invoke-CurvedCornerRound {
+    param(
+        $Session, $Model, $TypeObj,
+        [double]$Radius = 0.25,
+        [double]$Thickness = 0,
+        [double]$Tol = 0.05,
+        [int]$SweepMax = 5000,
+        [int]$BatchSize = 40,
+        [scriptblock]$OnPoll = $null
+    )
+    $mode = if ($Thickness -gt 0) { 'thickness' } else { 'auto' }
+    $target = if ($Thickness -gt 0) { [double]$Thickness } else { -1 }
+    $res = Invoke-AutoCornerRound -Session $Session -Model $Model -TypeObj $TypeObj `
+            -Radius $Radius -Target $target -Tol $Tol -SweepMax $SweepMax -BatchSize $BatchSize -OnPoll $OnPoll
+
+    # AUTO FALLBACK: if targeting the thicken length matched NO edges but the sweep DID
+    # find edges, the passed thickness simply is not a real edge length on this body (the
+    # #1 cause of "corner round does nothing" -- e.g. the blank was thickened to wall+relief
+    # but we were handed wall). Retry with the flat jig's AUTO target (the LOWEST length
+    # present) -- on a plate the shortest edges ARE the through-thickness walls. Only adopt
+    # the fallback if it actually matched something; otherwise keep the first (honest) miss
+    # so the caller still sees the LengthSummary + can report it.
+    if ($Thickness -gt 0 -and [int]$res.Matched -eq 0 -and [int]$res.Found -gt 0) {
+        $auto = Invoke-AutoCornerRound -Session $Session -Model $Model -TypeObj $TypeObj `
+                -Radius $Radius -Target -1 -Tol $Tol -SweepMax $SweepMax -BatchSize $BatchSize -OnPoll $OnPoll
+        if ([int]$auto.Matched -gt 0) { $res = $auto; $mode = 'auto-fallback' }
+    }
+    try { $res.Mode = $mode } catch {}
     return $res
 }

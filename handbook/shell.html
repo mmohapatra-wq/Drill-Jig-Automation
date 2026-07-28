@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drill-Jig Automation &mdash; Operator &amp; Developer Handbook</title>
+<style>
+  :root{
+    --bg:#0f1626; --panel:#151f33; --panel2:#1b2740; --ink:#e8edf6; --muted:#9fb0cc;
+    --accent:#4aa3ff; --accent2:#7cd9a8; --warn:#ffca6b; --danger:#ff7a7a; --line:#2a3852;
+    --code-bg:#0b1220; --chip:#233350; --green:#78d296;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,kbd{font-family:"Cascadia Code",ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}
+  code:not(pre code){background:var(--chip);padding:.08em .38em;border-radius:5px;font-size:.88em;color:#d8e6ff}
+  kbd{background:#26344f;border:1px solid #3a4d70;border-bottom-width:2px;border-radius:5px;padding:.05em .45em;font-size:.85em;white-space:nowrap}
+  pre{background:var(--code-bg);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;
+    margin:.6em 0;font-size:13px;line-height:1.55}
+  pre code{color:#cfe0ff;white-space:pre}
+  .cm{color:#6f83a6}.st{color:#9ff0c4}.kw{color:#ff9de0}.va{color:#ffca6b}
+  /* ---- page frame ---- */
+  header.masthead{max-width:1180px;margin:0 auto;padding:26px 34px 0}
+  header.masthead h1{margin:0 0 4px;font-size:26px;letter-spacing:-.01em}
+  header.masthead p{margin:.3em 0;color:var(--muted);font-size:14px}
+  .badges{margin-top:12px;display:flex;flex-wrap:wrap;gap:8px}
+  .badge{background:var(--chip);border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:12.5px;color:#cfe0ff}
+  .badge b{color:var(--accent2)}
+  /* ---- tab bar ---- */
+  .tabbar{position:sticky;top:0;z-index:50;background:linear-gradient(180deg,#111a2c,#0f1626f2);
+    border-bottom:1px solid var(--line);backdrop-filter:blur(6px);margin-top:18px}
+  .tabbar-inner{max-width:1180px;margin:0 auto;padding:0 22px;display:flex;flex-wrap:wrap;gap:4px}
+  .tabbtn{appearance:none;border:none;background:transparent;color:var(--muted);cursor:pointer;
+    font:600 14.5px/1 "Segoe UI",sans-serif;padding:15px 18px;border-bottom:3px solid transparent;letter-spacing:.01em}
+  .tabbtn:hover{color:var(--ink)}
+  .tabbtn.active{color:var(--ink);border-bottom-color:var(--accent)}
+  .tabbtn .n{display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:50%;
+    background:var(--chip);font-size:12px;margin-right:8px;color:#cfe0ff}
+  .tabbtn.active .n{background:var(--accent);color:#04121f}
+  /* ---- panels ---- */
+  main{max-width:1180px;margin:0 auto;padding:8px 34px 120px}
+  .tabpanel{display:none;animation:fade .18s ease}
+  .tabpanel.active{display:block}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  section.block{margin:34px 0;scroll-margin-top:70px}
+  h2.sec{font-size:22px;border-bottom:1px solid var(--line);padding-bottom:8px;margin:30px 0 14px}
+  h3{font-size:17px;margin:26px 0 6px;color:#dbe7fb}
+  h4{font-size:14px;margin:18px 0 4px;color:var(--accent2);letter-spacing:.02em}
+  p{margin:.55em 0}
+  ul,ol{margin:.5em 0 .5em 0;padding-left:1.3em}
+  li{margin:.28em 0}
+  /* numbered step list */
+  ol.steps{list-style:none;counter-reset:stepc;padding:0;margin:14px 0}
+  ol.steps>li{position:relative;padding:2px 0 14px 46px;margin:0}
+  ol.steps>li::before{counter-increment:stepc;content:counter(stepc);position:absolute;left:0;top:0;
+    width:30px;height:30px;border-radius:50%;background:var(--accent);color:#04121f;font-weight:700;
+    display:flex;align-items:center;justify-content:center;font-size:14px}
+  /* callouts */
+  .callout{border-radius:10px;padding:12px 16px;margin:14px 0;border:1px solid;background:var(--panel)}
+  .callout.tip{border-color:#2f6b48;background:#12241a}
+  .callout.warn{border-color:#7a5f22;background:#241d10}
+  .callout.danger{border-color:#7a2f2f;background:#241111}
+  .callout.info{border-color:#2f527a;background:#101c2e}
+  .callout .t{font-weight:700;margin-bottom:2px}
+  .callout.tip .t{color:var(--accent2)} .callout.warn .t{color:var(--warn)}
+  .callout.danger .t{color:var(--danger)} .callout.info .t{color:var(--accent)}
+  /* tables */
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cfe0ff;font-weight:600}
+  td code{white-space:nowrap}
+  tbody tr:nth-child(even){background:#121c30}
+  /* cards */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .card{border:1px solid var(--line);border-radius:12px;padding:16px 18px;background:var(--panel)}
+  .card h4{margin-top:0}
+  @media(max-width:820px){.grid2,.grid3{grid-template-columns:1fr}main,header.masthead{padding-left:16px;padding-right:16px}}
+  /* pills / chips */
+  .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;margin-left:6px;vertical-align:middle}
+  .pill.ok{background:#13351f;color:#8be0a6;border:1px solid #2f6b48}
+  .pill.auth{background:#3a2f10;color:var(--warn);border:1px solid #7a5f22}
+  .pill.local{background:#10233a;color:var(--accent);border:1px solid #2f527a}
+  .pill.wip{background:#2c2416;color:var(--warn);border:1px solid #7a5f22}
+  .muted{color:var(--muted)} .path{color:#ffca6b}
+  /* chip legend swatches (honesty colors from the wizard) */
+  .sw{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px;vertical-align:baseline}
+  .sw-gray{background:#a8b6ce}.sw-blue{background:#6eaaff}.sw-green{background:#78dc96}
+  .sw-gold{background:#f5cd5f}.sw-red{background:#f5786e}
+  /* download buttons */
+  .dlrow{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:14px 0}
+  .dlbtn{appearance:none;border:none;cursor:pointer;border-radius:10px;padding:13px 20px;
+    background:linear-gradient(135deg,#3f7fe6,#4aa3ff);color:#fff;font:700 14.5px/1 "Segoe UI",sans-serif;
+    display:inline-flex;align-items:center;gap:10px;box-shadow:0 2px 10px #0006}
+  .dlbtn:hover{filter:brightness(1.08)}
+  .dlbtn .sz{font-weight:500;opacity:.85;font-size:12px}
+  .dlbtn.ghost{background:#1b2740;border:1px solid #35507e;color:#cfe0ff;box-shadow:none;padding:9px 14px;font-size:13px}
+  .dlbtn.mini{background:#17233c;border:1px solid #33507e;color:#bcd2f5;box-shadow:none;padding:6px 12px;font-size:12.5px;font-weight:600}
+  .dlbtn svg{width:16px;height:16px;flex:none}
+  .tool-td{white-space:nowrap}
+  hr{border:none;border-top:1px solid var(--line);margin:30px 0}
+  .footer{color:var(--muted);font-size:12.5px;margin:40px auto 0;max-width:1180px;padding:16px 34px 0;border-top:1px solid var(--line)}
+  .anchor-note{font-size:12.5px;color:var(--muted)}
+  .keycap{color:var(--accent2);font-weight:600}
+  /* screenshot gallery + lightbox */
+  .shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:18px;margin-top:16px}
+  figure.shot{margin:0;border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--panel)}
+  figure.shot img{display:block;width:100%;height:auto;cursor:zoom-in;border-bottom:1px solid var(--line);background:#141e34}
+  figure.shot figcaption{padding:9px 13px;font-size:12.5px;color:var(--muted)}
+  figure.shot figcaption b{color:#dbe7fb;font-weight:600}
+  /* per-step reference blocks (screenshot beside its guidance) */
+  .stepcard{padding:0;overflow:hidden;margin:20px 0}
+  .step-head{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--panel2);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .step-num{flex:none;width:30px;height:30px;border-radius:50%;background:var(--accent);color:#04121f;font-weight:700;display:flex;align-items:center;justify-content:center;font-size:14px}
+  .step-head .htxt{min-width:0}
+  .step-head .title{font-size:15.5px;font-weight:600;color:#eaf1fb;line-height:1.25}
+  .step-head .stage{font-size:11.5px;color:var(--muted)}
+  .step-head .btnlbl{margin-left:auto;font-size:12px;color:var(--accent2);border:1px solid #2f6b48;background:#12241a;border-radius:7px;padding:4px 10px;white-space:nowrap}
+  .step-grid{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,1fr);gap:18px;padding:16px}
+  @media(max-width:860px){.step-grid{grid-template-columns:1fr}}
+  .step-grid figure.shot{align-self:start}
+  .step-grid figure.shot + figure.shot{margin-top:12px}
+  .step-facts{align-self:start}
+  .step-desc{font-size:13.5px;margin:0 0 10px;color:#cdd9ee}
+  .step-facts dl{margin:0}
+  .step-facts dt{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--accent2);margin-top:10px}
+  .step-facts dd{margin:2px 0 0;font-size:13px;color:var(--ink)}
+  .step-facts dd code{white-space:normal}
+  /* Ctrl+Alt snap diagram + inline sub-steps */
+  .diagram{border:1px solid var(--line);border-radius:12px;background:#0e1830;padding:14px;margin:14px 0}
+  .diagram svg{display:block;width:100%;height:auto;max-width:660px;margin:0 auto}
+  .diagram figcaption{margin-top:10px;font-size:13px;color:var(--muted)}
+  .diagram figcaption ol{margin:.3em 0 0;padding-left:1.3em}
+  .draw-steps{margin:.4em 0 0;padding-left:1.3em;font-size:13.5px}
+  .draw-steps li{margin:.35em 0}
+  .seq-cap{font-size:12.5px;color:var(--muted);margin:-6px 0 10px}
+  #lb{position:fixed;inset:0;background:rgba(4,8,16,.9);display:none;align-items:center;justify-content:center;z-index:200;cursor:zoom-out;padding:22px}
+  #lb.open{display:flex}
+  #lb img{max-width:98vw;max-height:95vh;border:1px solid #35507e;border-radius:8px;box-shadow:0 10px 46px #000}
+</style>
+</head>
+<body>
+<header class="masthead">
+  <h1>Drill-Jig Automation &mdash; Operator &amp; Developer Handbook</h1>
+  <p>Everything for the Creo Parametric drill-jig toolkit: run the guided GUI, set up a dev environment, grab the other tools, and see what's next. This page is <b>self-contained</b> — every download below is embedded inside this file, so it works offline with no network.</p>
+  <div class="badges">
+    <span class="badge">Platform <b>Windows 11</b></span>
+    <span class="badge">Creo <b>12.4.3.0</b></span>
+    <span class="badge">PowerShell <b>5.1 (STA)</b></span>
+    <span class="badge">Front-end <b>WinForms wizard</b></span>
+    <span class="badge">Built <b>2026-07-28</b></span>
+  </div>
+</header>
+
+<nav class="tabbar">
+  <div class="tabbar-inner">
+    <button class="tabbtn active" data-tab="use"><span class="n">1</span>Using the GUI</button>
+    <button class="tabbtn" data-tab="dev"><span class="n">2</span>Build &amp; Develop</button>
+    <button class="tabbtn" data-tab="tools"><span class="n">3</span>Other Tools &amp; Downloads</button>
+    <button class="tabbtn" data-tab="future"><span class="n">4</span>Roadmap</button>
+  </div>
+</nav>
+
+<main>
+  <section id="tab-use" class="tabpanel active">
+<!--INCLUDE:tab1-->
+  </section>
+  <section id="tab-dev" class="tabpanel">
+<!--INCLUDE:tab2-->
+  </section>
+  <section id="tab-tools" class="tabpanel">
+<!--INCLUDE:tab3-->
+  </section>
+  <section id="tab-future" class="tabpanel">
+<!--INCLUDE:tab4-->
+  </section>
+</main>
+
+<div class="footer">
+  Drill-Jig Automation handbook · generated 2026-07-28 · self-contained (all downloads embedded as base64 blobs) ·
+  authors: M. Mohapatra (drill-jig pipeline, wizards, previews) · K. Brooker (baseline orthogrid) · E. Iglehart (gauginator).
+</div>
+
+<div id="lb"><img alt="Enlarged wizard screenshot"></div>
+
+<script>
+/* ---------------- screenshot lightbox ---------------- */
+(function(){
+  var lb=document.getElementById('lb'); if(!lb) return;
+  var lbimg=lb.querySelector('img');
+  document.addEventListener('click',function(e){
+    var t=e.target;
+    if(t && t.tagName==='IMG' && t.closest('figure.shot')){ lbimg.src=t.src; lb.classList.add('open'); }
+    else if(t===lb || t===lbimg){ lb.classList.remove('open'); lbimg.src=''; }
+  });
+  document.addEventListener('keydown',function(e){ if(e.key==='Escape'){ lb.classList.remove('open'); lbimg.src=''; } });
+})();
+
+/* ---------------- tab switching ---------------- */
+(function(){
+  var btns = document.querySelectorAll('.tabbtn');
+  var panels = {use:'tab-use', dev:'tab-dev', tools:'tab-tools', future:'tab-future'};
+  function show(tab){
+    btns.forEach(function(b){ b.classList.toggle('active', b.dataset.tab===tab); });
+    Object.keys(panels).forEach(function(k){
+      var el=document.getElementById(panels[k]);
+      if(el) el.classList.toggle('active', k===tab);
+    });
+    try{ history.replaceState(null,'','#'+tab); }catch(e){}
+    window.scrollTo({top:0,behavior:'instant' in window ? 'instant':'auto'});
+  }
+  btns.forEach(function(b){ b.addEventListener('click', function(){ show(b.dataset.tab); }); });
+  var h=(location.hash||'').replace('#','');
+  if(panels[h]) show(h);
+})();
+
+/* ---------------- embedded-file downloads ----------------
+   Each payload lives in a <script type="application/octet-stream" id=.. data-filename=.. data-mime=..>
+   holding base64. dl(id) decodes it to a Blob and saves it — no server, fully offline. */
+function b64ToBlob(b64, mime){
+  var clean = b64.replace(/\s+/g,'');
+  var bin = atob(clean);
+  var len = bin.length;
+  var bytes = new Uint8Array(len);
+  for(var i=0;i<len;i++){ bytes[i]=bin.charCodeAt(i); }
+  return new Blob([bytes], {type: mime||'application/octet-stream'});
+}
+function dl(id){
+  var el = document.getElementById(id);
+  if(!el || !el.textContent.trim()){ alert('That download is not embedded in this copy of the file ('+id+').'); return; }
+  var fn = el.getAttribute('data-filename') || 'download.bin';
+  var mime = el.getAttribute('data-mime') || 'application/octet-stream';
+  try{
+    var blob = b64ToBlob(el.textContent, mime);
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = fn;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }catch(e){ alert('Could not build the download: '+e.message); }
+}
+</script>
+<!--PAYLOADS-->
+</body>
+</html>
