@@ -68,10 +68,15 @@ $cmd = $cmd.Replace($oUri,$oCall).Replace($oSrc,'')
 if (([regex]::Matches($cmd,'Set-WebView2LocalScene -WebView')).Count -ne 2) { throw "launcher: expected 2 Set-WebView2LocalScene calls after patching" }
 WT "$stage/drilljig-gui.cmd" $cmd
 
-# libs: 11 from the live repo, then overlay the patched webview2_host
-$libs = 'creo_geometry','edge_round','orthogrid','orthogrid_gui','orthogrid_points','fastener_layout','drilljig_core','bushing_svg','wpf3d_preview','webview2_host','wizard'
-foreach ($l in $libs) { Copy-Item "$REPO/lib/$l.ps1" "$stage/lib/$l.ps1" -Force }
+# libs: ship EVERY lib from the live repo (lib/*.ps1, non-recursive so lib/tests is excluded),
+# then overlay the offline-patched webview2_host. The launcher only dot-sources a subset, but
+# shipping them all means a lib it needs (e.g. hole_layout.ps1) can NEVER be missing -- extras
+# are harmless dead files. Completeness is then asserted against the launcher's dot-sources.
+Get-ChildItem "$REPO/lib" -Filter *.ps1 -File | ForEach-Object { Copy-Item $_.FullName "$stage/lib/$($_.Name)" -Force }
 Copy-Item "$HB/overlay/webview2_host.ps1" "$stage/lib/webview2_host.ps1" -Force
+$needed = [regex]::Matches($cmd, "lib\\([A-Za-z0-9_]+\.ps1)") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+foreach ($n in $needed) { if (-not (Test-Path "$stage/lib/$n")) { throw "offline bundle is MISSING a lib the launcher dot-sources: $n" } }
+Write-Host ("  libs bundled: {0} .ps1 (launcher references {1}, all present incl. hole_layout.ps1)" -f (Get-ChildItem "$stage/lib" -Filter *.ps1).Count, @($needed).Count)
 # data catalogs (committed under handbook/data -- the repo copies are gitignored, so
 # they are absent in a fresh CI checkout; the committed handbook copy is the source of truth)
 foreach ($c in 'bushings.csv','bushings_drill.csv','bushings_archive.csv') { if (Test-Path "$HB/data/$c") { Copy-Item "$HB/data/$c" "$stage/data/$c" -Force } }
@@ -125,6 +130,15 @@ foreach ($png in Get-ChildItem "$HB/shots" -Filter *.png) {
   $tok = 'data-shot="' + $png.Name + '"'
   if ($html.IndexOf($tok) -ge 0) { $html = $html.Replace($tok, 'src="data:image/png;base64,' + (B64 $png.FullName) + '"'); $injShots++ }
 }
+# inline tutorial video(s): data-video="FILE" -> src="data:video/mp4;base64,.." (same self-contained
+# scheme as the screenshots -- the compressed mp4 lives under handbook/media and is committed source).
+$injVids = 0
+if (Test-Path "$HB/media") {
+  foreach ($mp4 in Get-ChildItem "$HB/media" -Filter *.mp4 -File) {
+    $tok = 'data-video="' + $mp4.Name + '"'
+    if ($html.IndexOf($tok) -ge 0) { $html = $html.Replace($tok, 'src="data:video/mp4;base64,' + (B64 $mp4.FullName) + '"'); $injVids++ }
+  }
+}
 # payload <script> blocks
 $blocks = New-Object System.Collections.Generic.List[string]
 function Payload($id,$file,$mime,$path){ "<script type=""application/octet-stream"" id=""$id"" data-filename=""$file"" data-mime=""$mime"">" + (B64 $path) + "</script>" }
@@ -146,6 +160,7 @@ WT $Out $html
 $final = RT $Out
 $leftInc = ([regex]::Matches($final,'<!--INCLUDE:')).Count
 $leftShot= ([regex]::Matches($final,'data-shot=')).Count
+$leftVid = ([regex]::Matches($final,'data-video=')).Count
 $leftPay = ([regex]::Matches($final,'<!--PAYLOADS-->')).Count
 $refIds  = [regex]::Matches($final, "dl\('([^']+)'\)") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 $haveIds = [regex]::Matches($final, 'id="(pl_[^"]+)"')  | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
@@ -153,10 +168,10 @@ $missing = $refIds | Where-Object { $_ -and ($haveIds -notcontains $_) }
 $fi = Get-Item $Out
 Write-Host ""
 Write-Host ("WROTE {0}  ({1:N2} MB)" -f $Out, ($fi.Length/1MB))
-Write-Host ("  screenshots inlined = {0}; individual .cmd embedded = {1}" -f $injShots, $cmdCount)
-Write-Host ("  unspliced markers: INCLUDE={0} PAYLOADS={1}; leftover data-shot={2} (all want 0)" -f $leftInc,$leftPay,$leftShot)
+Write-Host ("  screenshots inlined = {0}; videos inlined = {1}; individual .cmd embedded = {2}" -f $injShots, $injVids, $cmdCount)
+Write-Host ("  unspliced markers: INCLUDE={0} PAYLOADS={1}; leftover data-shot={2} data-video={3} (all want 0)" -f $leftInc,$leftPay,$leftShot,$leftVid)
 if ($missing) { throw ("buttons reference MISSING payloads: " + ($missing -join ', ')) }
-if ($leftInc -ne 0 -or $leftPay -ne 0 -or $leftShot -ne 0) { throw "unspliced markers remain -- build incomplete" }
+if ($leftInc -ne 0 -or $leftPay -ne 0 -or $leftShot -ne 0 -or $leftVid -ne 0) { throw "unspliced markers remain -- build incomplete" }
 Write-Host ("  every dl() button has a payload ({0} referenced). OK." -f (@($refIds).Count))
 
 # cleanup temp
