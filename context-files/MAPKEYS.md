@@ -175,7 +175,8 @@ Gotchas:
 |---|---|---|---|---|
 | `ProCmdDatumSketCurve` | Open the Sketch tool on a pre-selected/MRU plane | `Odui_Dlg_00`, `t1.PlnMru`, `t1.RefMru`, `stdbtn_1` | boxinator, curved_slot_macros, slotplane-probe, drilljig, drilljig-gui | ✅ |
 | `ProCmdViewSketchView` | Orient view to sketch plane / enter internal sketcher view | — | slotinator, curved_slot_macros, drilljig, drilljig-gui, drilljig3d, pocketinator | ✅ |
-| `ProCmdSketRectangle` | Arm corner-rectangle tool (2 screen picks) | — | drilljig, drilljig-gui, slotinator, pocketinator, curved_slot_macros | ✅ |
+| `ProCmdSketRectangle` | Arm corner-rectangle tool (2 screen picks) | — | drilljig, drilljig-gui, slotinator, pocketinator | ✅ |
+| `ProCmdSketSlantRectangle` | Arm slanted-rectangle tool (3 screen picks: define the first side, then the width) | — | curved_relief, curved_slot_macros (curved chip-relief pockets) | ✅ (recorded live trail.txt.33) |
 | `ProCmdSketCenterRectangle` | Arm center-rectangle tool (center + corner picks) | — | boxinator, drilljig, drilljig-gui | ✅ |
 | `ProCmdSketGeomPoint` | Arm sketch-point tool (1 screen pick) | — | drilljig | ✅ |
 | `ProCmdSketDimension` | Arm dimension tool + set value via `mod_dim_emb` | `main_dlg_cur`, `mod_dim_emb` | boxinator | ✅ |
@@ -200,7 +201,7 @@ Dimension set (double-click a dim opens the inline editor):
 ```
 
 Gotchas:
-- **`@PAUSE_FOR_SCREEN_PICK`:** `ProCmdSketRectangle`, `ProCmdSketCenterRectangle`, `ProCmdSketGeomPoint`, `ProCmdSketDimension` all require operator screen picks — split the macro around the pause. Rectangle/center-rectangle = 2 picks; point = 1 pick.
+- **`@PAUSE_FOR_SCREEN_PICK`:** `ProCmdSketRectangle`, `ProCmdSketSlantRectangle`, `ProCmdSketCenterRectangle`, `ProCmdSketGeomPoint`, `ProCmdSketDimension` all require operator screen picks — split the macro around the pause. Rectangle/center-rectangle = 2 picks; **slanted rectangle = 3 picks** (first side, then width); point = 1 pick.
 - **Split point:** the classic box-a arm phase is TWO RunMacro calls — Macro A does `ProCmdFtExtrude` + `ProCmdViewSketchView` + `ProCmdSketRectangle 1`, user draws, Macro B finishes.
 - **`mod_dim_emb` uses FULL values** (not halved for center-rectangle), and each dimension needs its own double-click → set → confirm cycle (it does not advance to the next dim).
 - **Sketch-dim snap-back:** weak sketch dims can snap back on regen — expected for `mod_dim_emb`-driven sketches. Feature-level dims (extrude depth, datum offset) hold via a plain `DimValue` write; sketch dims need the sketch-open repair flow (open sketch → set on sketch model → `$sketchModel.Regenerate($null)` while open → close → `$model.Regenerate($null)`).
@@ -449,6 +450,7 @@ Gotchas:
 | Pattern dir-1 count/spacing/flip | Set dir-1 instances, increment, optional flip | `ui_pat_dir_1_num_inst`, `ui_pat_dir_1_incr`, `ui_pat_dir_1_flip` | orthogrid_points, slotinator, drilljig_core | ✅ |
 | Pattern confirm | Finalize the pattern | `dashInst0.stdbtn_1` / `Odui_Dlg_00`/`stdbtn_1` | orthogrid_points, slotinator | ✅ |
 | `ProCmdPattern` | General feature pattern (dimension/table) — recorder captures dir-2 | — | holepat-probe, slotpat-probe | ⚠️ |
+| `ProCmdPattern` (AXIS/radial) | Axis pattern — rotate copies about a picked axis (re-orients each copy to a curved normal, unlike a linear pattern) | `maindashInst0.ui_pat_type` (item `2`=Axis), `ui_pat_axis_1_num_inst` (count), `ui_pat_axis_1_incr` (angular °), `ui_pat_axis_2_incr`, `dashInst0.stdbtn_1` | curved_relief (Build-RadialPattern*Macro / Invoke-CurvedReliefRadialPattern), radialpat-probe | ⚠️ |
 
 On-point thru-all hole (place point by ID first; optional surface pre-select `-NoClear` for normal orientation — ONE atomic macro):
 ```
@@ -508,6 +510,28 @@ Slotinator pattern direction fed BY DATUM (tree-search channel is dead for patte
 # then trigger/activate ui_pat_dir_dir1, set ui_pat_dir_1_num_inst / ui_pat_dir_1_incr,
 # optional ui_pat_dir_1_flip, then Odui_Dlg_00 stdbtn_1 to confirm.
 ```
+
+AXIS / RADIAL pattern (curved chip relief — from the operator's `axispattern` mapkey, 2026-07-30; ⚠️ ordinal + `ui_pat_axis_*` names from ONE recording, canary-gated). SPLIT around the axis screen-pick (the seed is raw-COM re-selected first, like `Invoke-SlotPatternFromSeed`):
+```
+# A) OPEN + switch type to Axis + arm the axis collector (Build-RadialPatternOpenMacro):
+~ Command `ProCmdPattern`;
+~ Trigger `main_dlg_cur` `maindashInst0.ui_pat_dim_1_num` `0`;  ~ Trigger ... ``;   # zero the default dim fields
+~ Select  `main_dlg_cur` `maindashInst0.ui_pat_type`;  ~ Close `main_dlg_cur` `maindashInst0.ui_pat_type`;
+~ Activate `main_dlg_cur` `2 ui_pat_type` 1;                    # dropdown item 2 = Axis
+~ Trigger `ui_pat_dim_panel.0.0` `PH.ui_pat_dim_1_array` 2 `DuMmY` `dimension`;  ~ Trigger ... `` ``;
+@PAUSE_FOR_SCREEN_PICK                                          # operator clicks the rotation axis (cylinder / datum axis)
+
+# B) count + angular increment (deg) + confirm (Build-RadialPatternValuesMacro):
+~ Input/Update/FocusOut `main_dlg_cur` `maindashInst0.ui_pat_axis_1_num_inst` `<count>`;   # total instances incl. seed
+~ Input/Update/FocusOut `main_dlg_cur` `maindashInst0.ui_pat_axis_1_incr`     `<deg>`;      # angular step
+~ Input/Update/FocusOut `main_dlg_cur` `maindashInst0.ui_pat_axis_2_incr`     `0`;          # 2nd dim = none
+~ Activate `main_dlg_cur` `dashInst0.stdbtn_1`;
+```
+An AXIS pattern rotates each copy about the picked axis, so on a cylinder every copy lands normal to the surface at its new angular position — the re-orientation a LINEAR (`ui_pat_dir_*`) pattern cannot do.
+
+**⚠️ THE SPLIT ABOVE DOES NOT WORK VIA `RunMacro` (root-caused live 2026-07-31, workflow-confirmed).** The operator's `axispattern` mapkey works under Creo's NATIVE interpreter — one continuous playback whose internal `@PAUSE_FOR_SCREEN_PICK` keeps the pattern dashboard alive across the axis pick. Driving it as the tool did — `RunMacro`(A) → operator axis dialog → `RunMacro`(B) — hits the atomic-dashboard rule (Rule 1): a dashboard's command context does NOT survive across separate `RunMacro` calls, so B's `dashInst0.stdbtn_1` confirm lands in a dashboard Creo already dropped and is silently discarded → **"opens but does nothing"** (live symptom, both raw-COM and tree-click seed attempts). `RunMacro` cannot honor `@PAUSE`, so **the only viable radial via `RunMacro` is ONE atomic macro that feeds the rotation AXIS BY ID** (no pick), exactly as the flat slot pattern (`Build-SlotPatternMacro`) feeds its direction datum by id. That is `Build-RadialPatternAtomicMacro` (`lib\curved_relief.ps1`): `Build-RadialPatternOpenMacro` (proven prefix, through `2 ui_pat_type`) + arm the axis collector + `Get-SelectAxisByIdMacro` (feed the axis by id) + `Build-RadialPatternValuesMacro` (count/incr/`stdbtn_1`) — **all in ONE `RunMacro`**.
+
+**⚠️ TWO tokens are UNRECORDED and must be mined, not guessed** ([[reference_mine_trail_files_for_widgets]]): (1) `$global:RadialAxisCollectorWidget` — the widget to `~ Activate` to ARM the axis reference collector (the axis analog of the flat pattern's `ui_pat_dir_dir1`; the operator's mapkey never armed it — it hit the screen-pick `@PAUSE` instead); (2) `$global:RadialAxisSelType` — the `ProCmdMdlTreeSearch` `SelOptionRadio` value that selects a datum AXIS by id (expected `Axis`, vs the proven `Datum`/`Surface`/`Point`). Both default `$null` so `Build-RadialPatternAtomicMacro` returns `$null` and `Invoke-CurvedReliefRadialPattern` is **probe-gated** (`Test-RadialPatternReady` false → the GUI stays per-fastener with an honest "run the probe" log; it never fires a guessed token). `radialpat-probe.cmd` mines both (Section B → `radialpat_recipe.txt`), demonstrates the split no-op (Section A/T0), and tests the atomic fix (Section C/T3-T4). Also still needs `$ctx.RadialAxisFeatId` populated (a datum-axis feature id for the cylinder — `ProCmdDatumAxis`-from-2-planes tokens also mined in Section B).
 
 Gotchas:
 - **Entire hole dashboard is ONE atomic macro** — depth-type flyout, layout toggles, body select, diameter, Done all in a single RunMacro. Point must be pre-selected by ID *before* `ProCmdHole`; add a surface pre-select with `-NoClear` for On-Point normal orientation.

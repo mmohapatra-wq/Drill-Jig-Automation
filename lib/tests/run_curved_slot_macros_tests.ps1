@@ -18,7 +18,7 @@
 #   * Build-CurvedSlotArmMacro -SketchPlaneId  -> the PURE atomic macro STRING that
 #     selects the sketch plane BY ID (datum-by-id) then opens the sketcher on it
 #     (ProCmdDatumSketCurve + t1.PlnMru/t1.RefMru + stdbtn_1) and arms the corner
-#     rectangle (ProCmdSketRectangle). No screen pick.
+#     rectangle (ProCmdSketSlantRectangle). No screen pick.
 #   * Invoke-CurvedSlotArm -SketchPlaneId  -> COM: fire the arm macro. A plane id
 #     <= 0 means "no usable plane" (fall back to a screen pick) -> Armed=$false and
 #     NOTHING is fired; a positive id -> Armed=$true (the macro fired).
@@ -186,8 +186,8 @@ Assert-True "arm-macro: returns a non-empty string" (($armMacro -is [string]) -a
 Assert-True "arm-macro: opens the sketcher (ProCmdDatumSketCurve)" ($armMacro -match 'ProCmdDatumSketCurve')
 Assert-True "arm-macro: selects the plane from the MRU (t1.PlnMru)"  ($armMacro -match 't1\.PlnMru')
 Assert-True "arm-macro: enters the sketcher (stdbtn_1)"              ($armMacro -match 'stdbtn_1')
-# arms the corner rectangle for the operator to draw the seed slot
-Assert-True "arm-macro: arms the corner rectangle (ProCmdSketRectangle)" ($armMacro -match 'ProCmdSketRectangle')
+# arms the SLANTED rectangle for the operator to draw the seed slot
+Assert-True "arm-macro: arms the slanted rectangle (ProCmdSketSlantRectangle)" ($armMacro -match 'ProCmdSketSlantRectangle')
 # routes the plane id through the datum-by-ID tree search (surfenator feed)
 Assert-True "arm-macro: routes plane via the tree-search select" ($armMacro -match 'ProCmdMdlTreeSearch')
 Assert-True "arm-macro: feeds the plane id 5002 into the InputIDPanel" ($armMacro -match 'InputIDPanel.*5002')
@@ -226,7 +226,7 @@ Assert-True "arm: positive plane id -> Armed true"  ([bool](Get-Field $armOk @('
 Assert-True "arm: positive plane id -> fired exactly one macro" (@($script:cslmFired).Count -eq 1)
 Assert-True "arm: fired macro opens the sketcher"   ($script:cslmFired[0] -match 'ProCmdDatumSketCurve')
 Assert-True "arm: fired macro carries plane id 5003" ($script:cslmFired[0] -match 'InputIDPanel.*5003')
-Assert-True "arm: fired macro arms the rectangle"   ($script:cslmFired[0] -match 'ProCmdSketRectangle')
+Assert-True "arm: fired macro arms the rectangle"   ($script:cslmFired[0] -match 'ProCmdSketSlantRectangle')
 
 # never throws on a bad id
 $threwArm = $false
@@ -335,7 +335,7 @@ Assert-True "planrun all-ok: SeedsCut == 3"      (([int](Get-Field $runAll @('Se
 Assert-True "planrun all-ok: SeedsSkipped == 0"  (([int](Get-Field $runAll @('SeedsSkipped'))) -eq 0)
 Assert-True "planrun all-ok: SeedsFailed == 0"   (([int](Get-Field $runAll @('SeedsFailed'))) -eq 0)
 # 3 seeds -> 3 arm macros + 3 cut macros = 6 fired (no verify-flip retries here)
-Assert-True "planrun all-ok: fired 3 arm + 3 cut macros" ((@($script:cslmFired | Where-Object { $_ -match 'ProCmdSketRectangle' }).Count -eq 3) -and (@($script:cslmFired | Where-Object { $_ -match 'remove_material_cb' }).Count -eq 3))
+Assert-True "planrun all-ok: fired 3 arm + 3 cut macros" ((@($script:cslmFired | Where-Object { $_ -match 'ProCmdSketSlantRectangle' }).Count -eq 3) -and (@($script:cslmFired | Where-Object { $_ -match 'remove_material_cb' }).Count -eq 3))
 
 # (b) a seed with NO usable plane (SketchPlaneId <= 0) is SKIPPED, not cut, and
 #     recorded as a Warning; the other two still cut.
@@ -352,7 +352,7 @@ Assert-True "planrun gap: SeedsSkipped == 1 (the no-plane hole)" (([int](Get-Fie
 $runGapWarn = Get-Field $runGap @('Warnings')
 Assert-True "planrun gap: a Warning was recorded for the skip" ((Count-Of $runGapWarn) -ge 1)
 # the skipped seed did NOT arm/cut: only 2 arm macros + 2 cuts fired
-Assert-True "planrun gap: only 2 seeds armed (skip did not arm)" (@($script:cslmFired | Where-Object { $_ -match 'ProCmdSketRectangle' }).Count -eq 2)
+Assert-True "planrun gap: only 2 seeds armed (skip did not arm)" (@($script:cslmFired | Where-Object { $_ -match 'ProCmdSketSlantRectangle' }).Count -eq 2)
 Assert-True "planrun gap: only 2 cuts fired (skip did not cut)"  (@($script:cslmFired | Where-Object { $_ -match 'remove_material_cb' }).Count -eq 2)
 
 # (c) a CANARY MISS (a cut that does not change the model) increments SeedsFailed

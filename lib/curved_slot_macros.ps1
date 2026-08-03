@@ -24,7 +24,8 @@
 # FUNCTIONS:
 #   1. Build-CurvedSlotArmMacro -SketchPlaneId     (PURE)  - the atomic arm macro
 #      (select the tangent plane by ID + open the sketcher on it + arm the
-#      rectangle tool). Token strings COPIED VERBATIM from slotplane-probe.cmd.
+#      SLANTED-rectangle tool). Token strings COPIED VERBATIM from slotplane-probe.cmd
+#      (the slanted-rectangle command ProCmdSketSlantRectangle from trail.txt.33).
 #   2. Invoke-CurvedSlotArm     -Seed | -SketchPlaneId    - fire the arm macro for
 #      one seed's SketchPlaneId. SketchPlaneId<=0 => NEVER fires.
 #   3. Invoke-CurvedSlotCut     -Depth -BodyIndex -Flip   - AFTER the operator drew,
@@ -71,7 +72,7 @@
 #   + t1.RefMru `0`/`` (select the orientation reference from the MRU)
 #   + stdbtn_1          (enter the sketcher)
 #   + ProCmdViewSketchView  (orient to the sketch plane, like Invoke-VerifiedSeedCut)
-#   + ProCmdSketRectangle 1 (arm the corner-rectangle tool for the operator draw)
+#   + ProCmdSketSlantRectangle 1 (arm the SLANTED-rectangle tool for the operator draw)
 # The @PAUSE_FOR_SCREEN_PICK from the generic "open sketcher on a plane" recipe is
 # DELIBERATELY OMITTED - the whole point of the by-ID feed is that it replaces the
 # manual plane click (proven live). PlaneId<=0 returns the empty string (the caller
@@ -94,7 +95,7 @@ function global:Build-CurvedSlotArmMacro {
         "~ Trigger ``Odui_Dlg_00`` ``t1.RefMru`` ````;" +
         "~ Activate ``Odui_Dlg_00`` ``stdbtn_1``;" +
         "~ Command ``ProCmdViewSketchView``;" +
-        "~ Command ``ProCmdSketRectangle`` 1;"
+        "~ Command ``ProCmdSketSlantRectangle`` 1;"
 }
 
 # ----------------------------------------------------------------------------

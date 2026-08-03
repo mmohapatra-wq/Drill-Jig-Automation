@@ -150,6 +150,11 @@ function global:Invoke-CurvedDrillAll {
     $comps = @()
     try { if ($null -ne $c.FastenerComponents) { $comps = @($c.FastenerComponents) } } catch { $comps = @() }
     if (@($comps).Count -lt 1) { $wiz.Log('  drill: no fasteners captured - skipping.'); $wiz.SetChip('fastholes', 'fastener holes: none', 'warning'); return }
+    # SELECTED hole diameter (the fastener-dia step). Passed to the hole macro so every hole
+    # is drilled at the chosen size, not Creo's last dashboard value (the wrong-diameter bug).
+    $holeDia = 0.0
+    try { if ($null -ne $c.FastenerHoleDia -and [double]$c.FastenerHoleDia -gt 0) { $holeDia = [double]$c.FastenerHoleDia } } catch { $holeDia = 0.0 }
+    if ($holeDia -le 0) { try { if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { $holeDia = [double]$c.HoleDiaFinal } } catch { $holeDia = 0.0 } }
     $drilled = 0; $autoN = 0; $manualN = 0; $failN = 0
     $ci = 0
     foreach ($comp in $comps) {
@@ -204,14 +209,26 @@ function global:Invoke-CurvedDrillAll {
                 'OK', $true)
         }.GetNewClosure()
         $hr = $null
-        try { $hr = Invoke-FastenerHole -Session $session -Model $model -TypeObj $pfcType -PointId $ptId -ComponentPath $useCompPath -TopPlaneId 1 -DirectionPrompt $dirPrompt -OnPoll $OnPoll } catch { $hr = $null }
+        try { $hr = Invoke-FastenerHole -Session $session -Model $model -TypeObj $pfcType -PointId $ptId -ComponentPath $useCompPath -TopPlaneId 1 -Diameter $holeDia -DirectionPrompt $dirPrompt -OnPoll $OnPoll } catch { $hr = $null }
         if ($null -ne $hr -and $hr.Drilled) {
             $drilled++
             if ($null -eq $c.FastenerHolesMade) { $c.FastenerHolesMade = 0 }
             $c.FastenerHolesMade = [int]$c.FastenerHolesMade + 1
             try {
                 if ($null -eq $c.CurvedHolePairs) { $c.CurvedHolePairs = @() }
-                $c.CurvedHolePairs = @($c.CurvedHolePairs) + @([pscustomobject]@{ PointId = $ptId; TopPlaneId = 1; ViaPlane = [bool]$hr.ViaPlane; ReliefCut = $false })
+                # Store the fastener's ComponentPath alongside the datum PointId so the terminal
+                # Slots stage pre-selects THIS fastener's TOP plane (id 1) before the relief extrude
+                # + offsets the hole-bounding guide planes -- WITHOUT re-selecting the fasteners
+                # (user 2026-07-29). Store the FRESH resolved path ($useCompPath, read back from the
+                # live buffer via Get-BufferComponentPath) -- NOT the drill-time $comp.Path handle,
+                # which can go stale; the Slots arm re-resolves once more before use as a backstop.
+                # Origin = this fastener's position (component-path transform origin, captured
+                # at fastener-select) so the terminal Slots stage can compute a RADIAL/axis
+                # chip-relief pattern from the fastener ring WITHOUT a new live read
+                # ([[project_curved_radial_slot_pattern]]). Stored per hole so it aligns 1:1
+                # with the slot items even when a fastener's hole was skipped.
+                $fOrigin = $null; try { $fOrigin = $comp.Origin } catch { $fOrigin = $null }
+                $c.CurvedHolePairs = @($c.CurvedHolePairs) + @([pscustomobject]@{ PointId = $ptId; TopPlaneId = 1; ViaPlane = [bool]$hr.ViaPlane; ReliefCut = $false; CompPath = $useCompPath; Origin = $fOrigin })
             } catch {}
             $orientNote = if ($hr.ViaPlane) { 'oriented to its TOP plane' } else { 'oriented by your direction pick' }
             $wiz.Log(("  + fastener {0}/{1} drilled on-point, {2} (total {3})." -f $ci, @($comps).Count, $orientNote, [int]$c.FastenerHolesMade))

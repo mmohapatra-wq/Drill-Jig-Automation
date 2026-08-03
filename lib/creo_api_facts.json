@@ -760,6 +760,16 @@
       "verifiedOn": null
     },
     {
+      "id": "curved-radial-axis-pattern",
+      "category": "mapkey",
+      "status": "docs-only",
+      "fact": "A Creo AXIS (radial) feature pattern rotates each copy about a picked axis, so on a CYLINDER every copy lands normal to the surface at its new angular position -- the re-orientation a LINEAR (ui_pat_dir_*) pattern CANNOT do, which is why radial patterning works for curved chip-relief pockets where linear was correctly ruled out. Tokens (from the operator's `axispattern` mapkey, 2026-07-30): ~Command ProCmdPattern -> zero maindashInst0.ui_pat_dim_1_num/ui_pat_dim_2_num -> Select/Close maindashInst0.ui_pat_type + Activate `2 ui_pat_type` 1 (dropdown item 2 = Axis) -> Trigger ui_pat_dim_panel.0.0 PH.ui_pat_dim_1_array (arm the axis reference collector) -> @PAUSE_FOR_SCREEN_PICK (operator clicks the rotation axis; CANNOT be fed by id, so the macro SPLITS here) -> Input/Update/FocusOut maindashInst0.ui_pat_axis_1_num_inst=<count incl seed> + ui_pat_axis_1_incr=<angular deg> + ui_pat_axis_2_incr=0 -> Activate dashInst0.stdbtn_1. The seed feature is re-selected first via the raw-COM channel (slot-pattern-seed-raw-com-select). lib/curved_relief.ps1 Build-RadialPatternOpenMacro/Build-RadialPatternValuesMacro + Invoke-CurvedReliefRadialPattern; the count+increment are computed pure from the fastener positions by lib/curved_radial.ps1 Get-CurvedRadialPatternPlan (uniform-spacing gate; a live cylinder axis+point from lib/curved_surface_radius.ps1 RadialAxisGeom is the override).",
+      "antipattern": "Hand-writing the ui_pat_type ordinal (2) or the ui_pat_axis_* widget names from memory -- they come from ONE operator mapkey, not a cross-checked trail; keep canary-gated (VersionStamp + new feature) with the per-fastener draw loop as the fallback, and confirm live via radialpat-probe.cmd. Also: assuming the axis can be fed by id -- the recording shows a @PAUSE_FOR_SCREEN_PICK, so the operator picks it (the by-id feed via RadialAxisFeatId/Get-SelectDatumByIdMacro is plumbed but OFF by default, unproven for the axis collector).",
+      "symbols": ["ProCmdPattern", "ui_pat_type", "ui_pat_axis_1_num_inst", "ui_pat_axis_1_incr", "ui_pat_axis_2_incr", "dashInst0.stdbtn_1", "Build-RadialPatternOpenMacro", "Build-RadialPatternValuesMacro", "Invoke-CurvedReliefRadialPattern", "Get-CurvedRadialPatternPlan"],
+      "evidence": "Operator's `axispattern` mapkey (2026-07-30, count=2, incr settled to 10 deg). Wired into lib/curved_gui_steps_slots.ps1 (auto when Get-CurvedRadialPatternPlan.CanPattern; per-fastener fallback on a miss). Offline: run_curved_radial_tests.ps1 (36) + run_curved_relief_tests.ps1 radial section (macros+driver) + fuzz_curved_gui.ps1 slot-radial scenarios + regression. LIVE-UNVERIFIED (headless cannot fire the pattern); radialpat-probe.cmd confirms it live + records the axis-from-2-planes idea.",
+      "verifiedOn": null
+    },
+    {
       "id": "sketch-open-on-plane-by-id",
       "category": "mapkey",
       "status": "confirmed-live",

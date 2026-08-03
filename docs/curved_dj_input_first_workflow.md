@@ -1,8 +1,37 @@
 # Curved drill-jig GUI — INPUT-FIRST workflow re-sequence (plan)
 
-**Status:** PLAN ONLY — do not implement until the rounded-corners + chip-relief branches
-have merged onto `CURVED_DJ`. Written 2026-07-28 from a research workflow over the live code.
-Target file: `pipeline/drilljig3d-gui.cmd` + the `lib/curved_gui_steps_*.ps1` step groups.
+> **SUPERSEDED (2026-07-29).** This is the ORIGINAL planning doc; the input-first
+> re-sequence it describes has since shipped AND been simplified further. The LIVE step
+> order (owned by `curved_gui_steps_compose.ps1::Get-CurvedInputFirstOrder`) is now:
+> `welcome, fastener-select, surface-arm, tree, chip-clearance, fastener-dia, build-run,
+> slot-arm, slot-finish, done`. Key deltas vs the plan below: the free-text **thickness** +
+> **standoff** steps are GONE — part thickness is DERIVED as bushing length + chip clearance
+> and the offset is always 0; the old **relief-depth** free-text step is now the
+> **chip-clearance** card (Standard 0.25" / Custom, seeded so Next works immediately); the
+> hole is drilled at the SELECTED diameter (`maindashInst0.diameter_mip_OptionMenu`); the
+> Slots stage no longer re-selects the fasteners (it reuses the up-front selection); and the
+> chip relief is a flat-DJ-parity **two-step** flow — **slot-arm** PRE-SELECTS that fastener's
+> **OWN TOP datum plane** (the same raw-COM reference the hole uses, id 1, staged BEFORE the
+> extrude — the hole's proven pre-select-then-fire order; v5's post-open feed did not register)
+> then opens the extrude so the sketch opens ON the TOP plane immediately — **no reference/guide
+> planes** (retired 2026-07-29 per the operator); an operator plane-pick fallback fires only if
+> the pre-select cannot stage (stale path); the operator draws; then **slot-finish** cuts the
+> symmetric pocket and re-arms the next hole (a return-`$false` self-loop), re-resolving a fresh
+> component path per fastener (see `[[project_curved_relief_extrude_plane]]`). Confirmed live
+> 2026-07-29 (reliefplane-probe TEST A). The drilled hole is set to the selected diameter
+> (`maindashInst0.diameter_mip_OptionMenu`). **RADIAL PATTERN (2026-07-30):** a *linear* pattern is
+> not feasible on a curved face (fixed increment+orientation can't re-orient to a new normal), but a
+> Creo **AXIS/radial** pattern rotates each copy about the cylinder axis and DOES re-orient it — so when
+> the fasteners are uniformly spaced about the axis (`Get-CurvedRadialPatternPlan.CanPattern`, computed
+> from `FastenerComponents[].Origin` + the live cylinder axis in `$ctx.RadialAxisGeom` from the "Read
+> radial distance" half, `lib/curved_surface_radius.ps1`), **slot-arm** picks radial mode + swaps the
+> seed to the arc-endpoint fastener, and **slot-finish** cuts that ONE seed then AXIS-patterns the rest
+> (operator picks the rotation axis once; `Invoke-CurvedReliefRadialPattern`, canary-gated). Non-uniform,
+> `--no-radial-pattern`, or a pattern miss → the per-fastener draw loop (unchanged, the guaranteed
+> fallback). See `[[project_curved_radial_slot_pattern]]`. The historical plan below is kept for context only.
+
+**Status:** PLAN ONLY (historical) — written 2026-07-28 from a research workflow over the
+live code. Target file: `pipeline/drilljig3d-gui.cmd` + the `lib/curved_gui_steps_*.ps1` step groups.
 
 ## Goal (operator's requested workflow)
 

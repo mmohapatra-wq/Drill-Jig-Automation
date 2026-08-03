@@ -18,6 +18,11 @@
 #      $ctx.FastenerSurfId from the picked surface (its home now that fasteners are
 #      selected before the surface). The STAGE-4 batch pre-selects these ids by ID so
 #      ProCmdFtOffset auto-consumes them (the proven select-by-ID -> offset channel).
+#      verify ALSO reads the picked surface's RADIAL DISTANCE (cylinder radius+axis,
+#      when it is a cylinder) into $ctx.RadialAxisGeom via Read-CurvedRadialGeomFromBuffer
+#      (lib\curved_surface_radius.ps1) - the OVERRIDE the radial-pattern session consumes
+#      ("self-compute + accept override"). Best-effort: a non-cylinder leaves it
+#      Valid=$false and the pattern falls back to its self-computed increment.
 #
 # HARD RULES honored (repo house style):
 #   * EDITS NOTHING existing -- only appends steps.
@@ -69,6 +74,19 @@ function global:Add-CurvedSurfaceSteps {
                 $Context.SurfIds = @($ids)
                 $msg = ("Captured {0} surface(s): {1}." -f $ids.Count, ($ids -join ', '))
                 try { if (@($res.Rejected).Count -gt 0) { $msg += (" ({0} non-surface selection(s) ignored.)" -f @($res.Rejected).Count) } } catch {}
+                # RADIAL-DISTANCE OVERRIDE ("read radial distance" session, see the memory
+                # note project_curved_radial_slot_pattern): if the picked follow-surface is a
+                # genuine cylinder, read its RADIUS + AXIS off the surface descriptor and stash
+                # it in $ctx.RadialAxisGeom for the radial-pattern step to consume as an
+                # override (the "self-compute + accept override" contract). Best-effort, from
+                # the SAME live buffer the ids came from, and NEVER throws: a non-cylindrical
+                # follow surface leaves RadialAxisGeom Valid=$false and the pattern step falls
+                # back to its self-computed increment + operator-picked axis. Read-*FromBuffer
+                # is a GLOBAL fn (curved_surface_radius.ps1) so this closure resolves it.
+                $geom = $null
+                try { $geom = Read-CurvedRadialGeomFromBuffer -Session $Context.Session -TypeObj $Context.Type -PreferSurfId ([int]@($ids)[0]) } catch { $geom = $null }
+                $Context.RadialAxisGeom = $geom
+                try { if ($null -ne $geom) { $msg += (" " + (Format-CurvedRadialGeom $geom)) } } catch {}
                 return @{ Ok = $true; Message = $msg }
             }
         } `

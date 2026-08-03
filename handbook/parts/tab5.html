@@ -1,0 +1,38 @@
+<p>The wizard is tuned for the common case &mdash; a flat, rectangular guide plate on an orthogrid of holes. But the geometry it builds is ordinary Creo: parametric planes, an extruded plate, drilled guide holes, and chip-relief slots. That means once the wizard has done the heavy lifting, <strong>a few manual tweaks in the sketcher</strong> unlock jigs that are far from rectangular &mdash; L-shapes, stepped multi-region plates, and small wrap-around corner jigs. The examples below are real drill-jigs built for flight-hardware thrust-structure work; each one started in <code>drilljig-gui</code> and was finished with light hand-editing.</p>
+
+<div class="callout info">
+  <div class="t">Why this tab exists</div>
+  The point isn&rsquo;t to document a fixed recipe &mdash; it&rsquo;s to widen the aperture on what&rsquo;s possible. If the part you&rsquo;re jigging isn&rsquo;t a clean rectangle, don&rsquo;t walk away: run the wizard to get the plate, holes, and slots roughly right, then adjust the plate outline or split the hole regions by hand. Click any image to enlarge.
+</div>
+
+<section class="block">
+  <h2 class="sec">Aft Module Thrust Structure &mdash; <code>150-110-0030-101</code></h2>
+  <p>A drill-jig for the <strong>ASSY THRUST STRUCTURE AFT MODULE TS</strong>. The part isn&rsquo;t a single rectangular pad: the guide holes fall into <strong>two offset regions on different pitches</strong>, so the plate was drawn as a stepped L to hug both hole clusters while clearing the surrounding structure. The wizard produced the plate, the seated bushing holes, and the chip-relief slots along the bottom edge; the non-rectangular outline is a single manual edit to the plate sketch.</p>
+  <div class="shots">
+    <figure class="shot"><img loading="lazy" alt="Aft module thrust-structure drill-jig, seated on the part" data-shot="ex-ts-aft-1.png"><figcaption><b>1 &middot; Seated on the part</b> &mdash; the stepped L-plate registered against the aft-module thrust structure, guide bushings dropped into every hole. Two hole regions on different pitches are covered by one continuous plate.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Aft module drill-jig, isolated underside view" data-shot="ex-ts-aft-2.png"><figcaption><b>2 &middot; The jig alone</b> &mdash; the same plate lifted off. The counterbored bushing seats sit on top; the combed <strong>chip-relief slots</strong> run along the lower edge so swarf and the drill can clear each hole row.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Aft module drill-jig, relief side showing chip-relief channels across the hole rows" data-shot="ex-ts-aft-relief.png"><figcaption><b>3 &middot; Relief side</b> &mdash; the slotted face of the same plate. The <strong>chip-relief channels</strong> run as fins between the hole columns so swarf and the drill clear each hole; the stepped L profile spanning both hole regions is visible edge-on.</figcaption></figure>
+  </div>
+  <div class="callout tip">
+    <div class="t">The one adjustment that made it possible</div>
+    The wizard drew a rectangle over the full hole envelope; the operator then edited that rectangle into the stepped L outline in the open sketcher (removing the empty corner the structure needed clear). Everything downstream &mdash; holes, slots, the 3D preview &mdash; regenerated on the new outline with no further changes.
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">FWD Demo BUDS Corner &mdash; <code>150-510-9010-001</code></h2>
+  <p>A compact <strong>corner jig</strong> for the <strong>TS FWD Demo BUDS Corner</strong>. Instead of a flat pad, this one wraps a lip over the edge of the part so it self-locates on a corner &mdash; a small manual flange added to the wizard&rsquo;s plate. It carries an engraved <code>+X1</code> orientation datum and a <strong>&ldquo;DO NOT USE FOR FLIGHT&rdquo;</strong> callout so it can never be mistaken for flight hardware, plus the jig&rsquo;s own part number <code>004-986-4656-001</code>.</p>
+  <div class="shots">
+    <figure class="shot"><img loading="lazy" alt="BUDS corner jig, guide-hole face with +X1 datum" data-shot="ex-buds-corner-1.png"><figcaption><b>1 &middot; Guide-hole face</b> &mdash; the four index holes with the engraved <code>+X1</code> orientation mark and the <em>DO NOT USE FOR FLIGHT</em> engraving down the edge. The locating lip is visible along the top.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="BUDS corner jig, opposite view showing relief channels and part number" data-shot="ex-buds-corner-2.png"><figcaption><b>2 &middot; Relief side</b> &mdash; the opposite face, showing the <strong>chip-relief channels</strong> crossing the guide holes and the engraved jig part number <code>004-986-4656-001</code>.</figcaption></figure>
+  </div>
+  <div class="callout tip">
+    <div class="t">The one adjustment that made it possible</div>
+    Starting from the wizard&rsquo;s flat plate, the operator added a short flange so the jig hooks over the part&rsquo;s corner and self-registers &mdash; no separate fixture needed. Engraved text (orientation datum, flight-safety note, part number) was added as cosmetic features afterward.
+  </div>
+</section>
+
+<div class="callout info">
+  <div class="t">Try it on your part</div>
+  If your job looks more like these than like a plain rectangle, still start in <code>drilljig-gui</code> &mdash; let it place the holes, bushings, and slots &mdash; then reshape the plate or add a locating feature by hand. The wizard does the tedious layout math; you keep full control of the outline.
+</div>

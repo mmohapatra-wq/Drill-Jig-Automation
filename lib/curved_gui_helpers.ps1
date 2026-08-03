@@ -193,6 +193,195 @@ function global:Add-RebuiltNotice {
 }
 
 # ============================================================================
+# Bushing CONFIRMATION render (2D schematic + optional 3D) - ported from
+# drilljig-gui.cmd so the CURVED GUI shows the SAME picture of the picked bushing on
+# the tree-done confirmation page (user 2026-07-29). global: so the tree step's Build
+# closure resolves it. Reuses Draw-BushingSchematic / Get-BushingHeadDia (lib\bushing_svg.ps1,
+# already global) + Build-BushingModelGroup (lib\wpf3d_preview.ps1). 3D is gated on
+# $script:Wpf3dOk (the .cmd sets it after Add-Type'ing the WPF assemblies); when WPF is
+# absent the 2D shows full-width. NEVER throws (a paint/WPF failure degrades to 2D-only).
+# ============================================================================
+
+# New-BushingViewportHost - a WPF Media3D 3D view of a bushing as a WinForms ElementHost,
+# for the confirmation page NEXT TO the 2D schematic. Drill bushings (HeadDia > OD) render
+# HEADED; sleeves headless - the SAME distinction the 2D makes (the caller passes HeadDia
+# from Get-BushingHeadDia). Drag orbits, wheel zooms. Returns $null on ANY failure so the
+# caller falls back to a 2D-only layout (the 3D is a bonus, never a crash). Needs the WPF
+# assemblies ($script:Wpf3dOk). PORTED VERBATIM from drilljig-gui.cmd so both GUIs render
+# identically. Orbit state lives in captured hashtables (mutated across events).
+function global:New-BushingViewportHost {
+    param([double]$OD, [double]$ID, [double]$Length, [double]$HeadDia, [int]$Width, [int]$Height, $Background)
+    try {
+        $vp = New-Object System.Windows.Controls.Viewport3D
+        $cam = New-Object System.Windows.Media.Media3D.PerspectiveCamera; $cam.FieldOfView = 46
+        $vp.Camera = $cam
+        $lg = New-Object System.Windows.Media.Media3D.Model3DGroup
+        # NOTE: every collection .Add() below returns an int index; [void]-wrap them so
+        # they do NOT leak into this function's output (else the return is an array, not
+        # the ElementHost, and $eh3d.Location fails at the call site).
+        [void]$lg.Children.Add((New-Object System.Windows.Media.Media3D.AmbientLight([System.Windows.Media.Color]::FromRgb(96,106,126))))
+        [void]$lg.Children.Add((New-Object System.Windows.Media.Media3D.DirectionalLight([System.Windows.Media.Color]::FromRgb(255,255,255), (New-Object System.Windows.Media.Media3D.Vector3D(-0.5,-1,-0.6)))))
+        [void]$lg.Children.Add((New-Object System.Windows.Media.Media3D.DirectionalLight([System.Windows.Media.Color]::FromRgb(120,150,200), (New-Object System.Windows.Media.Media3D.Vector3D(0.6,-0.3,0.5)))))
+        $lv = New-Object System.Windows.Media.Media3D.ModelVisual3D; $lv.Content = $lg; [void]$vp.Children.Add($lv)
+        $mv = New-Object System.Windows.Media.Media3D.ModelVisual3D
+        $mv.Content = Build-BushingModelGroup -OD $OD -ID $ID -Length $Length -HeadDia $HeadDia -Segments 48
+        [void]$vp.Children.Add($mv)
+        # iso fit + orbit state (hashtable captured by the handlers => mutation persists)
+        $headLen = if ($HeadDia -gt $OD) { $OD * 0.3 } else { 0.0 }
+        $Hdim = $Length + $headLen
+        $maxDim = [math]::Max([math]::Max($OD, $HeadDia), $Hdim); if ($maxDim -le 0) { $maxDim = 1 }
+        $rad0 = ($maxDim / (2*[math]::Tan(($cam.FieldOfView*[math]::PI/180)/2))) * 1.9
+        $st = @{ az=0.9; el=0.5; rad=$rad0; cam=$cam }
+        $place = {
+            $cx = $st.rad*[math]::Cos($st.el)*[math]::Cos($st.az)
+            $cy = $st.rad*[math]::Sin($st.el)
+            $cz = $st.rad*[math]::Cos($st.el)*[math]::Sin($st.az)
+            $st.cam.Position = New-Object System.Windows.Media.Media3D.Point3D($cx,$cy,$cz)
+            $st.cam.LookDirection = New-Object System.Windows.Media.Media3D.Vector3D((-$cx),(-$cy),(-$cz))
+            $st.cam.UpDirection = New-Object System.Windows.Media.Media3D.Vector3D(0,1,0)
+        }.GetNewClosure()
+        & $place
+        $grid = New-Object System.Windows.Controls.Grid
+        $bg = if ($null -ne $Background) { $Background } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+        $grid.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb([byte]$bg.R,[byte]$bg.G,[byte]$bg.B))
+        [void]$grid.Children.Add($vp)
+        $drag = @{ on=$false; lx=0.0; ly=0.0 }
+        $grid.Add_MouseDown({ param($s,$e) $p=$e.GetPosition($s); $drag.on=$true; $drag.lx=$p.X; $drag.ly=$p.Y; [void]$s.CaptureMouse() }.GetNewClosure())
+        $grid.Add_MouseUp({ param($s,$e) $drag.on=$false; [void]$s.ReleaseMouseCapture() }.GetNewClosure())
+        $grid.Add_MouseMove({ param($s,$e)
+            if (-not $drag.on) { return }
+            $p=$e.GetPosition($s); $dx=$p.X-$drag.lx; $dy=$p.Y-$drag.ly
+            $st.az -= $dx*0.01; $st.el += $dy*0.01
+            $st.el = [math]::Max(-1.55, [math]::Min(1.55, $st.el)); & $place
+            $drag.lx=$p.X; $drag.ly=$p.Y
+        }.GetNewClosure())
+        $grid.Add_MouseWheel({ param($s,$e)
+            $factor = if ($e.Delta -gt 0) { 0.88 } else { 1.136 }
+            $st.rad = [math]::Max(0.2, [math]::Min(200.0, $st.rad*$factor)); & $place
+        }.GetNewClosure())
+        $eh = New-Object System.Windows.Forms.Integration.ElementHost
+        $eh.Child = $grid
+        return $eh
+    } catch { return $null }
+}
+
+# Add-BushingConfirmSchematic - render the picked bushing (2D cross-section + optional
+# 3D view) onto $Panel starting at $Top, and RETURN the bottom Y so the caller flows its
+# Change buttons below. $Active is the last $Context.Picks entry (HoleDiameter / BushingID
+# / BushingLength / Bushing). Skips cleanly (returns $Top) for the fixed-OD "no bushing"
+# leaf where the bore/length is indeterminate. PORTED from drilljig-gui.cmd:1806-1880.
+function global:Add-BushingConfirmSchematic {
+    param($Panel, $Active, [int]$Top = 8)
+    $y = [int]$Top
+    if ($null -eq $Active) { return $y }
+    # OD = the drilled hole; Length = bushing length; ID = the bore, "(any)" for the METAL
+    # removable path where the bore is operator-chosen (drilled hole IS the OD). Skipped for
+    # the fixed-OD "no bushing" leaf (BushingLength null).
+    $bsOD  = 0.0; try { $bsOD = [double]$Active.HoleDiameter } catch { $bsOD = 0.0 }
+    $bsLen = 0.0; try { if ($null -ne $Active.BushingLength) { $bsLen = [double]$Active.BushingLength } } catch { $bsLen = 0.0 }
+    $bsIdVal = 0.0; $bsIdLabel = ''; $bsIdNum = 0.0
+    if ($null -ne $Active.BushingID -and [double]::TryParse([string]$Active.BushingID, [ref]$bsIdNum) -and $bsIdNum -gt 0 -and $bsIdNum -lt $bsOD) {
+        $bsIdVal = $bsIdNum                                 # a real, known bore (sleeve / ID-first pick)
+    } elseif ($bsOD -gt 0) {
+        $bsIdVal = $bsOD * 0.5                              # bore indeterminate
+        # metal removable = '(any)'; custom OD = '(verify)' (no catalog bushing behind it).
+        $bsIdLabel = if ([string]$Active.BushingID -eq '(custom)') { '(verify)' } else { '(any)' }
+    }
+    if ($bsOD -le 0 -or $bsLen -le 0 -or $bsIdVal -le 0) { return $y }   # nothing sensible to draw
+
+    $bsLabel = [string]$Active.Bushing
+    # DRILL BUSHINGS are headed; SLEEVES are headless. A representative head (no dimension)
+    # is drawn so the two are not confused.
+    $bsHeadDia = Get-BushingHeadDia -EasyName $bsLabel -OD $bsOD
+    $bsBack = if ($script:WizTheme) { $script:WizTheme.CanvasBack } else { [System.Drawing.Color]::FromArgb(30,42,68) }
+    $wpfOk = $false; try { $wpfOk = [bool]$script:Wpf3dOk } catch { $wpfOk = $false }
+    # Layout: 2D schematic + 3D model SIDE BY SIDE; stack them when the canvas is too
+    # narrow, or when WPF 3D is unavailable show the 2D full-width.
+    $viewH = 290; $gap = 12
+    $avail = [Math]::Max(320, $Panel.Width - 24)
+    $sideBySide = ($avail -ge 680) -and $wpfOk
+    if ($sideBySide) {
+        $cellW = [Math]::Min(440, [int][Math]::Floor(($avail - $gap) / 2))
+        $x2d = 8; $y2d = $y; $x3d = 8 + $cellW + $gap; $y3d = $y
+    } else {
+        $cellW = [Math]::Min(600, $avail)
+        $x2d = 8; $y2d = $y; $x3d = 8; $y3d = $y + $viewH + 26
+    }
+    # 2D schematic panel (GDI+ Draw-BushingSchematic)
+    $bsPanel = New-Object System.Windows.Forms.Panel
+    $bsPanel.Size = New-Object System.Drawing.Size($cellW, $viewH)
+    $bsPanel.Location = New-Object System.Drawing.Point($x2d, $y2d)
+    $bsPanel.BackColor = $bsBack
+    try {
+        $dbp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
+        $dbp.SetValue($bsPanel, $true, $null)
+    } catch {}
+    $bsPanel.Add_Paint({
+        param($snd, $ev)
+        try {
+            Draw-BushingSchematic -Graphics $ev.Graphics -OD $bsOD -ID $bsIdVal -Length $bsLen -HeadDia $bsHeadDia `
+                -ClientW $snd.ClientSize.Width -ClientH $snd.ClientSize.Height `
+                -ShowEnd $true -ShowDims $true -Background $bsBack -Label $bsLabel -IdLabel $bsIdLabel
+        } catch { }
+    }.GetNewClosure())
+    $Panel.Controls.Add($bsPanel)
+    $lastBottom = $bsPanel.Bottom
+    # 3D model (WPF Media3D) - a BONUS view beside/below the 2D. On any WPF failure it is
+    # simply omitted (the 2D schematic always shows).
+    $eh3d = $null
+    if ($wpfOk) {
+        try { $eh3d = New-BushingViewportHost -OD $bsOD -ID $bsIdVal -Length $bsLen -HeadDia $bsHeadDia -Width $cellW -Height $viewH -Background $bsBack } catch { $eh3d = $null }
+    }
+    if ($null -ne $eh3d) {
+        $eh3d.Location = New-Object System.Drawing.Point($x3d, $y3d)
+        $eh3d.Size = New-Object System.Drawing.Size($cellW, $viewH)
+        $Panel.Controls.Add($eh3d)
+        $cap = New-Object System.Windows.Forms.Label
+        $cap.Text = ([char]0x2192 + " 3D: drag to rotate, wheel to zoom")
+        $cap.AutoSize = $true; $cap.ForeColor = Get-UiColor 'gray'; $cap.BackColor = [System.Drawing.Color]::Transparent
+        $cap.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+        $cap.Location = New-Object System.Drawing.Point(($x3d + 2), ($y3d + $viewH + 1))
+        $Panel.Controls.Add($cap)
+        $lastBottom = [Math]::Max([int]$lastBottom, [int]$cap.Bottom)
+    }
+    return ([int]$lastBottom + 12)
+}
+
+# Set-CurvedChipClearance - derive the conformal-blank inputs from ONE chip-clearance
+# value (user 2026-07-29: the operator no longer types thickness/offset). The single
+# clearance drives BOTH the wall + the relief:
+#   * wall (Thickness)  = the bushing length (the bushing seats through it); a fallback
+#     of max(1.5 x hole dia, 0.5") covers the rare fixed-OD "no bushing" leaf where the
+#     length is unknown (Fallback=$true in the return so the caller can note it).
+#   * ReliefDepth       = the clearance (the symmetric relief-pocket depth).
+#   * StandOff          = 0 (offset is always flush; never prompted).
+# The conformal-blank engine thickens to wall + ReliefDepth = bushingLen + clearance
+# (Invoke-CurvedBlankAction: tEff = Thickness + ReliefDepth), so the finished PART
+# thickness = bushing length + chip clearance -- mirroring the flat GUI's
+# plate = bushingLen + slotDepth. Assumes $Clearance is already validated (>= 0);
+# sets ThicknessValid + ChipClearanceValid true. Returns @{ Wall; Clearance; Total; Fallback }.
+# global: so the chip-clearance step's card OnPick + custom-field closures resolve it.
+function global:Set-CurvedChipClearance {
+    param($Context, [double]$Clearance)
+    $c = $Context
+    $c.ChipClearance = [double]$Clearance
+    $c.ReliefDepth   = [double]$Clearance
+    $c.StandOff      = 0.0
+    $c.StandOffValid = $true
+    $wall = 0.0; $fallback = $false
+    try { if ($null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) { $wall = [double]$c.BushingLen } } catch { $wall = 0.0 }
+    if ($wall -le 0) {
+        $fallback = $true
+        $hd = 0.0; try { if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { $hd = [double]$c.HoleDiaFinal } } catch { $hd = 0.0 }
+        $wall = [Math]::Max((1.5 * $hd), 0.5)
+    }
+    $c.Thickness      = [double]$wall
+    $c.ThicknessValid = $true
+    $c.ChipClearanceValid = $true
+    return @{ Wall = [double]$wall; Clearance = [double]$Clearance; Total = ([double]$wall + [double]$Clearance); Fallback = [bool]$fallback }
+}
+
+# ============================================================================
 # Bushing decision-tree WALK state machine (ported from drilljig-gui.cmd) - the
 # history stack + the length-pick resolver. State lives in $Context.
 # ============================================================================

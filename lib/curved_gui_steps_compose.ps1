@@ -15,12 +15,15 @@
 #
 # ORDER (must match the shell's $stages: Welcome/Fasteners/Surface/Conditions/Build/Slots/Done):
 #   welcome            (Welcome)
-#   fastener-select    (Fasteners)   <- input 1: which fasteners
+#   fastener-select    (Fasteners)   <- input 1: which fasteners (reused later by Slots)
 #   surface-arm        (Surface)     <- input 2: which surface (also defaults FastenerSurfId)
-#   tree, thickness, standoff, relief-depth, fastener-dia  (Conditions)  <- input 3: all numbers/choices
-#   build-run          (Build)       <- hands-free batch: blank -> corners -> drill all
-#   slot-select, slot-loop (Slots)   <- terminal interaction: re-select + draw each relief rectangle
-#   done               (Done)
+#   tree, chip-clearance, fastener-dia  (Conditions)  <- input 3: bushing + clearance + dia
+#                                        (thickness + offset are DERIVED, never typed)
+#   build-run              (Build)   <- hands-free batch: blank -> corners -> drill all
+#   slot-arm, slot-finish  (Slots)   <- flat-DJ two-step: slot-arm opens the first pocket
+#                                        sketch; slot-finish cuts it + re-arms the next
+#                                        (return-false loop), the operator drawing between.
+#   done                   (Done)
 #
 # Dot-source AFTER all the curved_gui_steps_* libs it composes. The SHELL and BOTH
 # offline harnesses (run_drilljig3d_gui_tests.ps1, fuzz_curved_gui.ps1) call THIS one
@@ -32,9 +35,12 @@
 function global:Get-CurvedInputFirstOrder {
     # the canonical input-first step order (keys). Single source of truth for the
     # shell + the tests. Matches the shell's $stages grouping.
+    # 2026-07-29: dropped the free-text 'thickness'/'standoff' steps + the 'slot-select'
+    # re-pick; 'relief-depth' -> the 'chip-clearance' card (Standard/Custom) that derives
+    # the auto thickness. The Slots stage now reuses the fasteners selected up front.
     return @('welcome', 'fastener-select', 'surface-arm',
-             'tree', 'thickness', 'standoff', 'relief-depth', 'fastener-dia',
-             'build-run', 'slot-select', 'slot-loop', 'done')
+             'tree', 'chip-clearance', 'fastener-dia',
+             'build-run', 'slot-arm', 'slot-finish', 'done')
 }
 
 function global:Add-CurvedInputFirstSteps {

@@ -44,6 +44,8 @@ if ($Shots) {
   if (-not $onWin) { throw "-Shots needs Windows (WinForms DrawToBitmap). Run it on a Windows machine." }
   Write-Host "capturing screenshots..."
   & (Join-Path $HB 'capture_shots.ps1')
+  Write-Host "capturing curved screenshots..."
+  & (Join-Path $HB 'capture_curved_shots.ps1')
 }
 
 # ---------------------------------------------------------------- 1. offline drilljig-gui.zip
@@ -93,6 +95,32 @@ $guiZip = Join-Path $tmp 'drilljig-gui.zip'
 Compress-Archive -Path $stage -DestinationPath $guiZip -Force
 Write-Host ("  offline zip: {0:N0} bytes" -f (Get-Item $guiZip).Length)
 
+# ---------------------------------------------------------------- 1b. offline drilljig3d-gui.zip (CURVED / conformal)
+# The curved analog of the flat gui zip. SIMPLER: the curved launcher has NO WebView2 nav
+# to patch (its bushing 3D preview is WPF -- system assemblies, nothing to vendor), so this
+# stage ships only the (line-4-patched) launcher + every lib + the decision tree + the data
+# catalogs. Same flat-ScriptDir patch ($old4/$new4 from above) + the same completeness assert.
+$stage3d = Join-Path $tmp 'drilljig3d-gui'
+New-Item -ItemType Directory -Force -Path "$stage3d/lib","$stage3d/data","$stage3d/docs" | Out-Null
+# launcher: live repo cmd + the SAME line-4 flat-ScriptDir patch the flat build applies.
+$cmd3d = RT "$REPO/pipeline/drilljig3d-gui.cmd"
+Need $cmd3d $old4 'curved launcher line 4'; $cmd3d = $cmd3d.Replace($old4,$new4)
+WT "$stage3d/drilljig3d-gui.cmd" $cmd3d
+# libs: ship EVERY lib from the live repo (non-recursive so lib/tests is excluded), same as flat.
+Get-ChildItem "$REPO/lib" -Filter *.ps1 -File | ForEach-Object { Copy-Item $_.FullName "$stage3d/lib/$($_.Name)" -Force }
+# completeness assert (analog of the flat one): every lib\NAME.ps1 the CURVED launcher dot-sources must be present.
+$needed3d = [regex]::Matches($cmd3d, "lib\\([A-Za-z0-9_]+\.ps1)") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+foreach ($n in $needed3d) { if (-not (Test-Path "$stage3d/lib/$n")) { throw "curved offline bundle is MISSING a lib the launcher dot-sources: $n" } }
+Write-Host ("  curved libs bundled: {0} .ps1 (launcher references {1}, all present)" -f (Get-ChildItem "$stage3d/lib" -Filter *.ps1).Count, @($needed3d).Count)
+# data catalogs (committed under handbook/data; the repo copies are gitignored -- same as flat)
+foreach ($c in 'bushings.csv','bushings_drill.csv','bushings_archive.csv') { if (Test-Path "$HB/data/$c") { Copy-Item "$HB/data/$c" "$stage3d/data/$c" -Force } }
+# docs: the decision tree the Bushing stage walks as cards (NO preview HTML, NO three.js -- the curved 3D preview is WPF)
+Copy-Item "$REPO/docs/drill_jig_decision_tree.json" "$stage3d/docs/" -Force
+WT "$stage3d/README.md" ("drilljig3d-gui -- self-contained offline bundle (CURVED / conformal jig).`nEXPERIMENTAL preview build. Auto-built from ngs-orthogrid-automation @ $Sha. See the code repo for full docs.`n")
+$gui3dZip = Join-Path $tmp 'drilljig3d-gui.zip'
+Compress-Archive -Path $stage3d -DestinationPath $gui3dZip -Force
+Write-Host ("  curved offline zip: {0:N0} bytes" -f (Get-Item $gui3dZip).Length)
+
 # ---------------------------------------------------------------- 2. toolkit zip (live repo, scrubbed)
 $kit = Join-Path $tmp 'ngs-orthogrid-automation'
 New-Item -ItemType Directory -Force -Path $kit | Out-Null
@@ -117,7 +145,7 @@ Write-Host ("  toolkit zip: {0:N0} bytes" -f (Get-Item $kitZip).Length)
 
 # ---------------------------------------------------------------- 3. assemble index.html
 $html = RT "$HB/shell.html"
-foreach ($k in 'tab1','tab2','tab3','tab4') {
+foreach ($k in 'tab1','tab2','tab3','tab4','tab5','tab6') {
   $pf = "$HB/parts/$k.html"; if (-not (Test-Path $pf)) { throw "missing fragment $pf" }
   $html = $html.Replace("<!--INCLUDE:$k-->", (RT $pf))
 }
@@ -143,6 +171,7 @@ if (Test-Path "$HB/media") {
 $blocks = New-Object System.Collections.Generic.List[string]
 function Payload($id,$file,$mime,$path){ "<script type=""application/octet-stream"" id=""$id"" data-filename=""$file"" data-mime=""$mime"">" + (B64 $path) + "</script>" }
 $blocks.Add((Payload 'pl_gui_zip'     'drilljig-gui.zip'          'application/zip' $guiZip))
+$blocks.Add((Payload 'pl_curved_zip'  'drilljig3d-gui.zip'        'application/zip' $gui3dZip))
 $blocks.Add((Payload 'pl_toolkit_zip' 'ngs-orthogrid-toolkit.zip' 'application/zip' $kitZip))
 if (Test-Path "$REPO/docs/DEVELOPMENT_SETUP.html") { $blocks.Add((Payload 'pl_dev_html' 'DEVELOPMENT_SETUP.html' 'text/html' "$REPO/docs/DEVELOPMENT_SETUP.html")) }
 $cmdCount = 0

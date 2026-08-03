@@ -21,9 +21,11 @@
 # (2026-07-28): the datum POINT and the fastener's TOP plane are SELECTED TOGETHER (a 2-item
 # tree selection) BEFORE ProCmdHole, which AUTO-ASSIGNS them by type -- point -> on-point
 # placement, TOP plane -> normal orientation. NO prim_ref/ft_dir collector arming, NO
-# placement-page triggers, NO diameter/thru-all/target-body (the recording is minimal; user
-# decision 2026-07-28 "match recording exactly"; the hole inherits Creo's current dashboard
-# settings). A wrong diameter is NOT caught by the feature-diff canary, so verify size visually.
+# placement-page triggers. The hole DIAMETER is set from the selected value (user 2026-07-29)
+# via the confirmed-live maindashInst0.diameter_mip_OptionMenu widget (Build-PreselectedHoleMacro
+# -Diameter) so the hole is drilled at the right size; thru-all/target-body still inherit Creo's
+# current dashboard settings. A wrong diameter is NOT caught by the feature-diff canary, so still
+# verify the size + thru-all visually.
 #
 # ORIENTATION: the hole is oriented to the fastener's OWN TOP plane (feature id 1) -- the hole
 # axis is normal to that plane, which (per the operator) is exactly normal to the jig part.
@@ -66,11 +68,27 @@ function global:Build-FastenerPointMacro {
 # dashInst0.Done` -- harmless here (no armed collector to discard; the refs are already bound).
 # ONE atomic macro. PURE. The two tree-selects in the recording (point + TOP plane) are the
 # operator's picks; the caller reproduces them by ID + path (raw-COM CreateModelItemSelection).
+#
+# -Diameter (user 2026-07-29: "make sure the hole is the correct diameter"): when > 0, the
+# CONFIRMED-LIVE diameter widget maindashInst0.diameter_mip_OptionMenu (holeinator's proven
+# hole-dashboard tail, lib\conformal_blank.ps1 Build-NormalHoleMacro) is set BEFORE Done, so
+# the hole is drilled at the SELECTED diameter instead of inheriting Creo's last dashboard
+# value (the wrong-diameter bug). Diameter <= 0 emits NO diameter tokens (keeps the default).
+# The tokens go AFTER the dashInst0.Quit blur (which discards the auto-armed collector) and
+# BEFORE Done, so the value is typed into a clean dashboard then committed.
 # ----------------------------------------------------------------------------
 function global:Build-PreselectedHoleMacro {
+    param([double]$Diameter = 0.0)
+    $diaMacro = if ($Diameter -gt 0) {
+        "~ Input  ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu`` ``$Diameter``;" +
+        "~ Update ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu`` ``$Diameter``;" +
+        "~ Activate ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu``;" +
+        "~ FocusOut ``main_dlg_cur`` ``maindashInst0.diameter_mip_OptionMenu``;"
+    } else { "" }
     return "~ Command ``ProCmdHole``;" +
         "~ Enter ``main_dlg_cur`` ``dashInst0.Quit``;" +
         "~ Exit  ``main_dlg_cur`` ``dashInst0.Quit``;" +
+        $diaMacro +
         "~ Activate ``main_dlg_cur`` ``dashInst0.Done``;"
 }
 
@@ -435,6 +453,8 @@ function global:Invoke-FastenerPoint {
 #   -PointId        the fastener datum point id (Invoke-FastenerPoint). >0 for the pre-select.
 #   -ComponentPath  the fastener's IpfcComponentPath (FRESH from the buffer -- Get-BufferComponentPath).
 #   -TopPlaneId     the fastener's TOP datum-plane feature id (constant 1). The orientation ref.
+#   -Diameter       the SELECTED hole diameter (in). >0 sets it via the confirmed-live widget so
+#                   the hole is drilled at the right size; <=0 keeps Creo's default (see the macro).
 #   -DirectionPrompt operator fallback (AskInline NoActivate) fired only if the by-id plane misses.
 # Returns @{ Drilled=<bool>; ViaPlane=<bool>; Reason=<string> }. -OnPoll pumps DoEvents.
 # ----------------------------------------------------------------------------
@@ -442,6 +462,7 @@ function global:Invoke-FastenerHole {
     param(
         $Session, $Model, $TypeObj,
         [int]$PointId = 0, $ComponentPath = $null, [int]$TopPlaneId = 1,
+        [double]$Diameter = 0.0,
         [scriptblock]$DirectionPrompt = $null,
         [scriptblock]$OnPoll = $null, [int]$TimeoutMs = 30000
     )
@@ -485,8 +506,9 @@ function global:Invoke-FastenerHole {
     # PUMP so Creo/WinForms processes the pre-selection before ProCmdHole reads it.
     if ($null -ne $OnPoll) { try { & $OnPoll } catch {} }
 
-    # 4) fire ProCmdHole on the PRE-SELECTED [point, TOP plane] + commit (Done).
-    try { $Session.RunMacro((Build-PreselectedHoleMacro)) }
+    # 4) fire ProCmdHole on the PRE-SELECTED [point, TOP plane] + commit (Done). Set the
+    # SELECTED diameter so the hole is drilled at the right size (not Creo's last value).
+    try { $Session.RunMacro((Build-PreselectedHoleMacro -Diameter ([double]$Diameter))) }
     catch { $res.Reason = "hole macro error: $($_.Exception.Message)"; return $res }
 
     # 5) canary: a NEW hole FEATURE must appear (VersionStamp move is corroborating).

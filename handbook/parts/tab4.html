@@ -1,6 +1,30 @@
-<h2 class="sec">Roadmap</h2>
+<h2 class="sec">Future Development Ideas</h2>
 
-<p>This tab collects candidate improvements, honestly labelled by status and effort. Items marked <span class="pill ok">done</span> are already implemented; everything else is a proposal. Where a step still needs a live Creo recording or a live probe to confirm the load-bearing assumption, it is called out explicitly. Nothing here is a promise of a ship date &mdash; it is a prioritized backlog.</p>
+<p>This tab collects candidate improvements, honestly labelled by status and effort. Items marked <span class="pill ok">done</span> are already implemented; everything else is a proposal. Where a step still needs a live Creo recording or a live probe to confirm the load-bearing assumption, it is called out explicitly. Nothing here is a promise of a ship date &mdash; it is where the project is heading, followed by a prioritized backlog.</p>
+
+<section class="block">
+  <h2 class="sec">1. Where this is heading &mdash; the bigger ambitions</h2>
+  <p>Beyond the concrete backlog below, these are the larger directions the toolkit is aiming at. They are <strong>aspirational</strong> &mdash; some are research, not scheduled work &mdash; but they frame why the smaller items matter.</p>
+  <div class="grid2">
+    <div class="card">
+      <h4>Faster regeneration speeds <span class="pill wip">perf</span></h4>
+      <p>Each geometry step today makes a round-trip into Creo and often forces a full <code>Regenerate</code>. On a big jig that adds up. The direction: <strong>batch and defer regeneration</strong> (regenerate once per stage instead of per feature), cut the number of macro round-trips per hole, and cache the resolved references so re-entering a step doesn&rsquo;t re-query Creo. The payoff is a large orthogrid or a many-fastener curved jig that builds in a fraction of the time.</p>
+    </div>
+    <div class="card">
+      <h4>A learning model for understanding 3D space <span class="pill wip">research</span></h4>
+      <p>The hardest problem in the curved tool is <em>reasoning about geometry</em> &mdash; which face is the drilling surface, where the fastener ring lies, which way is &ldquo;normal.&rdquo; Today the operator supplies all of that by clicking. The ambition: a model that <strong>understands the part in three dimensions</strong> &mdash; surfaces, curvature, bolt patterns, symmetry &mdash; well enough to <strong>propose the picks</strong> (highlight the likely surface, pre-select the fastener set, suggest the index) and cut the click count. Framed honestly as a research bet, not a near-term feature.</p>
+    </div>
+    <div class="card">
+      <h4>Sketching <span class="pill wip">blocked</span></h4>
+      <p>More of the flow could be driven from <strong>programmatic or assisted sketches</strong> &mdash; the plate outline, the relief seed, non-rectangular profiles &mdash; instead of hand-drawing in the sketcher. This is gated on the project&rsquo;s hardest known problem: reliably <strong>writing sketch dimensions</strong> through the API (see &sect;3, &ldquo;Sketch-dimension writes&rdquo;). Solve that and assisted sketching opens up; until then the operator draws the load-bearing rectangles by hand.</p>
+    </div>
+    <div class="card">
+      <h4>Parametric curves <span class="pill wip">exploratory</span></h4>
+      <p>For curved jigs, both the conformal blank and the hole layout could be driven from <strong>parametric curve definitions on the surface</strong> &mdash; a spline or a mapped path the holes follow &mdash; rather than a fixed orthogrid or a hand-picked fastener set. This would let a jig wrap a doubly-curved face or follow a feature line cleanly. Exploratory: it depends on the 3D-space understanding above to know <em>which</em> curve, and on faster regeneration to stay interactive.</p>
+    </div>
+  </div>
+  <p class="muted"><small>The concrete, near-term backlog &mdash; the curved-jig correctness items, the flat-pipeline reliability gaps, and the cross-cutting ideas &mdash; follows below, ordered by how load-bearing and how ready each one is.</small></p>
+</section>
 
 <div class="callout info">
   <div class="t">Sourcing caveat</div>
@@ -8,11 +32,9 @@
 </div>
 
 <section class="block">
-  <h2 class="sec">1. The curved / conformal jig (drilljig3d) &mdash; the biggest frontier</h2>
+  <h2 class="sec">2. The curved / conformal jig (drilljig3d) &mdash; the biggest frontier</h2>
 
-  <p>A curved jig can't be a flat plate. So instead of building a box, the 3D pipeline builds a <strong>conformal blank</strong>: it copies the part's curved face (offset surface / quilt), then thickens that into a new solid body that follows the curvature. The bushing holes are then driven <em>normal to that surface</em> rather than normal to a flat top.</p>
-
-  <p>Where it stands: <strong>STAGE 1</strong> (offset-surface + thicken &rarr; new body, flipped away from the part) and <strong>STAGE 2</strong> (On-Point holes normal-to-surface via surface pre-select) are confirmed working live (2026-06-24). The biggest open correctness question is simple to state and load-bearing: <em>does pre-selecting the surface truly orient each hole normal to the face, or does Creo quietly fall back to its own default?</em></p>
+  <p>How the curved tool works today &mdash; the conformal blank, normal-to-surface drilling, symmetric chip relief, and the radial pattern &mdash; is documented on the <strong>Curved DJ</strong> tab. This section is <strong>what&rsquo;s next</strong> for it: the correctness items and geometry it doesn&rsquo;t build yet. Where it stands: <strong>STAGE 1</strong> (offset-surface + thicken &rarr; new body, flipped away from the part) and <strong>STAGE 2</strong> (On-Point holes normal-to-surface via surface pre-select) are confirmed working live (2026-06-24). The biggest open correctness question is simple to state and load-bearing: <em>does pre-selecting the surface truly orient each hole normal to the face, or does Creo quietly fall back to its own default?</em></p>
 
   <h3>Already implemented</h3>
   <ul>
@@ -101,7 +123,7 @@
 </section>
 
 <section class="block">
-  <h2 class="sec">2. Flat-pipeline reliability items still open</h2>
+  <h2 class="sec">3. Flat-pipeline reliability items still open</h2>
   <table>
     <tr><th>Item</th><th>Status</th><th>Note</th></tr>
     <tr>
@@ -128,7 +150,7 @@
 </section>
 
 <section class="block">
-  <h2 class="sec">3. Cross-cutting ideas</h2>
+  <h2 class="sec">4. Cross-cutting ideas</h2>
   <ul>
     <li>Richer bushing catalog data (headed / press-fit rows, fit classes) to unlock counterbores.</li>
     <li>Parameter-stamping the jig for traceability.</li>

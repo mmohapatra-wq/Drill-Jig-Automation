@@ -1,0 +1,18 @@
+﻿{
+    "SourceModel":  "004-956-8883-001.asm",
+    "Units":  "unknown",
+    "AxisX":  "X",
+    "AxisZ":  "Z",
+    "AxisXSign":  1,
+    "AxisZSign":  1,
+    "Margin":  0.25,
+    "Count":  1,
+    "Points":  [
+                   {
+                       "X":  0.25,
+                       "Z":  0.25
+                   }
+               ],
+    "ReadMethod":  "component-path transform (selected components) (GUI live)",
+    "WhenIso":  "2026-07-21T09:47:33.8580591-04:00"
+            }

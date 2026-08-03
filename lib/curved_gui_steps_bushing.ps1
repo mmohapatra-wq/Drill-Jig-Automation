@@ -2,26 +2,29 @@
 # lib\curved_gui_steps_bushing.ps1 - the Welcome + Bushing step group for the
 # curved-jig wizard GUI (drilljig3d-gui.cmd).
 # ============================================================================
-# Defines ONE global function, Add-CurvedBushingSteps, that appends FOUR wizard
+# Defines ONE global function, Add-CurvedBushingSteps, that appends THREE wizard
 # steps to the shared $Steps ArrayList:
 #   1. welcome   (Stage 'Welcome') - plain-language overview, no Creo.
-#   2. tree      (Stage 'Bushing') - the decision-tree card walk that resolves the
+#   2. tree      (Stage 'Conditions') - the decision-tree card walk that resolves the
 #                hole OD + bushing length. This PORTS the functional core of
 #                drilljig-gui.cmd's tree step (~1737-2340) - the SAME walk state
 #                machine (curved_gui_helpers.ps1's Push/Pop-TreeHistory,
 #                Reset-TreeWalk, Set-BushLengthPick) + the SAME shared catalog
 #                resolvers (drilljig_core.ps1) - so behaviour matches the flat GUI.
-#                DELIBERATELY OMITTED: the 2D/3D bushing schematic (bushing_svg /
-#                WPF Media3D) that drilljig-gui draws on the confirmation page. The
-#                curved GUI shows a TEXT confirmation only (name / hole dia / length)
-#                - lighter, zero extra deps, and the geometry preview is not needed
-#                to pick a bushing. Everything else (OD-first metal, ID-first sleeve,
-#                custom-OD, standardized length + Custom, OD tie-break, in-flow Back)
-#                is preserved verbatim.
-#   3. thickness (Stage 'Bushing') - inline textbox for the conformal-blank
-#                THICKNESS (jig wall). Pre-filled from the bushing length.
-#   4. standoff  (Stage 'Bushing') - inline textbox for the STANDOFF / chip-clearance
-#                offset (default 0 = flush).
+#                On the DONE confirmation it now ALSO draws the SAME 2D (+ optional
+#                WPF 3D) bushing render drilljig-gui shows, via the ported global
+#                Add-BushingConfirmSchematic (curved_gui_helpers.ps1). Everything else
+#                (OD-first metal, ID-first sleeve, custom-OD, standardized length +
+#                Custom, OD tie-break, in-flow Back) is preserved verbatim.
+#   3. chip-clearance (Stage 'Conditions') - ONE choice (Standard 0.25" /
+#                Tight-custom, green-preselected) that sizes the WHOLE blank. The
+#                operator no longer types the wall thickness or the offset (user
+#                2026-07-29): the part thickness is DERIVED as bushing length + chip
+#                clearance and the offset is always 0. Set-CurvedChipClearance
+#                (curved_gui_helpers.ps1) writes $c.Thickness / $c.ReliefDepth /
+#                $c.StandOff. Mirrors drilljig-gui.cmd's slot-depth cards.
+# (The old free-text 'thickness' + 'standoff' + 'relief-depth' steps are REMOVED --
+#  the single chip-clearance card now derives all three values.)
 #
 # CONTRACT / RULES honoured (see the drilljig3d-gui.cmd header + [[project_gui_scope_bugs]]):
 #  - global: on this function so the wizard resolves it after dot-sourcing.
@@ -105,6 +108,11 @@ function global:Add-CurvedBushingSteps {
                     if ([string]$active.BushingID -eq '(custom)') {
                         $y = (Add-Para $panel ([char]0x26A0 + " Custom hole OD -- verify a drill bushing / bushing sleeve at this OD actually exists before machining.") $y 0 'yellow' $true).Bottom + 10
                     }
+                    # DISPLAY-ONLY bushing render (user 2026-07-29): the SAME 2D cross-section
+                    # (+ optional WPF 3D) drilljig-gui shows. No controls, no save -- just a
+                    # picture of the picked bushing. Skipped for the fixed-OD "no bushing" leaf
+                    # (BushingLength null -> Add-BushingConfirmSchematic returns $y unchanged).
+                    $y = (Add-BushingConfirmSchematic -Panel $panel -Active $active -Top $y)
                 } else {
                     $y = (Add-Para $panel "Selection complete (no catalog bushing was resolved)." $y 0 'gray').Bottom + 10
                 }
@@ -519,212 +527,147 @@ function global:Add-CurvedBushingSteps {
     [void]$Steps.Add($treeStep)
 
     # ========================================================================
-    # STEP 3 - THICKNESS (Stage 'Bushing'): inline textbox for the conformal-blank
-    # thickness (jig wall). Live-validate a POSITIVE number into $c.Thickness;
-    # store the validity flag in $c.ThicknessValid (a Build-local cannot survive to
-    # Validate). Soft-warn (yellow) when < 1.5x the hole dia. Mirrors the slot-depth
-    # inline-textbox pattern: precompute echo colors OUTSIDE the closure (Get-UiColor
-    # is global but capturing avoids a per-keystroke resolve), write to $c.*, Refresh.
+    # STEP 3 - CHIP CLEARANCE (Stage 'Conditions'): ONE choice that sizes the whole
+    # blank. The operator no longer types the wall thickness OR the offset (user
+    # 2026-07-29): the offset is always 0 (flush), and the part thickness is DERIVED as
+    # bushing length + chip clearance (mirroring the flat GUI's plate = bushingLen +
+    # slotDepth). Two cards -- "Standard clearance" (0.25", green-preselected) and
+    # "Tight / custom" (type your own) -- exactly like drilljig-gui.cmd's slot-depth
+    # step. Set-CurvedChipClearance (curved_gui_helpers.ps1) does the derivation into
+    # $c.Thickness (wall = bushingLen, or a fallback for the no-bushing leaf), $c.ReliefDepth
+    # (= clearance), and $c.StandOff (= 0). The conformal-blank engine then thickens to
+    # wall + relief = bushingLen + clearance. Validate/OnNext gate on ChipClearanceValid.
     # ========================================================================
-    $thicknessStep = New-WizardStep -Key 'thickness' -Title 'Jig wall thickness' -Stage 'Conditions' -Kind 'info' -PrimaryText 'Next' `
-        -Validate { param($c) return [bool]$c.ThicknessValid } `
-        -Build {
-            param($panel, $c, $wiz)
-            # Pre-fill from the bushing length on first entry (a good default wall = the
-            # length the bushing seats through). Only when Thickness is still unset.
-            if ($null -eq $c.Thickness -and $null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) {
-                $c.Thickness = [double]$c.BushingLen
-            }
-            $y = 8
-            $y = (Add-Para $panel "How thick should the conformal jig blank be? This is the wall the tool grows off the surface you follow (the bushing seats through it)." $y 0 'gray').Bottom + 6
-            if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) {
-                $rec = 1.5 * [double]$c.HoleDiaFinal
-                $y = (Add-Para $panel ("Guidance: at least ~1.5x the hole diameter ({0:0.###}`") gives the bushing enough wall to seat." -f $rec) $y 0 'gray').Bottom + 8
-            }
-            $lab = New-Object System.Windows.Forms.Label
-            $lab.Text = 'Thickness (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(112, 20)
-            $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
-            $panel.Controls.Add($lab)
-            $tb = New-Object System.Windows.Forms.TextBox
-            $tb.Location = New-Object System.Drawing.Point(124, $y); $tb.Size = New-Object System.Drawing.Size(90, 24)
-            $tb.Text = if ($null -ne $c.Thickness) { [string]$c.Thickness } else { '' }
-            $tb.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tb.ForeColor = Get-UiColor ''; $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-            $panel.Controls.Add($tb)
-            $lblEcho = New-Object System.Windows.Forms.Label
-            $lblEcho.AutoSize = $true; $lblEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
-            $lblEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblEcho.BackColor = [System.Drawing.Color]::Transparent
-            $panel.Controls.Add($lblEcho)
-            # Precompute echo colors + the recommended wall OUTSIDE the closure (Get-UiColor
-            # is global, but capturing keeps the closure free of a per-keystroke resolve;
-            # $recWall is a plain double captured by value).
-            $okCol   = Get-UiColor 'green'
-            $warnCol = Get-UiColor 'warn'
-            $errCol  = Get-UiColor 'firebrick'
-            $recWall = if ($null -ne $c.HoleDiaFinal) { 1.5 * [double]$c.HoleDiaFinal } else { 0.0 }
-            $updateEcho = {
-                $t = [string]$tb.Text
-                $v = $null
-                if (-not [string]::IsNullOrWhiteSpace($t)) {
-                    try { $v = [double]::Parse($t.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) } catch { $v = $null }
-                }
-                if ($null -eq $v -or [double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -le 0) {
-                    $c.ThicknessValid = $false
-                    $lblEcho.ForeColor = $errCol
-                    $lblEcho.Text = 'Enter a positive thickness in inches (e.g. 0.5).'
-                } else {
-                    $c.Thickness = [double]$v; $c.ThicknessValid = $true
-                    if ($recWall -gt 0 -and $v -lt $recWall) {
-                        $lblEcho.ForeColor = $warnCol
-                        $lblEcho.Text = ([char]0x26A0 + (" Thickness {0:0.###}`" is thin -- below ~1.5x the hole dia ({1:0.###}`"). OK to continue, but verify the bushing has enough wall to seat." -f [double]$v, $recWall))
-                    } else {
-                        $lblEcho.ForeColor = $okCol
-                        $lblEcho.Text = ("Thickness {0:0.###}`". Press Next." -f [double]$v)
-                    }
-                    $wiz.SetChip('thickness', ("wall {0:0.###}`"" -f [double]$v), 'set')
-                }
-                try { $wiz.Refresh() } catch {}
-            }.GetNewClosure()
-            $tb.Add_TextChanged({ param($s,$e) & $updateEcho }.GetNewClosure())
-            & $updateEcho
+    $clearanceStep = New-WizardStep -Key 'chip-clearance' -Title 'Chip clearance' -Stage 'Conditions' -Kind 'choice' -PrimaryText 'Next' `
+        -Validate {
+            param($c)
+            # Standard (the seeded default) is ALWAYS valid, so Next is enabled on entry
+            # (the fix for "Next not working"). Only custom must have a valid typed value.
+            if ($c.ClearanceMode -eq 'custom') { return [bool]$c.ChipClearanceValid }
+            return $true
         } `
-        -OnNext { param($c, $wiz) return [bool]$c.ThicknessValid }
-    [void]$Steps.Add($thicknessStep)
-
-    # ========================================================================
-    # STEP 4 - STANDOFF (Stage 'Bushing'): inline textbox for the standoff /
-    # chip-clearance offset. Default 0 (flush). Live-validate a NON-NEGATIVE number
-    # into $c.StandOff (blank == 0 is OK). Store the validity flag in $c.StandOffValid.
-    # ========================================================================
-    $standoffStep = New-WizardStep -Key 'standoff' -Title 'Standoff / chip clearance' -Stage 'Conditions' -Kind 'info' -PrimaryText 'Next' `
-        -Validate { param($c) return [bool]$c.StandOffValid } `
         -Build {
             param($panel, $c, $wiz)
-            # Default StandOff = 0 (flush) if unset; the field seeds from it.
-            if ($null -eq $c.StandOff) { $c.StandOff = 0.0 }
-            # Blank/0 is a VALID default, so the step can pass with no typing.
-            if ($null -eq $c.StandOffValid) { $c.StandOffValid = $true }
-            $y = 8
-            $y = (Add-Para $panel "Standoff (chip-clearance offset): how far to float the jig off the part surface. Leave 0 for flush (the usual choice); a positive value lifts the jig to clear chips/debris." $y 0 'gray').Bottom + 8
-            $lab = New-Object System.Windows.Forms.Label
-            $lab.Text = 'Standoff (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(100, 20)
-            $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
-            $panel.Controls.Add($lab)
-            $tb = New-Object System.Windows.Forms.TextBox
-            $tb.Location = New-Object System.Drawing.Point(112, $y); $tb.Size = New-Object System.Drawing.Size(90, 24)
-            $tb.Text = if ($null -ne $c.StandOff) { [string]$c.StandOff } else { '0' }
-            $tb.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tb.ForeColor = Get-UiColor ''; $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-            $panel.Controls.Add($tb)
-            $lblEcho = New-Object System.Windows.Forms.Label
-            $lblEcho.AutoSize = $true; $lblEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
-            $lblEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblEcho.BackColor = [System.Drawing.Color]::Transparent
-            $panel.Controls.Add($lblEcho)
-            # Precompute echo colors OUTSIDE the closure (same pattern as above).
-            $okCol  = Get-UiColor 'green'
-            $errCol = Get-UiColor 'firebrick'
-            $updateEcho = {
-                $t = [string]$tb.Text
-                if ([string]::IsNullOrWhiteSpace($t)) {
-                    # blank == flush (0).
-                    $c.StandOff = 0.0; $c.StandOffValid = $true
-                    $lblEcho.ForeColor = $okCol
-                    $lblEcho.Text = 'Standoff 0" (flush). Press Next.'
-                    $wiz.SetChip('standoff', 'standoff 0"', 'set')
-                } else {
-                    $v = $null
-                    try { $v = [double]::Parse($t.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) } catch { $v = $null }
-                    if ($null -eq $v -or [double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0) {
-                        $c.StandOffValid = $false
-                        $lblEcho.ForeColor = $errCol
-                        $lblEcho.Text = 'Enter 0 (flush) or a positive offset in inches.'
-                    } else {
-                        $c.StandOff = [double]$v; $c.StandOffValid = $true
-                        $lblEcho.ForeColor = $okCol
-                        $lblEcho.Text = ("Standoff {0:0.###}`". Press Next." -f [double]$v)
-                        $wiz.SetChip('standoff', ("standoff {0:0.###}`"" -f [double]$v), 'set')
-                    }
-                }
-                try { $wiz.Refresh() } catch {}
-            }.GetNewClosure()
-            $tb.Add_TextChanged({ param($s,$e) & $updateEcho }.GetNewClosure())
-            & $updateEcho
-        } `
-        -OnNext { param($c, $wiz) return [bool]$c.StandOffValid }
-    [void]$Steps.Add($standoffStep)
-
-    # ========================================================================
-    # STEP 5 - RELIEF DEPTH (Stage 'Bushing'): inline textbox for the chip-relief
-    # depth. Each fastener gets a SYMMETRIC remove-material pocket on its TOP plane
-    # `relief`-deep each way; the conformal blank thicken grows to wall + relief so
-    # there is material to remove. Default 0.25" (prefilled from $c.SlotDepthAbs, the
-    # --slot-depth/--relief-depth flag). 0 = NO chip relief (no thicken bump, no cuts).
-    # Live-validate a NON-NEGATIVE number into $c.ReliefDepth (0 is valid = disabled);
-    # store the validity flag in $c.ReliefDepthValid. Mirrors the standoff/thickness
-    # inline-textbox pattern: precompute echo colors OUTSIDE the closure, write $c.*, Refresh.
-    # ========================================================================
-    $reliefStep = New-WizardStep -Key 'relief-depth' -Title 'Chip-relief depth' -Stage 'Conditions' -Kind 'info' -PrimaryText 'Next' `
-        -Validate { param($c) return [bool]$c.ReliefDepthValid } `
-        -Build {
-            param($panel, $c, $wiz)
-            # Seed the default from the flag ($c.SlotDepthAbs) on first entry if unset.
-            if ($null -eq $c.ReliefDepth) {
+            # Seed the standard default (0.25, or the --slot-depth/--relief-depth flag) on
+            # first entry so the recommended card is meaningful.
+            if ($null -eq $c.ChipClearance) {
                 $seed = 0.25
                 try { if ($null -ne $c.SlotDepthAbs -and [double]$c.SlotDepthAbs -gt 0) { $seed = [double]$c.SlotDepthAbs } } catch { $seed = 0.25 }
-                $c.ReliefDepth = [double]$seed
+                $c.ChipClearance = [double]$seed
             }
-            # A seeded numeric default is valid, so the step can pass with no typing.
-            if ($null -eq $c.ReliefDepthValid) { $c.ReliefDepthValid = $true }
-            $y = 8
-            $y = (Add-Para $panel "Chip-relief: each fastener hole gets a shallow rectangular pocket cut on its TOP plane to clear chips/debris while drilling. The pocket is a SYMMETRIC cut, this deep on each side of the plane." $y 0 'gray').Bottom + 6
-            $y = (Add-Para $panel "The conformal blank is thickened to wall + this relief so there is material to remove. Enter 0 for NO chip relief." $y 0 'gray').Bottom + 8
-            $lab = New-Object System.Windows.Forms.Label
-            $lab.Text = 'Relief depth (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(120, 20)
-            $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
-            $panel.Controls.Add($lab)
-            $tb = New-Object System.Windows.Forms.TextBox
-            $tb.Location = New-Object System.Drawing.Point(132, $y); $tb.Size = New-Object System.Drawing.Size(90, 24)
-            $tb.Text = if ($null -ne $c.ReliefDepth) { [string]$c.ReliefDepth } else { '0.25' }
-            $tb.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tb.ForeColor = Get-UiColor ''; $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-            $panel.Controls.Add($tb)
-            $lblEcho = New-Object System.Windows.Forms.Label
-            $lblEcho.AutoSize = $true; $lblEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
-            $lblEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblEcho.BackColor = [System.Drawing.Color]::Transparent
-            $panel.Controls.Add($lblEcho)
-            # Precompute echo colors OUTSIDE the closure (same pattern as thickness/standoff).
-            $okCol   = Get-UiColor 'green'
-            $grayCol = Get-UiColor 'gray'
-            $errCol  = Get-UiColor 'firebrick'
-            $updateEcho = {
-                $t = [string]$tb.Text
-                if ([string]::IsNullOrWhiteSpace($t)) {
-                    # blank == the 0.25 default (a positive relief), matching the prefill.
-                    $c.ReliefDepth = 0.25; $c.ReliefDepthValid = $true
-                    $lblEcho.ForeColor = $okCol
-                    $lblEcho.Text = ('Relief 0.25" (symmetric cut 0.5"). Press Next.')
-                    $wiz.SetChip('relief', 'relief 0.25"', 'set')
+            # SEED the mode to 'standard' on first entry so Next is ENABLED immediately (the
+            # preselected default). Without this, ClearanceMode was $null -> Validate false ->
+            # Next disabled until a card click (the reported "Next not working"). The cards
+            # stay visible below so the operator can still switch to custom.
+            if ($null -eq $c.ClearanceMode) { $c.ClearanceMode = 'standard' }
+            # bushing length (for the derived-thickness echo); fallback wall when unknown.
+            $bl = 0.0; try { if ($null -ne $c.BushingLen -and [double]$c.BushingLen -gt 0) { $bl = [double]$c.BushingLen } } catch { $bl = 0.0 }
+            $wallFallback = 0.0
+            if ($bl -le 0) {
+                $hd = 0.0; try { if ($null -ne $c.HoleDiaFinal -and [double]$c.HoleDiaFinal -gt 0) { $hd = [double]$c.HoleDiaFinal } } catch { $hd = 0.0 }
+                $wallFallback = [Math]::Max((1.5 * $hd), 0.5)
+            }
+            $wallNow = if ($bl -gt 0) { $bl } else { $wallFallback }
+
+            $y = (Add-Para $panel "Chip clearance sizes the jig. Each fastener hole gets a shallow SYMMETRIC relief pocket cut on its TOP plane to clear chips/debris while drilling, and the blank is thickened by this same amount so there is material to remove." 8 0 'gray').Bottom + 6
+            $thkLine = if ($bl -gt 0) {
+                ("Part thickness is AUTOMATIC: bushing length {0:0.###}`" + chip clearance. The offset is always 0 (flush) -- you are not asked for either." -f $bl)
+            } else {
+                ("Part thickness is AUTOMATIC: jig wall {0:0.###}`" (no bushing length on this leaf -- fallback ~1.5x the hole dia) + chip clearance. The offset is always 0 (flush)." -f $wallFallback)
+            }
+            $y = (Add-Para $panel $thkLine $y 0 'gray').Bottom + 12
+
+            # ALWAYS show the two cards (green border on the ACTIVE mode) so the default is
+            # preselected AND custom stays one click away. Standard = 0.25; Custom = type your own.
+            $selIdx = if ($c.ClearanceMode -eq 'custom') { 1 } else { 0 }
+            $stdC = 0.25
+            $stdTotal = $wallNow + $stdC
+            $stdSub = ("Chip clearance 0.25`". Part thickness = {0:0.###}`" ({1:0.###}`" + 0.25`")." -f $stdTotal, $wallNow)
+            $opts = @(
+                @{ Title = 'Standard clearance'; Subtitle = $stdSub },
+                @{ Title = 'Tight / custom'; Subtitle = 'Enter my own (usually smaller) chip clearance.' }
+            )
+            Add-WizardChoiceCards -Panel $panel -Options $opts -Context $c -Wizard $wiz -Top ($y + 4) -CardWidth 250 -CardHeight 92 -HighlightIndex $selIdx -AfterPick 'rerender' -OnPick {
+                param($i, $opt, $cc, $w)
+                if ($i -eq 0) {
+                    $cc.ClearanceMode = 'standard'
+                    $dr = Set-CurvedChipClearance -Context $cc -Clearance 0.25
+                    $w.SetChip('relief', 'clearance 0.25"', 'set')
+                    $w.SetChip('thickness', ("part {0:0.###}`"" -f $dr.Total), 'set')
                 } else {
-                    $v = $null
-                    try { $v = [double]::Parse($t.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) } catch { $v = $null }
-                    if ($null -eq $v -or [double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0) {
-                        $c.ReliefDepthValid = $false
-                        $lblEcho.ForeColor = $errCol
-                        $lblEcho.Text = 'Enter 0 (no relief) or a positive depth in inches (e.g. 0.25).'
-                    } elseif ($v -eq 0) {
-                        $c.ReliefDepth = 0.0; $c.ReliefDepthValid = $true
-                        $lblEcho.ForeColor = $grayCol
-                        $lblEcho.Text = 'No chip relief (0). Blank thickens to the wall only; no pockets are cut. Press Next.'
-                        $wiz.SetChip('relief', 'relief: none', 'set')
-                    } else {
-                        $c.ReliefDepth = [double]$v; $c.ReliefDepthValid = $true
-                        $lblEcho.ForeColor = $okCol
-                        $lblEcho.Text = ("Relief {0:0.###}`" (symmetric cut {1:0.###}`"). Blank thickens to wall + {0:0.###}`". Press Next." -f [double]$v, (2.0 * [double]$v))
-                        $wiz.SetChip('relief', ("relief {0:0.###}`"" -f [double]$v), 'set')
-                    }
+                    $cc.ClearanceMode = 'custom'
+                    $cur = 0.25; try { if ($null -ne $cc.ChipClearance -and [double]$cc.ChipClearance -gt 0) { $cur = [double]$cc.ChipClearance } } catch { $cur = 0.25 }
+                    $cc.ChipClearanceValid = ([double]$cur -gt 0)
                 }
-                try { $wiz.Refresh() } catch {}
-            }.GetNewClosure()
-            $tb.Add_TextChanged({ param($s,$e) & $updateEcho }.GetNewClosure())
-            & $updateEcho
+            }
+            # flow the confirmation/field BELOW the cards (Get-StackTop returns just under the
+            # lowest control so it can never draw over the cards).
+            $y = Get-StackTop $panel ($y + 4) 14
+
+            if ($c.ClearanceMode -eq 'custom') {
+                # CUSTOM: an editable clearance field, live-validated. Seeds Set-CurvedChipClearance
+                # on every valid keystroke so the derived thickness + relief stay in sync.
+                $y = (Add-Para $panel "Tight / custom -- enter your chip clearance (inches):" $y 0 $null $true).Bottom + 8
+                $lab = New-Object System.Windows.Forms.Label
+                $lab.Text = 'Chip clearance (in):'; $lab.Location = New-Object System.Drawing.Point(8, ($y + 3)); $lab.Size = New-Object System.Drawing.Size(136, 20)
+                $lab.ForeColor = Get-UiColor ''; $lab.BackColor = [System.Drawing.Color]::Transparent
+                $panel.Controls.Add($lab)
+                $tb = New-Object System.Windows.Forms.TextBox
+                $tb.Location = New-Object System.Drawing.Point(148, $y); $tb.Size = New-Object System.Drawing.Size(90, 24)
+                $tb.Text = if ($null -ne $c.ChipClearance) { [string]$c.ChipClearance } else { '0.25' }
+                $tb.BackColor = [System.Drawing.Color]::FromArgb(16,24,42); $tb.ForeColor = Get-UiColor ''; $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+                $panel.Controls.Add($tb)
+                $lblEcho = New-Object System.Windows.Forms.Label
+                $lblEcho.AutoSize = $true; $lblEcho.MaximumSize = New-Object System.Drawing.Size(560, 0)
+                $lblEcho.Location = New-Object System.Drawing.Point(8, ($y + 34)); $lblEcho.BackColor = [System.Drawing.Color]::Transparent
+                $panel.Controls.Add($lblEcho)
+                # Precompute echo colors OUTSIDE the closure (Get-UiColor is global but capturing
+                # avoids a per-keystroke resolve).
+                $okCol  = Get-UiColor 'green'
+                $errCol = Get-UiColor 'firebrick'
+                $updateEcho = {
+                    $t = [string]$tb.Text
+                    $v = $null
+                    if (-not [string]::IsNullOrWhiteSpace($t)) {
+                        try { $v = [double]::Parse($t.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) } catch { $v = $null }
+                    }
+                    if ($null -eq $v -or [double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -le 0) {
+                        $c.ChipClearanceValid = $false
+                        $lblEcho.ForeColor = $errCol
+                        $lblEcho.Text = 'Enter a positive chip clearance in inches (e.g. 0.125).'
+                    } else {
+                        $dr = Set-CurvedChipClearance -Context $c -Clearance ([double]$v)
+                        $lblEcho.ForeColor = $okCol
+                        $lblEcho.Text = ("Chip clearance {0:0.###}`" (symmetric relief cut {1:0.###}`"). Part thickness = {2:0.###}`". Press Next." -f [double]$v, (2.0 * [double]$v), $dr.Total)
+                        $wiz.SetChip('relief', ("clearance {0:0.###}`"" -f [double]$v), 'set')
+                        $wiz.SetChip('thickness', ("part {0:0.###}`"" -f $dr.Total), 'set')
+                    }
+                    try { $wiz.Refresh() } catch {}
+                }.GetNewClosure()
+                $tb.Add_TextChanged({ param($s,$e) & $updateEcho }.GetNewClosure())
+                & $updateEcho
+            } else {
+                # STANDARD (preselected default): confirm + derive. Next is already enabled.
+                $dr = Set-CurvedChipClearance -Context $c -Clearance 0.25
+                $y = (Add-Para $panel ([char]0x2713 + " Standard clearance 0.25`" (symmetric relief cut 0.5`") -- press Next, or pick Tight / custom above.") $y 0 'green' $true).Bottom + 6
+                $ftxt = if ($dr.Fallback) { " (wall = fallback ~1.5x hole dia; no bushing length on this leaf)" } else { "" }
+                $y = (Add-Para $panel ("Part thickness = {0:0.###}`" ({1:0.###}`" + 0.25`"){2}. Offset 0 (flush)." -f $dr.Total, $dr.Wall, $ftxt) $y 0 'gray').Bottom + 10
+                $wiz.SetChip('relief', 'clearance 0.25"', 'set')
+                $wiz.SetChip('thickness', ("part {0:0.###}`"" -f $dr.Total), 'set')
+            }
         } `
-        -OnNext { param($c, $wiz) return [bool]$c.ReliefDepthValid }
-    [void]$Steps.Add($reliefStep)
+        -OnNext {
+            param($c, $wiz)
+            # null mode defaults to standard (Next is enabled on entry, no card click needed).
+            if ($null -eq $c.ClearanceMode) { $c.ClearanceMode = 'standard' }
+            if ($c.ClearanceMode -eq 'custom' -and -not $c.ChipClearanceValid) { return $false }
+            # Re-derive from the committed clearance so Thickness/ReliefDepth/StandOff are set
+            # even if the operator advanced via Next without touching a card this render.
+            $cl = 0.25
+            if ($c.ClearanceMode -eq 'standard') { $cl = 0.25 }
+            else { try { if ($null -ne $c.ChipClearance -and [double]$c.ChipClearance -gt 0) { $cl = [double]$c.ChipClearance } } catch { $cl = 0.25 } }
+            [void](Set-CurvedChipClearance -Context $c -Clearance $cl)
+            return $true
+        }
+    [void]$Steps.Add($clearanceStep)
 }

@@ -56,10 +56,12 @@ $files = @(
     'lib\curved_gui_steps_fastener.ps1',
     'lib\curved_gui_steps_drill.ps1',
     'lib\curved_relief.ps1',
+    'lib\curved_radial.ps1',
     'lib\curved_gui_steps_build.ps1',
     'lib\curved_gui_steps_slots.ps1',
     'lib\curved_gui_steps_compose.ps1',
-    'lib\curved_gui_steps_done.ps1'
+    'lib\curved_gui_steps_done.ps1',
+    'lib\curved_surface_radius.ps1'
 )
 foreach ($rel in $files) {
     $p = Join-Path $root $rel
@@ -97,6 +99,8 @@ if ($null -ne $guiRaw) {
     Assert-True "dot-sources lib\curved_slots.ps1"          ($guiRaw -match 'lib\\curved_slots\.ps1')
     Assert-True "dot-sources lib\curved_slot_macros.ps1"    ($guiRaw -match 'lib\\curved_slot_macros\.ps1')
     Assert-True "dot-sources lib\curved_relief.ps1"         ($guiRaw -match 'lib\\curved_relief\.ps1')
+    Assert-True "dot-sources lib\curved_radial.ps1"          ($guiRaw -match 'lib\\curved_radial\.ps1')
+    Assert-True "dot-sources lib\curved_surface_radius.ps1"  ($guiRaw -match 'lib\\curved_surface_radius\.ps1')
     Assert-True "dot-sources lib\curved_gui_steps_build.ps1"   ($guiRaw -match 'lib\\curved_gui_steps_build\.ps1')
     Assert-True "dot-sources lib\curved_gui_steps_slots.ps1"   ($guiRaw -match 'lib\\curved_gui_steps_slots\.ps1')
     Assert-True "dot-sources lib\curved_gui_steps_compose.ps1" ($guiRaw -match 'lib\\curved_gui_steps_compose\.ps1')
@@ -116,7 +120,7 @@ if ($null -ne $guiRaw) {
 Write-Host ""
 Write-Host "  -- resolve + build: Add-Curved*Steps append the expected steps --" -ForegroundColor White
 foreach ($dep in @('creo_geometry.ps1','orthogrid.ps1','orthogrid_points.ps1','drilljig_core.ps1',
-                   'conformal_blank.ps1','edge_round.ps1','curved_fastener_hole.ps1','tangent_plane.ps1','curved_slots.ps1','curved_slot_macros.ps1','curved_relief.ps1',
+                   'conformal_blank.ps1','edge_round.ps1','curved_fastener_hole.ps1','tangent_plane.ps1','curved_slots.ps1','curved_slot_macros.ps1','curved_relief.ps1','curved_radial.ps1',
                    'wizard.ps1','curved_gui_helpers.ps1',
                    'curved_gui_steps_bushing.ps1','curved_gui_steps_surface.ps1',
                    'curved_gui_steps_fastener.ps1','curved_gui_steps_build.ps1','curved_gui_steps_slots.ps1',
@@ -132,9 +136,25 @@ foreach ($fn in @('Add-CurvedInputFirstSteps','Add-CurvedBushingSteps','Add-Curv
 # GLOBAL so the build-run OnNext + the slot-loop Add_Click closure resolve them (the
 # closure-scope rule -- Section 6 lints the calls; this asserts they exist).
 foreach ($fn in @('Invoke-CurvedBlankAction','Invoke-CurvedCornerAction','Invoke-CurvedDrillAll',
-                  'Build-CurvedReliefArmMacro','Build-CurvedReliefCutMacro','Invoke-FastenerRelief')) {
+                  'Build-CurvedReliefArmMacro','Build-CurvedReliefCutMacro','Invoke-FastenerRelief',
+                  'Build-CurvedReliefOpenByIdMacro','Build-OffsetPlaneOnPreselectedMacro','New-CurvedGuidePlanes',
+                  'Invoke-FastenerReliefArm','Invoke-FastenerReliefCut','Invoke-CurvedReliefArmAt')) {
     Assert-True "resolves: $fn (global)" ($null -ne (Get-Command $fn -ErrorAction SilentlyContinue))
 }
+# the RADIAL / AXIS chip-relief pattern (user 2026-07-30): the PURE plan math + the macro
+# builders + the driver must all be GLOBAL so the slot-arm/slot-finish OnNext closures resolve
+# them (the closure-scope rule). Get-CurvedRadialPatternPlan/Test are the auto-when-uniform gate;
+# Build-RadialPattern* are the mapkey-transcribed axis-pattern macros; Invoke-CurvedReliefRadialPattern
+# is the canary-gated driver (per-fastener fallback). See [[project_curved_radial_slot_pattern]].
+foreach ($fn in @('Get-CurvedRadialAzimuths','Get-CurvedRadialPatternPlan','Test-CurvedRadialPatternPlan',
+                  'Build-RadialPatternOpenMacro','Build-RadialPatternValuesMacro','Invoke-CurvedReliefRadialPattern')) {
+    Assert-True "resolves: $fn (radial, global)" ($null -ne (Get-Command $fn -ErrorAction SilentlyContinue))
+}
+# the Slots stage's hands-free relief opens the sketch on a jig-part TANGENT plane by id,
+# built via the GLOBAL wrapper Invoke-TangentPlane (a curved-GUI step closure can only
+# resolve `function global:` names). Assert it is global-scoped + resolvable.
+$itp = Get-Command Invoke-TangentPlane -ErrorAction SilentlyContinue
+Assert-True "resolves: Invoke-TangentPlane (global wrapper for the relief sketch plane)" ($null -ne $itp)
 # the corner-round step's OnNext calls the GLOBAL wrapper Invoke-CurvedCornerRound; a
 # curved-GUI step closure can only resolve `function global:` names, so assert it is
 # GLOBAL-scoped + resolvable (a plain Invoke-AutoCornerRound would be invisible to the
@@ -148,7 +168,7 @@ $steps = New-Object System.Collections.ArrayList
 $built = $true
 try { Add-CurvedInputFirstSteps -Steps $steps } catch { $built = $false; Write-Host "    (Add-CurvedInputFirstSteps threw: $($_.Exception.Message))" -ForegroundColor DarkGray }
 Assert-True "Add-CurvedInputFirstSteps ran without throwing" $built
-Assert-True "produced >= 12 steps" (@($steps).Count -ge 12) ("got {0}" -f @($steps).Count)
+Assert-True "produced >= 10 steps" (@($steps).Count -ge 10) ("got {0}" -f @($steps).Count)
 
 # collect the (Key, Stage) inventory
 $keys   = @($steps | ForEach-Object { [string]$_.Key })
@@ -156,9 +176,14 @@ $stagesSeen = @($steps | ForEach-Object { [string]$_.Stage } | Select-Object -Un
 Write-Host ("    steps: " + ($keys -join ', ')) -ForegroundColor DarkGray
 
 foreach ($k in @('welcome','fastener-select','surface-arm',
-                 'tree','thickness','standoff','relief-depth','fastener-dia',
-                 'build-run','slot-select','slot-loop','done')) {
+                 'tree','chip-clearance','fastener-dia',
+                 'build-run','slot-arm','slot-finish','done')) {
     Assert-True "has step '$k'" ($keys -contains $k)
+}
+# the free-text thickness/standoff steps + the slot re-select are REMOVED (2026-07-29);
+# the single slot-loop is now the flat-DJ two-step slot-arm/slot-finish (2026-07-29 PM).
+foreach ($gone in @('thickness','standoff','relief-depth','slot-select','slot-loop')) {
+    Assert-True "removed step '$gone' is absent" (-not ($keys -contains $gone))
 }
 foreach ($stg in @('Welcome','Fasteners','Surface','Conditions','Build','Slots','Done')) {
     Assert-True "stage '$stg' is covered by >=1 step" ($stagesSeen -contains $stg)
@@ -168,8 +193,8 @@ Assert-True "first step is 'welcome'" (@($keys)[0] -eq 'welcome')
 Assert-True "last step is 'done'"     (@($keys)[-1] -eq 'done')
 # INPUT-FIRST ORDER: fasteners + surface come BEFORE the conditions/build/slots.
 $idx = @{}; for ($ii=0; $ii -lt $keys.Count; $ii++) { $idx[$keys[$ii]] = $ii }
-Assert-True "order: fastener-select before surface-arm before tree/build-run" `
-    (($idx['fastener-select'] -lt $idx['surface-arm']) -and ($idx['surface-arm'] -lt $idx['tree']) -and ($idx['tree'] -lt $idx['build-run']) -and ($idx['build-run'] -lt $idx['slot-loop']))
+Assert-True "order: fastener-select before surface-arm before tree/chip-clearance/build-run/slot-arm/slot-finish" `
+    (($idx['fastener-select'] -lt $idx['surface-arm']) -and ($idx['surface-arm'] -lt $idx['tree']) -and ($idx['tree'] -lt $idx['chip-clearance']) -and ($idx['chip-clearance'] -lt $idx['build-run']) -and ($idx['build-run'] -lt $idx['slot-arm']) -and ($idx['slot-arm'] -lt $idx['slot-finish']))
 # STAGE CONTIGUITY: each stage's steps are contiguous in the array (the breadcrumb needs it).
 $stageSeq = @($steps | ForEach-Object { [string]$_.Stage })
 $seenStages = @(); $contig = $true
@@ -319,6 +344,33 @@ foreach ($rel in $stepFiles) {
         }
     }
     Assert-True "no closure-unsafe COM primitive call in $rel" (@($callHits).Count -eq 0) ("(" + (@($callHits) -join ', ') + ") -- route via a global Invoke-* wrapper")
+}
+
+# ----------------------------------------------------------------------------
+# RADIAL-DISTANCE OVERRIDE contract: the "read radial distance" session's producer
+# (lib\curved_surface_radius.ps1) that the radial-pattern session consumes as
+# $ctx.RadialAxisGeom. Producer/shape/format fns MUST be `function global:` so a
+# wizard step closure resolves them; the shell must seed the ctx field + dot-source
+# the lib; the surface-arm verify must read the override into the ctx field.
+# ----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "  -- radial-distance override contract --" -ForegroundColor White
+$radLib = Join-Path $libDir 'curved_surface_radius.ps1'
+Assert-True "curved_surface_radius.ps1 exists" (Test-Path $radLib) "missing"
+if (Test-Path $radLib) {
+    $radRaw = Get-Content -Raw $radLib
+    foreach ($fn in @('Read-CurvedRadialGeomFromBuffer','Read-CurvedSurfaceCylinderGeom','New-CurvedRadialGeom','Format-CurvedRadialGeom','Get-CurvedRadialCompTriple')) {
+        Assert-True "curved_surface_radius: $fn is 'function global:'" ($radRaw -match ("(?m)^\s*function\s+global:" + [regex]::Escape($fn) + "\b"))
+    }
+}
+if ($null -ne $guiRaw) {
+    Assert-True 'ctx seeds RadialAxisGeom = $null' ($guiRaw -match '(?m)RadialAxisGeom\s*=\s*\$null')
+}
+$surfStep = Join-Path $libDir 'curved_gui_steps_surface.ps1'
+if (Test-Path $surfStep) {
+    $surfRaw = Get-Content -Raw $surfStep
+    Assert-True "surface-arm calls Read-CurvedRadialGeomFromBuffer" ($surfRaw -match 'Read-CurvedRadialGeomFromBuffer')
+    Assert-True 'surface-arm sets $Context.RadialAxisGeom'          ($surfRaw -match '\$Context\.RadialAxisGeom\s*=')
 }
 
 Write-Host ""

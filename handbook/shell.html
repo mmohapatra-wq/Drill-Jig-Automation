@@ -164,15 +164,23 @@
 <nav class="tabbar">
   <div class="tabbar-inner">
     <button class="tabbtn active" data-tab="use"><span class="n">1</span>Using the GUI</button>
-    <button class="tabbtn" data-tab="dev"><span class="n">2</span>Build &amp; Develop</button>
-    <button class="tabbtn" data-tab="tools"><span class="n">3</span>Other Tools &amp; Downloads</button>
-    <button class="tabbtn" data-tab="future"><span class="n">4</span>Roadmap</button>
+    <button class="tabbtn" data-tab="curved"><span class="n">2</span>Curved DJ</button>
+    <button class="tabbtn" data-tab="examples"><span class="n">3</span>Examples</button>
+    <button class="tabbtn" data-tab="dev"><span class="n">4</span>Build &amp; Develop</button>
+    <button class="tabbtn" data-tab="tools"><span class="n">5</span>Other Tools &amp; Downloads</button>
+    <button class="tabbtn" data-tab="future"><span class="n">6</span>Future Development Ideas</button>
   </div>
 </nav>
 
 <main>
   <section id="tab-use" class="tabpanel active">
 <!--INCLUDE:tab1-->
+  </section>
+  <section id="tab-curved" class="tabpanel">
+<!--INCLUDE:tab6-->
+  </section>
+  <section id="tab-examples" class="tabpanel">
+<!--INCLUDE:tab5-->
   </section>
   <section id="tab-dev" class="tabpanel">
 <!--INCLUDE:tab2-->
@@ -208,7 +216,7 @@
 /* ---------------- tab switching ---------------- */
 (function(){
   var btns = document.querySelectorAll('.tabbtn');
-  var panels = {use:'tab-use', dev:'tab-dev', tools:'tab-tools', future:'tab-future'};
+  var panels = {use:'tab-use', curved:'tab-curved', examples:'tab-examples', dev:'tab-dev', tools:'tab-tools', future:'tab-future'};
   function show(tab){
     btns.forEach(function(b){ b.classList.toggle('active', b.dataset.tab===tab); });
     Object.keys(panels).forEach(function(k){

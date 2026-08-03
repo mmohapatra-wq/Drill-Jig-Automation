@@ -1,0 +1,333 @@
+<div class="callout warn">
+  <div class="t">Experimental &mdash; in active development <span class="pill wip">preview</span></div>
+  <p>The curved (conformal) drill-jig wizard is <strong>newer and less proven</strong> than the flat tool on the first tab. Its two load-bearing stages are confirmed working on live Creo (2026-06-24): <strong>STAGE&nbsp;1</strong> &mdash; offset the part&rsquo;s surface and thicken it into a new body &mdash; and <strong>STAGE&nbsp;2</strong> &mdash; drill On-Point holes oriented to each fastener&rsquo;s surface. But the load-bearing correctness question is still open: <em>does pre-selecting the surface truly orient every hole normal to the face, or does Creo sometimes fall back to its own default?</em> The automatic radial chip-relief pattern is <strong>probe-gated</strong> (it only engages once a one-time recording is captured; until then the tool draws each pocket by hand). Treat this as a <strong>preview build</strong>: run it, but <strong>eyeball every result in Creo</strong> before trusting it.</p>
+</div>
+
+<p>The curved drill-jig wizard (<code>drilljig3d-gui</code>) builds a jig for a part whose drilling face <strong>isn&rsquo;t flat</strong>. A flat jig is a plate; a curved jig can&rsquo;t be. So instead of extruding a box, this tool builds a <strong>conformal blank</strong>: it copies the part&rsquo;s curved face, offsets it, and thickens that into a new solid body that <em>follows the curvature</em>. It then drills each bushing hole <strong>normal to that surface</strong> (not normal to a flat top), and cuts a symmetric chip-relief pocket on each fastener&rsquo;s own datum plane. Like the flat tool it is <strong>input-first</strong>: you make every pick and type every number up front, then the build fires hands-free, and the only thing left to do by hand is draw one small relief rectangle per hole at the end.</p>
+
+<div class="dlrow">
+  <button class="dlbtn" onclick="dl('pl_curved_zip')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg> Download drilljig3d-gui.zip (preview build) <span class="sz">self-contained</span></button>
+</div>
+<p><small>This zip is the curved <code>.cmd</code> launcher plus all resources &mdash; the PowerShell libs (conformal-blank, fastener-hole, chip-relief, radial-pattern, the shared geometry + wizard framework), the bushing catalogs, and the decision tree. The 3D bushing preview uses <strong>WPF</strong> (built into Windows), so &mdash; unlike the flat tool &mdash; there is no WebView2 or three.js to bundle. No network access. <strong>Not yet live-verified end-to-end</strong>; see the WIP note above.</small></p>
+
+<section class="block">
+  <h2 class="sec">1. What you need on the machine</h2>
+  <p>The zip is self-contained, but it cannot ship these &mdash; they must already be present on the workstation:</p>
+  <table>
+    <tr><th>Requirement</th><th>Notes</th></tr>
+    <tr><td>Creo Parametric 12.4.3.0</td><td>The CAD app the tool automates (through its built-in VB API).</td></tr>
+    <tr><td>A running Creo session</td><td>Open the model before launching; the wizard connects to it.</td></tr>
+    <tr><td><strong>The jig PART active</strong></td><td>In a top-down assembly, <strong>activate the drilljig PART</strong> first (right-click it in the tree &rarr; Activate) so feature creation routes into the jig part. The curved surface and the fasteners are picked as <em>external references</em>.</td></tr>
+    <tr><td>The downloaded <code>drilljig3d-gui.zip</code></td><td>Extracted to a folder you can write to.</td></tr>
+    <tr><td>Windows PowerShell (STA)</td><td>Runs the launcher and the GUI. Built into Windows; the launcher requests STA for the WPF preview.</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">2. Quick start</h2>
+  <ol class="steps">
+    <li>Extract the folder anywhere <strong>writable</strong> (Desktop or Documents &mdash; not a locked/protected path).</li>
+    <li>Open Creo and, in the assembly, <strong>activate the drilljig PART</strong> (right-click it &rarr; Activate).</li>
+    <li>Double-click <code>drilljig3d-gui.cmd</code>.</li>
+    <li>Walk the wizard: Welcome &rarr; Fasteners &rarr; Surface &rarr; Conditions &rarr; Build &rarr; Slots &rarr; Done.</li>
+  </ol>
+  <div class="callout info">
+    <div class="t">The shape of the flow is different from the flat tool</div>
+    The flat wizard interleaves input and building at each stage. The curved wizard <strong>front-loads everything</strong>: you pick the fasteners, pick the surface, and answer every question <em>first</em>; then one button (<em>Build everything</em>) builds the blank, rounds the corners, and drills every hole hands-free; then you draw the relief pockets. Fewer trips back and forth to Creo.
+  </div>
+  <h4>Where files are written</h4>
+  <table>
+    <tr><th>Path</th><th>What</th></tr>
+    <tr><td><code>%TEMP%\drilljig-gui-error.log</code></td><td>Error log (shared with the flat tool).</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">3. The window at a glance</h2>
+  <p>The wizard opens <strong>maximized</strong>. There are three regions &mdash; identical in layout to the flat tool, but the breadcrumb has <strong>7 stages</strong> instead of 10:</p>
+  <div class="grid3">
+    <div class="card">
+      <h4>TOP &mdash; breadcrumb rail</h4>
+      <p>7 stage pills: Welcome, Fasteners, Surface, Conditions, Build, Slots, Done.</p>
+      <ul>
+        <li>Done = green check</li>
+        <li>Active = blue halo</li>
+        <li>Future = hollow</li>
+      </ul>
+      <p>The rail is <strong>clickable</strong>: click a pill to jump <strong>back</strong> to any stage you have already reached. You can never skip <strong>ahead</strong> past setup you have not done.</p>
+    </div>
+    <div class="card">
+      <h4>CENTER &mdash; canvas</h4>
+      <p>Swaps per step; scrolls if a step is tall. This is where the pick prompts, choice cards, the bushing schematic, and the build description live.</p>
+    </div>
+    <div class="card">
+      <h4>BOTTOM &mdash; controls</h4>
+      <p>An honesty-chip band + the <strong>Back / primary-button</strong> bar + a status line.</p>
+      <p>While Creo work runs, the canvas flips to a <strong>RUN view</strong> (progress marquee + live log) and <strong>all input is disabled</strong> (a busy guard) so a stray click cannot re-enter Creo.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">4. Insight &mdash; the conformal blank</h2>
+  <p>This is the idea that makes a curved jig possible. A flat jig starts from a rectangle you sketch and extrude. A curved jig starts from <strong>the part&rsquo;s own surface</strong>: the tool <strong>offsets</strong> that face (copying its exact curvature), then <strong>thickens</strong> the copy into a new solid body. The result is a shell that hugs the part, at a constant wall thickness, everywhere along the curve.</p>
+  <div class="callout info">
+    <div class="t">Two things are automatic &mdash; you never type them</div>
+    <ul>
+      <li><strong>Part thickness</strong> = bushing length + chip clearance. The blank is thickened to exactly the amount that leaves a full bushing seat <em>plus</em> the material the relief pocket removes. You choose the chip clearance on one card (§6); the thickness follows.</li>
+      <li><strong>Standoff</strong> = 0 (flush). The jig sits directly on the part. There is no &ldquo;float it off the surface&rdquo; question in this flow.</li>
+    </ul>
+  </div>
+  <p>The thicken <strong>flips away from the part by default</strong>, so the new material grows outward (into free space) rather than into the part you&rsquo;re jigging. If a particular part defaults the correct way already, <code>--no-flip</code> turns the flip off.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 660 250" role="img" aria-label="Conformal blank: offset the curved face, thicken away from the part, drill normal to the surface">
+      <rect x="0" y="0" width="660" height="250" rx="8" fill="#0e1830"/>
+      <!-- the part's curved face -->
+      <path d="M60 190 Q330 90 600 190" fill="none" stroke="#9fb0cc" stroke-width="3"/>
+      <text x="70" y="210" fill="#9fb0cc" font-size="13" font-family="Segoe UI, sans-serif">part surface</text>
+      <!-- offset + thickened blank following the curve -->
+      <path d="M90 150 Q330 55 570 150 L570 120 Q330 25 90 120 Z" fill="rgba(74,163,255,0.16)" stroke="#4aa3ff" stroke-width="2.5"/>
+      <text x="300" y="60" fill="#6eaaff" font-size="13" font-family="Segoe UI, sans-serif">conformal blank (thickened away)</text>
+      <!-- normal hole arrows -->
+      <g stroke="#78d296" stroke-width="2.5">
+        <line x1="200" y1="150" x2="188" y2="92"/><polygon points="188,86 184,98 192,98" fill="#78d296"/>
+        <line x1="330" y1="135" x2="330" y2="76"/><polygon points="330,70 326,82 334,82" fill="#78d296"/>
+        <line x1="460" y1="150" x2="472" y2="92"/><polygon points="472,86 468,98 476,98" fill="#78d296"/>
+      </g>
+      <text x="360" y="150" fill="#78d296" font-size="13" font-family="Segoe UI, sans-serif">holes normal to the surface</text>
+    </svg>
+    <figcaption>The blank copies the part&rsquo;s curvature and thickens away from it; each hole is driven along the local surface normal, so the drill enters square to the face at every point along the curve.</figcaption>
+  </figure>
+</section>
+
+<section class="block">
+  <h2 class="sec">5. Insight &mdash; normal-to-surface drilling (and the open question)</h2>
+  <p>On a flat jig every hole is parallel &mdash; they all point straight down through the plate. On a curved jig, &ldquo;straight down&rdquo; is different at every hole, because the surface tilts as it curves. Each hole must be drilled along its <strong>local surface normal</strong> so the bushing sits square and the drilled part hole lands true.</p>
+  <p>The tool does this by creating each hole <strong>On-Point</strong> and orienting it to that fastener&rsquo;s own <strong>TOP datum plane</strong> &mdash; the plane whose normal matches the surface there. Pre-selecting that reference before firing the hole is what (should) make Creo orient the hole normal to the face.</p>
+  <div class="callout warn">
+    <div class="t">This is the load-bearing open question <span class="pill wip">verifying</span></div>
+    Whether the surface pre-select <em>reliably</em> orients every hole normal &mdash; versus Creo silently taking its own default direction &mdash; is the correctness question the project is still nailing down with a live probe. If you ever see a hole that isn&rsquo;t square to the face, that&rsquo;s this. The fallback flag <code>--default-orient</code> drills with Creo&rsquo;s default On-Point direction (skip the per-hole orientation) if the oriented path misbehaves on your part. <strong>Always verify hole orientation in Creo.</strong>
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">6. Insight &mdash; symmetric chip-relief, and the radial pattern</h2>
+  <p>Chip relief on a curved jig is a shallow pocket cut over each hole so swarf and the drill can clear. Because the face is curved, the pocket is cut as a <strong>symmetric remove-material extrude on each fastener&rsquo;s own TOP plane</strong> &mdash; the same plane the hole was oriented to. You draw <strong>one rectangle</strong> over the hole; the tool cuts a pocket that straddles the plane, <strong>depth = 2&times; the chip clearance</strong> (half on each side). The blank was already thickened by the clearance in STAGE&nbsp;1, so there is material to remove.</p>
+  <div class="callout tip">
+    <div class="t">The radial / axis pattern &mdash; draw one, get all</div>
+    <p>When the fasteners are <strong>uniformly spaced around a cylinder axis</strong> (a bolt circle on a barrel-shaped part), drawing a rectangle over <em>every</em> hole is wasteful. The tool can instead have you draw <strong>one seed pocket</strong>, then <strong>pattern it around the axis</strong> &mdash; Creo rotates each copy so it re-orients to the new normal (a linear pattern can&rsquo;t do this on a curve; an axis pattern can). Non-uniform layouts are split into as many pattern groups as the angles need, and anything left over falls back to a hand-drawn pocket.</p>
+    <p><span class="pill wip">probe-gated</span> The radial pattern only engages once a one-time recording of the axis-pick is captured. Until then &mdash; and whenever <code>--no-radial-pattern</code> is passed or the fasteners aren&rsquo;t uniform &mdash; the tool uses the <strong>guaranteed path</strong>: draw one pocket per hole. Not yet live-verified.</p>
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">7. The honesty-chip colours (bottom band)</h2>
+  <p>Same contract as the flat tool: the chips report the true state of each piece of work &mdash; they never claim success they can&rsquo;t back up. Legend:</p>
+  <table>
+    <tr><th>Dot</th><th>Meaning</th></tr>
+    <tr><td><span class="sw sw-gray"></span> gray</td><td>needs input &mdash; not provided yet</td></tr>
+    <tr><td><span class="sw sw-blue"></span> blue</td><td>set &mdash; provided, but not yet built in Creo</td></tr>
+    <tr><td><span class="sw sw-green"></span> green</td><td>built <strong>and</strong> verified</td></tr>
+    <tr><td><span class="sw sw-gold"></span> gold</td><td>built but could <strong>not</strong> be verified &mdash; check it in Creo</td></tr>
+    <tr><td><span class="sw sw-red"></span> red</td><td>a canary aborted the step &mdash; nothing was built</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">8. Step-by-step reference &mdash; every screen, with its page</h2>
+  <p>The 10 screens across the 7 stages, in order &mdash; each with a real headless render of the page beside exactly what it does, when its button turns on, and what (if anything) you do in Creo. <strong>Click any screenshot to enlarge it.</strong> The breadcrumb at the top of each shot shows how far along that page sits (green check = done, blue = current).</p>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">1</span><div class="htxt"><div class="title">Curved Drill Jig Builder</div><div class="stage">Stage: Welcome</div></div><span class="btnlbl">&ldquo;Get started&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Curved welcome page" data-shot="c01-welcome.png"><figcaption>The landing page &mdash; a plain-language walkthrough of the whole input-first flow.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The landing page. It lays out the whole flow in order: pick the fasteners, pick the surface, answer the conditions, build hands-free, then draw the relief pockets. Nothing here touches Creo &mdash; it is orientation. Make sure the jig PART is <strong>active</strong> in Creo before you continue.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always &mdash; nothing to fill in.</dd>
+          <dt>What you do</dt><dd>Read the overview, then press <em>Get started</em>.</dd>
+          <dt>Creo pick</dt><dd>No &mdash; just have the jig PART active and Creo idle.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">2</span><div class="htxt"><div class="title">Select the fasteners</div><div class="stage">Stage: Fasteners</div></div><span class="btnlbl">&ldquo;Continue&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Select the fasteners page" data-shot="c02-fastener-select.png"><figcaption>The first input: Ctrl-click every fastener component to drill, then verify.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The first input step: tell the tool which fasteners to drill. In Creo (jig part active), <kbd>Ctrl</kbd>-click <strong>all</strong> the fastener <strong>components</strong> you want drilled &mdash; the fasteners themselves, one click each, <em>not</em> their planes &mdash; then press the verify button. The tool reads each component&rsquo;s identity and position; the Build stage later drills every hole for you. The chip shows how many it captured.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>At least one fastener component is captured.</dd>
+          <dt>What you do</dt><dd><kbd>Ctrl</kbd>-click every fastener, then <em>I clicked it &mdash; verify</em>.</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> &mdash; select the fastener components.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">3</span><div class="htxt"><div class="title">Pick the surface to follow</div><div class="stage">Stage: Surface</div></div><span class="btnlbl">&ldquo;Continue&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Pick the surface page" data-shot="c03-surface-arm.png"><figcaption>Click the curved part surface the jig should conform to, then verify.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Tell the tool which surface the jig follows. Click the curved face of the part in Creo and verify; the tool records the surface id and, if the face is a cylinder, reads its radius + axis (used later for the radial relief pattern). This surface is what STAGE&nbsp;1 offsets and thickens into the conformal blank.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>A surface is captured.</dd>
+          <dt>What you do</dt><dd>Click the surface, then verify.</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> &mdash; select the follow surface.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">4</span><div class="htxt"><div class="title">Bushing &amp; hole size</div><div class="stage">Stage: Conditions</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Curved bushing confirmation" data-shot="c04-tree.png"><figcaption>The same bushing decision walk as the flat tool, ending in a dimensioned schematic.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The same bushing decision walk the flat tool uses &mdash; a tree of answer cards that resolves the drilled <strong>hole diameter</strong> and the <strong>bushing length</strong>, ending in the confirmation shown here (part number + a dimensioned 2D schematic; the live GUI also shows a rotatable WPF 3D bushing beside it). <strong>See the flat tool&rsquo;s &ldquo;Using the GUI&rdquo; tab, &sect;7</strong> for the full screen-by-screen bushing walk &mdash; it is identical here.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once the tree resolves a hole size + length (the recommended length is preselected &mdash; press Next).</dd>
+          <dt>What you do</dt><dd>Click through the cards until the bushing is confirmed.</dd>
+          <dt>Creo pick</dt><dd>No &mdash; pure catalog cards.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">5</span><div class="htxt"><div class="title">Chip clearance</div><div class="stage">Stage: Conditions</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Chip clearance page" data-shot="c05-chip-clearance.png"><figcaption>The one sizing input: Standard 0.25&Prime; clearance, or a custom (usually smaller) value.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The <strong>single sizing input</strong> for the whole jig. Chip clearance is how deep each relief pocket cuts (a symmetric pocket = 2&times; this value), and the blank is thickened by the same amount so there is material to remove. <em>Standard clearance</em> is 0.25&Prime;; <em>Tight / custom</em> lets you type a smaller value. The part thickness (= bushing length + clearance) and the flush standoff both follow from this &mdash; you are never asked for them.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once a mode is set; the custom option needs a valid value &gt; 0. Standard is preselected &mdash; just press Next.</dd>
+          <dt>What you do</dt><dd>Take Standard, or pick Tight / custom and type a depth.</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">6</span><div class="htxt"><div class="title">Fastener hole diameter</div><div class="stage">Stage: Conditions</div></div><span class="btnlbl">&ldquo;Next&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Fastener hole diameter page" data-shot="c06-fastener-dia.png"><figcaption>The drilled hole diameter, prefilled from the bushing OD.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The diameter each fastener hole is drilled at. It <strong>prefills from the bushing OD</strong> resolved on the tree step (the seat the bushing presses into), so usually you just confirm it. This is the last input &mdash; after it, the next stage builds everything.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>A valid diameter is set (prefilled from the bushing).</dd>
+          <dt>What you do</dt><dd>Confirm the prefilled diameter, or type a different one.</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">7</span><div class="htxt"><div class="title">Build the jig (hands-free) <span class="pill wip">commit point</span></div><div class="stage">Stage: Build</div></div><span class="btnlbl">&ldquo;Build everything&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Build the jig page" data-shot="c07-build-run.png"><figcaption>One button: builds the conformal blank, rounds the corners, and drills every hole.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">The commit point. In <strong>one hands-free pass</strong> the tool: (1) offsets + thickens the surface into a new body, (2) rounds the blank&rsquo;s corners (skip with <code>--no-corner-round</code>), and (3) drills every fastener hole normal to the surface. It only pauses if the automatic resolve of a fastener&rsquo;s planes misses &mdash; then it asks you to tree-pick that fastener&rsquo;s three planes. Don&rsquo;t touch Creo while it runs. Chip-relief pockets are cut in the <em>next</em> stage.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>A surface, a positive thickness, a valid hole diameter, and &ge;1 fastener are all set.</dd>
+          <dt>What you do</dt><dd>Press <em>Build everything</em> and wait.</dd>
+          <dt>Creo pick</dt><dd>Mostly no &mdash; only a fallback tree-pick if a fastener&rsquo;s planes don&rsquo;t auto-resolve.</dd>
+        </dl>
+        <div class="callout warn" style="margin-top:12px">
+          <div class="t">Not yet live-verified end-to-end</div>
+          STAGE&nbsp;1 (blank) and STAGE&nbsp;2 (holes) are confirmed on live Creo, but hole <em>normality</em> is the open question (&sect;5). After this step, <strong>check the blank thickness and every hole&rsquo;s orientation in Creo</strong> before drilling the real part.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">8</span><div class="htxt"><div class="title">Chip-relief pockets: draw the first <span class="pill wip">draws in Creo</span></div><div class="stage">Stage: Slots</div></div><span class="btnlbl">&ldquo;Open the first pocket sketch&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Chip-relief arm page" data-shot="c08-slot-arm.png"><figcaption>Pre-selects the first fastener&rsquo;s TOP plane and opens the sketch on it.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Arms the chip relief. It reuses the fasteners you already selected (no re-picking): for the first one it <strong>pre-selects that fastener&rsquo;s own TOP datum plane</strong> (the plane its hole was drilled normal to) and opens the extrude so the sketch opens right on it &mdash; hands-free, no reference planes. You draw <strong>one rectangle</strong> over the hole and leave the sketch open. If the automatic plane pre-select doesn&rsquo;t take, the tool asks you to click that plane.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always (self-skips if chip relief is off, or if there is no blank body / no fasteners).</dd>
+          <dt>What you do</dt><dd>Press the button; draw one rectangle over the first hole; leave the sketch open.</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> &mdash; draw the rectangle (and click the plane only if the pre-select misses).</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">9</span><div class="htxt"><div class="title">Chip-relief pockets: cut + next</div><div class="stage">Stage: Slots</div></div><span class="btnlbl">&ldquo;Finish this pocket&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Chip-relief cut and next page" data-shot="c09-slot-finish.png"><figcaption>Cuts the symmetric pocket, then re-arms the next hole &mdash; a self-looping stage.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">Finishes the pocket you just drew: the tool cuts a <strong>symmetric remove-material extrude</strong> (depth = 2&times; the chip clearance) straddling the TOP plane, then <strong>re-arms the next fastener</strong> and re-opens its sketch &mdash; so this one step loops over every hole (draw &rarr; Finish &rarr; draw the next). When the fasteners form a uniform bolt circle and the radial pattern is available, it instead cuts one seed and <strong>patterns the rest around the axis</strong> (you pick the rotation axis once). A wedged re-arm can&rsquo;t trap you &mdash; a no-progress guard bails out honestly.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Once a pocket sketch is armed.</dd>
+          <dt>What you do</dt><dd>Press <em>Finish this pocket</em>; draw the next when it re-arms; repeat until done.</dd>
+          <dt>Creo pick</dt><dd><strong>Yes</strong> &mdash; one rectangle per hole (or one seed + an axis pick for the radial pattern).</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="card stepcard">
+    <div class="step-head"><span class="step-num">10</span><div class="htxt"><div class="title">Done</div><div class="stage">Stage: Done</div></div><span class="btnlbl">&ldquo;Finish&rdquo;</span></div>
+    <div class="step-grid">
+      <figure class="shot"><img loading="lazy" alt="Curved done page" data-shot="c10-done.png"><figcaption>Summary of what was built, with honest &ldquo;verify in Creo&rdquo; reminders.</figcaption></figure>
+      <div class="step-facts">
+        <p class="step-desc">A summary of everything built &mdash; the conformal blank, the count of holes drilled, and the count of relief pockets cut &mdash; each with an honest reminder to verify it visually in Creo (thickness/standoff, hole size + orientation, and that each pocket straddles its hole at the right depth). Finish closes the wizard; your Creo session stays open.</p>
+        <dl>
+          <dt>Enabled when</dt><dd>Always.</dd>
+          <dt>What you do</dt><dd>Read the summary, press Finish, then verify all geometry in Creo.</dd>
+          <dt>Creo pick</dt><dd>No.</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <div class="t">The moments you must interact with Creo</div>
+    <ol>
+      <li><strong>Select the fasteners (step 2)</strong> &mdash; <kbd>Ctrl</kbd>-click every fastener component, then verify.</li>
+      <li><strong>Pick the surface (step 3)</strong> &mdash; click the curved face the jig follows, then verify.</li>
+      <li><strong>Draw each relief pocket (steps 8&ndash;9)</strong> &mdash; draw one rectangle over each hole (or one seed rectangle + an axis pick if the radial pattern engages).</li>
+    </ol>
+    Everything else &mdash; the blank, the corner rounding, and all the drilling &mdash; the tool does itself.
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">9. Command-line flags (optional)</h2>
+  <p>Pass these to <code>drilljig3d-gui.cmd</code> to override defaults or skip questions:</p>
+  <table>
+    <tr><th>Flag</th><th>Effect</th></tr>
+    <tr><td><code>--default-orient</code></td><td>Drill with Creo&rsquo;s default On-Point direction (skip the per-hole normal-to-surface orientation). The fallback if oriented drilling misbehaves on your part.</td></tr>
+    <tr><td><code>--no-relief</code> <span class="muted">(alias <code>--no-slots</code>)</span></td><td>Disable chip relief entirely &mdash; no thicken bump, no pockets.</td></tr>
+    <tr><td><code>--relief-depth N</code> <span class="muted">(alias <code>--slot-depth N</code>)</span></td><td>Chip-relief depth in inches (default <code>0.25</code>). The pocket is cut <code>2N</code> deep (N each side of the plane); prefills the chip-clearance card.</td></tr>
+    <tr><td><code>--no-corner-round</code></td><td>Skip the Build-stage auto corner-rounding of the blank.</td></tr>
+    <tr><td><code>--corner-radius N</code></td><td>Corner-round fillet radius in inches (default <code>0.25</code>).</td></tr>
+    <tr><td><code>--no-flip</code></td><td>Do <strong>not</strong> flip the thicken side. The thicken flips by default so the blank grows <em>away</em> from the part; use this only if a part defaults the correct way.</td></tr>
+    <tr><td><code>--no-radial-pattern</code></td><td>Disable the automatic radial/axis chip-relief pattern; draw every pocket by hand (the guaranteed path).</td></tr>
+  </table>
+</section>
+
+<section class="block">
+  <h2 class="sec">10. Troubleshooting</h2>
+  <table>
+    <tr><th>Symptom</th><th>Fix</th></tr>
+    <tr><td>&ldquo;Creo (xtop.exe) is not running&rdquo;</td><td>Open Creo + the model; keep exactly one session.</td></tr>
+    <tr><td>&ldquo;VB API registration not found&rdquo;</td><td>Register the VB API from Creo&rsquo;s install &mdash; run <code>vb_api_register.bat</code> from <code>\Parametric\bin</code> as Administrator.</td></tr>
+    <tr><td>&ldquo;the ACTIVE model is the top assembly&rdquo;</td><td>In the assembly tree, right-click the drilljig <strong>PART</strong> &rarr; Activate, so feature creation routes into the jig part. Then re-run.</td></tr>
+    <tr><td>Bushing 3D preview shows a plain box / note</td><td>The WPF assemblies are unavailable on this machine; the wizard, the layout math, and the 2D bushing schematic are unaffected.</td></tr>
+    <tr><td>A hole isn&rsquo;t square to the surface</td><td>This is the open normality question (&sect;5). Re-run with <code>--default-orient</code>, or fix the hole&rsquo;s orientation reference in Creo. Report it &mdash; it helps close the probe.</td></tr>
+    <tr><td>Wizard seems stuck</td><td>Switch to Creo &mdash; it may be waiting for a pick or for you to draw a relief rectangle. Check the RUN log / PowerShell window.</td></tr>
+    <tr><td>A step &ldquo;did nothing&rdquo;</td><td>The canary aborted a macro that changed no geometry rather than claim false success; check the reported reason (a pick wasn&rsquo;t armed, or the wrong model/body was active).</td></tr>
+    <tr><td>Relief keeps asking you to draw every pocket</td><td>Expected unless the radial pattern is enabled (probe-gated) and the fasteners are uniformly spaced about an axis. The per-pocket draw is the guaranteed path.</td></tr>
+  </table>
+</section>
