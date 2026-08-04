@@ -44,6 +44,22 @@ trap {
     exit 1
 }
 
+# ---- MARK-OF-THE-WEB self-heal (offline/downloaded bundle) ------------------
+# When this tool is DOWNLOADED as a .zip from the handbook and extracted with
+# Windows Explorer, every file carries a Zone.Identifier (Internet) NTFS stream.
+# The .cmd/.ps1 still RUN (the launcher reads them as TEXT), but .NET Framework
+# REFUSES to Add-Type the vendored WebView2 managed DLLs (FileLoadException,
+# HRESULT 0x80131515) -- so the 3D overview silently degrades to "unavailable"
+# while the rest of the GUI works. Strip the mark from our OWN bundle at startup,
+# best-effort: Unblock-File is a no-op when there is no mark, and any failure here
+# just leaves today's behavior. Confirmed root cause via probes\motw-webview2-test.ps1.
+try {
+    foreach ($sub in @('webview2','lib')) {
+        $d = Join-Path $ScriptDir $sub
+        if (Test-Path $d) { Get-ChildItem -LiteralPath $d -Filter *.dll -Recurse -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue }
+    }
+} catch {}
+
 # ---- dot-source the shared libs (order matters; same as drilljig.cmd) -------
 . (Join-Path $ScriptDir 'lib\creo_geometry.ps1')
 . (Join-Path $ScriptDir 'lib\edge_round.ps1')
@@ -3045,23 +3061,6 @@ $overviewStep = New-WizardStep -Key 'overview' -Title '3D overview (rough)' -Sta
             return
         }
 
-        # HEADLESS GUARD: only spin up a WebView2 when a WinForms message loop is
-        # actually running (the live GUI). Headless render tests (fuzz_gui.ps1 /
-        # run_wizard_tests.ps1) call this Build on a detached panel with NO message
-        # loop, where WebView2 cannot init anyway -> skip it and just show a note, so
-        # the tests exercise the Build path without instantiating a browser control.
-        if (-not [System.Windows.Forms.Application]::MessageLoop) {
-            Add-Para $panel ("[3D overview renders here in the live GUI window - headless render skipped]") $y 0 'gray'
-            return
-        }
-
-        # lazy-load the WebView2 SDK; if unavailable, the jig still builds fine.
-        try { Add-WebView2Assemblies | Out-Null }
-        catch {
-            Add-Para $panel ("3D overview unavailable - WebView2 could not load ({0}). This does not affect building the jig; press Continue. (A zero-dependency 3D window is available separately: drilljig-3d-preview.cmd.)" -f $_.Exception.Message) $y 0 'gray'
-            return
-        }
-
         # ---- payload builder (reusable): reads the CURRENT context so the slot-FACE toggle
         # below can regenerate + re-push it live. Numbers use InvariantCulture (period decimal)
         # and the points array is hand-built so it is ALWAYS a JS array (PS ConvertTo-Json drops
@@ -3092,18 +3091,57 @@ $overviewStep = New-WizardStep -Key 'overview' -Title '3D overview (rough)' -Sta
         }.GetNewClosure()
         $c.Wv3dPayload = & $makePayload   # stashed in the context so the NavigationCompleted closure reads it by reference
 
-        # ---- chip-relief slot FACE toggle (moved here from the Relief/slot-a step, user
-        # 2026-07-24): choosing SIDE plane (near) vs SIDE offset plane (far) moves the slot to
-        # that face in the 3D preview below (live-push, no browser rebuild). --slot-face pins it.
+        # ---- chip-relief slot FACE toggle -- rendered UP FRONT, INDEPENDENT of the 3D.
+        # CRITICAL (user 2026-08-04): the Overview page is where the operator CHANGES the
+        # slot side. That control must ALWAYS be present, even if WebView2 fails to load --
+        # so it is built here BEFORE any WebView2 attempt (previously a WebView2 load failure
+        # returned early and took the slot-face toggle with it). $onFace live-pushes to the
+        # WebView2 when one exists ($wv is set below), else it Rerenders so the change still
+        # takes. --slot-face pins the choice and hides the toggle.
         if (-not $c.SlotFaceFromFlag) {
-            $y = (Add-Para $panel ("Which plate face does the chip-relief slot open onto? (Watch the slot move in the 3D view.)") $y 0 'Gray').Bottom + 6
+            $y = (Add-Para $panel ("Which plate face does the chip-relief slot open onto?") $y 0 'Gray').Bottom + 6
         } else {
             $faceLbl = if ($c.SlotFaceMode -eq 'offset') { 'SIDE offset plane (far face)' } else { 'SIDE plane (near face)' }
             $y = (Add-Para $panel ("Chip-relief slot face: {0} (from --slot-face)." -f $faceLbl) $y 0 'Gray').Bottom + 6
         }
+        $script:OvWv = $null   # set to the WebView2 control below IF it loads; the toggle reads it live
+        if (-not $c.SlotFaceFromFlag) {
+            $onFace = {
+                param($mode)
+                # push to the live WebView2 if present (slot jumps instantly, no rebuild); else
+                # Rerender so the change is still applied downstream even with no 3D pane.
+                try {
+                    $c.Wv3dPayload = & $makePayload
+                    if ($null -ne $script:OvWv -and $null -ne $script:OvWv.CoreWebView2) {
+                        $null = $script:OvWv.ExecuteScriptAsync("setJigGeometry(" + $c.Wv3dPayload + ")")
+                    } elseif ($null -ne $wiz) { $wiz.Rerender() }
+                } catch {}
+            }.GetNewClosure()
+            $y = (Add-SlotFaceToggle -Panel $panel -Context $c -Wizard $wiz -Top $y -OnChange $onFace)
+        }
+        $y += 8
+
+        # HEADLESS GUARD: only spin up a WebView2 when a WinForms message loop is
+        # actually running (the live GUI). Headless render tests (fuzz_gui.ps1 /
+        # run_wizard_tests.ps1) call this Build on a detached panel with NO message
+        # loop, where WebView2 cannot init anyway -> skip it and just show a note, so
+        # the tests exercise the Build path without instantiating a browser control.
+        # The slot-face toggle ABOVE is already rendered, so it is exercised regardless.
+        if (-not [System.Windows.Forms.Application]::MessageLoop) {
+            Add-Para $panel ("[3D overview renders here in the live GUI window - headless render skipped]") $y 0 'gray'
+            return
+        }
+
+        # lazy-load the WebView2 SDK; if unavailable, the jig still builds fine AND the
+        # slot-face toggle above still works (it Rerenders instead of live-pushing).
+        try { Add-WebView2Assemblies | Out-Null }
+        catch {
+            Add-Para $panel ("3D preview unavailable - WebView2 could not load ({0}). You can STILL change the slot face with the buttons above; press Continue. (A zero-dependency 3D window is available separately: drilljig-3d-preview.cmd.)" -f $_.Exception.Message) $y 0 'gray'
+            return
+        }
 
         # ---- the WebView2 control, filling the canvas below the note + toggle ----
-        $wvTop = $y + 34   # leave a row for the toggle buttons (rendered after $wv is created)
+        $wvTop = $y + 4
         $wv = New-Object Microsoft.Web.WebView2.WinForms.WebView2
         $props = New-Object Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties
         # DISTINCT UserDataFolder from the Welcome stage's WebView2 (shared folder = lock
@@ -3116,25 +3154,11 @@ $overviewStep = New-WizardStep -Key 'overview' -Title '3D overview (rough)' -Sta
         $wv.Size = New-Object System.Drawing.Size($cw, $ch)
         $wv.Anchor = ([System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right)
         $panel.Controls.Add($wv)
-
-        # now the toggle (positioned in the reserved row ABOVE $wv). Its OnChange rebuilds the
-        # payload and re-pushes it to THIS $wv so the slot jumps to the chosen face LIVE -- no
-        # $Wizard.Rerender() (that would dispose + recreate the WebView2, flashing the browser
-        # and re-contending for its UserDataFolder lock). Skipped entirely when --slot-face pins it.
-        if (-not $c.SlotFaceFromFlag) {
-            $onFace = {
-                param($mode)
-                # rebuild the payload with the new SlotFaceMode + push it to the LIVE WebView2 so the
-                # slot jumps to the chosen face instantly. No $wiz.Rerender(): the toggle recolors its
-                # own buttons, and a Rerender would dispose + recreate the WebView2 (a browser reload
-                # flash + UserDataFolder lock churn) just to move one box in the scene.
-                try {
-                    $c.Wv3dPayload = & $makePayload
-                    if ($null -ne $wv -and $null -ne $wv.CoreWebView2) { $null = $wv.ExecuteScriptAsync("setJigGeometry(" + $c.Wv3dPayload + ")") }
-                } catch {}
-            }.GetNewClosure()
-            [void](Add-SlotFaceToggle -Panel $panel -Context $c -Wizard $wiz -Top $y -OnChange $onFace)
-        }
+        # expose the LIVE control to the slot-face toggle built ABOVE, so its OnChange
+        # live-pushes the new face to THIS $wv (no Rerender, no browser reload flash).
+        # The toggle was rendered before this point specifically so it survives a WebView2
+        # load failure; wiring it here just upgrades it from "Rerender" to "live-push".
+        $script:OvWv = $wv
 
         # push the layout to the three.js scene once the page has loaded (setJigGeometry
         # stashes + applies whether it arrives before or after three.js finishes loading).

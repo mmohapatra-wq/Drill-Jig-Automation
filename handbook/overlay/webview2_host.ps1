@@ -27,7 +27,19 @@ function global:Resolve-WebView2Assets {
     foreach ($b in $bundleCand) {
         if ($b -and (Test-Path (Join-Path $b 'Microsoft.Web.WebView2.Core.dll')) -and
                     (Test-Path (Join-Path $b 'Microsoft.Web.WebView2.WinForms.dll')) -and
-                    (Test-Path (Join-Path $b 'WebView2Loader.dll'))) { return $b }
+                    (Test-Path (Join-Path $b 'WebView2Loader.dll'))) {
+            # MARK-OF-THE-WEB: when the user DOWNLOADS drilljig-gui.zip from the handbook
+            # and extracts it with Explorer, every file carries a Zone.Identifier (Internet)
+            # NTFS stream. .NET Framework then REFUSES to Add-Type the managed WebView2 DLLs
+            # (FileLoadException, HRESULT 0x80131515 "Operation is not supported") -- so the
+            # 3D overview silently shows "3D overview unavailable" while the rest of the GUI
+            # runs (the .cmd/.ps1 are read as TEXT, so only the assembly load is blocked).
+            # Confirmed live via probes\motw-webview2-test.ps1. Strip the mark, best-effort:
+            # Unblock-File is safe to run when there is no mark, and a failure here just leaves
+            # today's behavior (the caller still tries, and falls back to the WPF window / a note).
+            try { Get-ChildItem -LiteralPath $b -Filter *.dll -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue } catch {}
+            return $b
+        }
     }
 
     $stage = Join-Path $env:TEMP 'drilljig_wv2'
@@ -88,13 +100,40 @@ function global:Resolve-WebView2Assets {
     return $stage
 }
 
+# Load ONE managed WebView2 DLL, MARK-OF-THE-WEB proof. When the bundle was
+# downloaded + Explorer-extracted, each DLL carries a Zone.Identifier (Internet)
+# stream and .NET Framework REFUSES to Add-Type it (FileLoadException, HRESULT
+# 0x80131515 "Operation is not supported") -- which silently kills the 3D overview.
+# Three escalating attempts, each immune to the previous failure:
+#   1. Add-Type as-is (fast path; already-unblocked / trusted-zone machines).
+#   2. Unblock-File (strip the Zone.Identifier stream) + retry Add-Type.
+#   3. LOAD FROM BYTES: [Reflection.Assembly]::Load([byte[]]) has NO file path, so
+#      the zone check never runs -- proven to load a MARKED DLL (motw-webview2-test).
+# Returns $true on success. Throwing is left to the caller only if ALL THREE fail.
+function global:Import-WebView2Dll {
+    param([string]$Path)
+    try { Add-Type -Path $Path -ErrorAction Stop; return $true } catch {}
+    try { Unblock-File -LiteralPath $Path -ErrorAction SilentlyContinue } catch {}
+    try { Add-Type -Path $Path -ErrorAction Stop; return $true } catch {}
+    # last resort: byte-array load (bypasses Mark-of-the-Web entirely)
+    try { [void][System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($Path)); return $true } catch {}
+    return $false
+}
+
 # Resolve + load the WebView2 assemblies into the AppDomain. Prepends the stage
 # folder to PATH so the co-located native loader resolves. Returns the stage dir.
+# MARK-OF-THE-WEB proof (see Import-WebView2Dll): a downloaded+extracted bundle
+# would otherwise fail to load and hide the 3D overview (and its slot-face toggle).
 function global:Add-WebView2Assemblies {
     $stage = Resolve-WebView2Assets
     if ($env:PATH -notlike "*$stage*") { $env:PATH = "$stage;$env:PATH" }
-    Add-Type -Path (Join-Path $stage 'Microsoft.Web.WebView2.Core.dll')
-    Add-Type -Path (Join-Path $stage 'Microsoft.Web.WebView2.WinForms.dll')
+    # unblock the whole staged/bundle folder first (native WebView2Loader.dll too --
+    # a marked native DLL can fail to map even when the managed ones load by bytes).
+    try { Get-ChildItem -LiteralPath $stage -Filter *.dll -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue } catch {}
+    $core = Join-Path $stage 'Microsoft.Web.WebView2.Core.dll'
+    $wf   = Join-Path $stage 'Microsoft.Web.WebView2.WinForms.dll'
+    if (-not (Import-WebView2Dll $core)) { throw "WebView2 Core.dll could not be loaded (even after unblock + byte-load): $core" }
+    if (-not (Import-WebView2Dll $wf))   { throw "WebView2 WinForms.dll could not be loaded (even after unblock + byte-load): $wf" }
     return $stage
 }
 

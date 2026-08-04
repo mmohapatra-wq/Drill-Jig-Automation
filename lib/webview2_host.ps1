@@ -74,12 +74,31 @@ function global:Resolve-WebView2Assets {
     return $stage
 }
 
+# Load ONE managed WebView2 DLL, MARK-OF-THE-WEB proof. A downloaded+extracted
+# bundle (or scavenged app DLL) can carry a Zone.Identifier (Internet) stream that
+# makes .NET Framework REFUSE to Add-Type it (FileLoadException, HRESULT 0x80131515),
+# silently killing the 3D overview. Three escalating attempts, each immune to the
+# previous failure: (1) Add-Type as-is; (2) Unblock-File + retry; (3) load from a
+# byte array ([Reflection.Assembly]::Load([byte[]]) has no path, so no zone check).
+function global:Import-WebView2Dll {
+    param([string]$Path)
+    try { Add-Type -Path $Path -ErrorAction Stop; return $true } catch {}
+    try { Unblock-File -LiteralPath $Path -ErrorAction SilentlyContinue } catch {}
+    try { Add-Type -Path $Path -ErrorAction Stop; return $true } catch {}
+    try { [void][System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($Path)); return $true } catch {}
+    return $false
+}
+
 # Resolve + load the WebView2 assemblies into the AppDomain. Prepends the stage
 # folder to PATH so the co-located native loader resolves. Returns the stage dir.
+# MARK-OF-THE-WEB proof (see Import-WebView2Dll).
 function global:Add-WebView2Assemblies {
     $stage = Resolve-WebView2Assets
     if ($env:PATH -notlike "*$stage*") { $env:PATH = "$stage;$env:PATH" }
-    Add-Type -Path (Join-Path $stage 'Microsoft.Web.WebView2.Core.dll')
-    Add-Type -Path (Join-Path $stage 'Microsoft.Web.WebView2.WinForms.dll')
+    try { Get-ChildItem -LiteralPath $stage -Filter *.dll -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue } catch {}
+    $core = Join-Path $stage 'Microsoft.Web.WebView2.Core.dll'
+    $wf   = Join-Path $stage 'Microsoft.Web.WebView2.WinForms.dll'
+    if (-not (Import-WebView2Dll $core)) { throw "WebView2 Core.dll could not be loaded (even after unblock + byte-load): $core" }
+    if (-not (Import-WebView2Dll $wf))   { throw "WebView2 WinForms.dll could not be loaded (even after unblock + byte-load): $wf" }
     return $stage
 }
