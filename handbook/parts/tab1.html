@@ -138,42 +138,47 @@
 
 <section class="block">
   <h2 class="sec">7. The bushing selection, in depth</h2>
-  <p>The Bushing stage is a short decision walk that ends by resolving two numbers: the <strong>drilled hole diameter</strong> and the <strong>bushing length</strong>. What the walk shows you depends on <strong>two answers &mdash; material and drill method</strong>, because those decide <em>which kind of bushing</em> the jig is built around.</p>
+  <p>The Bushing stage is a short decision walk that ends by resolving two numbers: the <strong>drilled hole diameter</strong> and the <strong>plate thickness</strong> (called the <em>bushing length</em> on the paths that use a bushing). What the walk shows you depends on <strong>two answers &mdash; material and drill method</strong>, because those decide <em>whether</em> the jig uses a bushing at all, and if so <em>which kind</em>.</p>
 
-  <h3>The two bushing types</h3>
+  <h3>The bushing types &mdash; and the no-bushing case</h3>
   <div class="grid2">
     <div class="card">
       <h4>Sleeve (press-fit liner)</h4>
       <p>A hardened sleeve is <strong>permanently pressed into the jig</strong>; the drill runs through its bore. Selection keys on the <strong>ID</strong> (the bore that guides the drill); the jig hole is bored to the sleeve&rsquo;s OD. From <code>data/bushings.csv</code>.</p>
-      <p class="muted">Used by: Metal&nbsp;&rarr;&nbsp;PFD, and both 3D-print methods.</p>
+      <p class="muted">Used by: both 3D-print methods.</p>
     </div>
     <div class="card">
       <h4>Removable drill bushing</h4>
       <p>A slip bushing that <strong>drops into the jig plate</strong>; the plate hole <strong>IS the bushing&rsquo;s OD</strong> (the bore ID doesn&rsquo;t matter to the plate). Selection keys on the <strong>OD</strong>, and only <code>1/2&Prime;</code> and <code>3/4&Prime;</code> ODs are offered. From <code>data/bushings_drill.csv</code>.</p>
       <p class="muted">Used by: Metal&nbsp;&rarr;&nbsp;Hand&nbsp;drill.</p>
     </div>
+    <div class="card">
+      <h4>No bushing (direct drill)</h4>
+      <p>A power-feed drill on metal cuts <strong>straight through the jig plate</strong> &mdash; <strong>no sleeve or removable bushing is pressed in</strong>. So there is nothing to select from a catalog: the drilled hole OD is simply fixed at <code>3/4&Prime;</code> (with a <strong>Custom OD</strong> option), and you then pick the plate thickness.</p>
+      <p class="muted">Used by: Metal&nbsp;&rarr;&nbsp;PFD.</p>
+    </div>
   </div>
 
   <h3>How material &times; drill method changes the options</h3>
   <table>
-    <tr><th>Material</th><th>Drill method</th><th>Catalog you get</th><th>Keyed on</th><th>Sizes offered</th></tr>
-    <tr><td>Metal</td><td>PFD <span class="muted">(power-feed drill)</span></td><td>Sleeves</td><td>ID</td><td><code>3/4</code> ID</td></tr>
+    <tr><th>Material</th><th>Drill method</th><th>Bushing</th><th>Keyed on</th><th>Sizes offered</th></tr>
+    <tr><td>Metal</td><td>PFD <span class="muted">(power-feed drill)</span></td><td><strong>None</strong> &mdash; direct drill</td><td><strong>OD</strong> (= the drilled hole)</td><td><code>3/4</code> OD (or custom)</td></tr>
     <tr><td>Metal</td><td>Hand drill</td><td>Removable drill bushings</td><td><strong>OD</strong> (= the drilled hole)</td><td><code>1/2</code>, <code>3/4</code> OD</td></tr>
     <tr><td>3D print</td><td>PFD</td><td>Sleeves</td><td>ID</td><td><code>1/2</code>, <code>3/4</code> ID</td></tr>
     <tr><td>3D print</td><td>Hand drill</td><td>Sleeves</td><td>ID</td><td><code>1/2</code>, <code>3/4</code> ID</td></tr>
   </table>
-  <p><small><strong>PFD</strong> = power-feed drill (portable / power-feed); <strong>Hand drill</strong> = manual. Only <strong>Metal&nbsp;&rarr;&nbsp;Hand&nbsp;drill</strong> takes the OD-first removable path (it shows OD cards and skips the ID question, because the plate hole is the bushing OD). Every hole-size list also carries a trailing <strong>&ldquo;Custom hole OD&hellip;&rdquo;</strong> card &mdash; type any diameter and the tool shows a bold &ldquo;verify a real bushing exists&rdquo; warning, since no catalog SKU backs a typed size. And the material choice echoes later: <strong>3D-print</strong> jigs auto-add chip-relief slots, while <strong>metal</strong> jigs are asked.</small></p>
+  <p><small><strong>PFD</strong> = power-feed drill (portable / power-feed); <strong>Hand drill</strong> = manual. <strong>Metal&nbsp;&rarr;&nbsp;PFD</strong> uses <em>no bushing</em> &mdash; the drill goes straight through the plate, so it just fixes the hole OD at <code>3/4&Prime;</code> (or custom) and asks the plate thickness. <strong>Metal&nbsp;&rarr;&nbsp;Hand&nbsp;drill</strong> takes the OD-first <em>removable</em> path (OD cards, no ID question, because the plate hole is the bushing OD). Both <strong>3D-print</strong> methods take the ID-first <em>sleeve</em> path. Every hole-size list also carries a trailing <strong>&ldquo;Custom hole OD&hellip;&rdquo;</strong> card &mdash; type any diameter; on the bushing paths the tool shows a bold &ldquo;verify a real bushing exists&rdquo; warning, since no catalog SKU backs a typed size (the no-bushing path skips that warning &mdash; there is deliberately no bushing to verify). And the material choice echoes later: <strong>3D-print</strong> jigs auto-add chip-relief slots, while <strong>metal</strong> jigs are asked.</small></p>
 
   <h3>The walk, screen by screen</h3>
   <p class="seq-cap">Click any screenshot to enlarge. The exact middle screens depend on your material &times; method answers (OD cards vs ID cards).</p>
   <div class="shots">
     <figure class="shot"><img loading="lazy" alt="Material card" data-shot="03-bushing-cards.png"><figcaption><b>1 &middot; Material</b> &mdash; Metal vs 3D print. This is the first card of the walk.</figcaption></figure>
-    <figure class="shot"><img loading="lazy" alt="Drill method card" data-shot="03b-bushing-drillmethod.png"><figcaption><b>2 &middot; Drill method</b> &mdash; PFD vs Hand drill. Together with the material, this picks the catalog.</figcaption></figure>
-    <figure class="shot"><img loading="lazy" alt="OD catalog cards" data-shot="03c-bushing-od-cards.png"><figcaption><b>3a &middot; OD path</b> (Metal&nbsp;&rarr;&nbsp;Hand drill) &mdash; pick the removable-bushing <strong>OD</strong>; the drilled hole = that OD. No ID question.</figcaption></figure>
-    <figure class="shot"><img loading="lazy" alt="ID catalog cards" data-shot="03e-bushing-id-cards.png"><figcaption><b>3b &middot; ID path</b> (sleeves) &mdash; pick the <strong>ID</strong> (bore); each card previews the resolved hole. Plus a &ldquo;Custom hole OD&hellip;&rdquo; card.</figcaption></figure>
-    <figure class="shot"><img loading="lazy" alt="Length cards with recommended highlight" data-shot="03d-bushing-length.png"><figcaption><b>4 &middot; Length</b> &mdash; a fixed menu (&frac12;, &frac34;, 1&Prime;, Custom). The <strong>recommended</strong> length is highlighted green &mdash; press Next to accept.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Drill method card" data-shot="03b-bushing-drillmethod.png"><figcaption><b>2 &middot; Drill method</b> &mdash; PFD vs Hand drill. Together with the material, this picks the bushing type (or none, for Metal&nbsp;&rarr;&nbsp;PFD).</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="OD catalog cards" data-shot="03c-bushing-od-cards.png"><figcaption><b>3a &middot; OD path</b> (Metal&nbsp;&rarr;&nbsp;Hand drill, <em>and</em> Metal&nbsp;&rarr;&nbsp;PFD) &mdash; pick the <strong>OD</strong>; the drilled hole = that OD. No ID question. For PFD it is the fixed <code>3/4&Prime;</code> (no bushing); for Hand drill it is the removable-bushing OD.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="ID catalog cards" data-shot="03e-bushing-id-cards.png"><figcaption><b>3b &middot; ID path</b> (sleeves, 3D-print) &mdash; pick the <strong>ID</strong> (bore); each card previews the resolved hole. Plus a &ldquo;Custom hole OD&hellip;&rdquo; card.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Length cards with recommended highlight" data-shot="03d-bushing-length.png"><figcaption><b>4 &middot; Length / thickness</b> &mdash; a fixed menu (&frac12;, &frac34;, 1&Prime;, Custom). The <strong>recommended</strong> value is highlighted green &mdash; press Next to accept. (On Metal&nbsp;&rarr;&nbsp;PFD this sets the plate thickness, since there is no bushing.)</figcaption></figure>
   </div>
-  <p class="seq-cap">The walk then ends in a <strong>confirmation card</strong> (the picked bushing, its part number, and a dimensioned schematic) &mdash; shown as <strong>step&nbsp;3</strong> in the reference below.</p>
+  <p class="seq-cap">The walk then ends in a <strong>confirmation card</strong> (the resolved hole and a dimensioned schematic; plus the picked bushing and its part number on the paths that use one) &mdash; shown as <strong>step&nbsp;3</strong> in the reference below.</p>
 
   <div class="callout tip">
     <div class="t">The recommended length, and moving inside the walk</div>
@@ -223,7 +228,7 @@
     <div class="step-grid">
       <figure class="shot"><img loading="lazy" alt="Bushing confirmation" data-shot="04-bushing-confirm.png"><figcaption>The end of the walk &mdash; the confirmed bushing + its dimensioned schematic.</figcaption></figure>
       <div class="step-facts">
-        <p class="step-desc">A decision tree of answer cards resolves the drilled <strong>hole diameter</strong> and the <strong>bushing length</strong>. The first card picks the material, the next the drill method, and those two choose which bushing catalog you see; later cards pick the size and length, ending in the confirmation shown here. <strong>See &sect;7 above</strong> for the full screen-by-screen walk, the difference between the bushing types, and why material &times; method changes the options.</p>
+        <p class="step-desc">A decision tree of answer cards resolves the drilled <strong>hole diameter</strong> and the <strong>plate thickness</strong> (the <em>bushing length</em> on the paths that use a bushing). The first card picks the material, the next the drill method, and those two choose whether a bushing is used and which catalog you see &mdash; or, for <strong>Metal&nbsp;&rarr;&nbsp;PFD</strong>, no bushing at all (a fixed <code>3/4&Prime;</code> hole OD, or custom); later cards pick the size and thickness, ending in the confirmation shown here. <strong>See &sect;7 above</strong> for the full screen-by-screen walk, the difference between the bushing types, and why material &times; method changes the options.</p>
         <dl>
           <dt>Enabled when</dt><dd>Once the tree resolves a hole size. At the length sub-stage a recommended length already exists (just press Next); a custom length needs a valid typed value; the OD tie-break is never auto-committed.</dd>
           <dt>Default preselect</dt><dd>The <strong>recommended bushing length</strong> is highlighted &mdash; press Next to accept it.</dd>

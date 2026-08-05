@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="740" viewBox="0 0 1200 740" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif">
+  <defs>
+    <marker id="red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d6455a"/></marker>
+    <marker id="grn" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1f9d6b"/></marker>
+    <marker id="blu" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2b6cb0"/></marker>
+    <marker id="grnB" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#187a53"/></marker>
+    <style>
+      .h1{font-size:33px;font-weight:700;fill:#fff;letter-spacing:.3px}
+      .h2{font-size:15px;fill:#bcd0ec}
+      .m{font-family:Georgia,'Times New Roman',serif;fill:#1a2332}
+      .lbl{font-size:14px;fill:#5b6b86}
+      .chip{font-size:15px;fill:#33415c}
+      .code{font-family:Consolas,'Courier New',monospace;font-size:13px;fill:#6b7a99}
+      .cap{font-size:15px;font-weight:700}
+      .tag{font-size:13px;font-weight:700;letter-spacing:1px;fill:#fff}
+    </style>
+  </defs>
+
+  <rect width="1200" height="740" fill="#ffffff"/>
+
+  <!-- header -->
+  <rect x="0" y="0" width="1200" height="66" fill="#12203a"/>
+  <rect x="0" y="63" width="1200" height="4" fill="#1f9d6b"/>
+  <text x="30" y="34" class="h1">Best-Fit Plane from the Hole Cloud</text>
+  <text x="30" y="55" class="h2">Import a bolt pattern off a tilted panel &#8212; trust where the holes ARE, not the modelled fastener axis.</text>
+  <text x="1170" y="46" text-anchor="end" font-size="46" font-weight="700" fill="#1c2f52">n&#770;</text>
+
+  <!-- ============ HERO SCENE (left) ============ -->
+  <!-- covariance ellipse (drawn first, behind holes) -->
+  <g transform="rotate(-16 410 350)">
+    <ellipse cx="410" cy="350" rx="150" ry="80" fill="#1f9d6b" fill-opacity="0.10" stroke="#1f9d6b" stroke-opacity="0.5" stroke-dasharray="4 5"/>
+  </g>
+  <!-- tilted plate -->
+  <polygon points="180,250 520,190 640,450 300,510" fill="#dfe7f2" fill-opacity="0.55" stroke="#7d93b5" stroke-width="2"/>
+  <!-- ellipse axis ticks + labels -->
+  <text x="545" y="300" class="m" font-size="17" fill="#187a53" font-style="italic">&#955;&#8323;</text>
+  <text x="360" y="430" class="m" font-size="17" fill="#187a53" font-style="italic">&#955;&#8322;</text>
+
+  <!-- holes -->
+  <g fill="#26456f">
+    <circle cx="301" cy="313" r="7"/><circle cx="349" cy="417" r="7"/>
+    <circle cx="386" cy="298" r="7"/><circle cx="434" cy="402" r="7"/>
+    <circle cx="471" cy="283" r="7"/><circle cx="519" cy="387" r="7"/>
+  </g>
+  <!-- pi callout -->
+  <line x1="235" y1="150" x2="299" y2="309" stroke="#9fb0cc" stroke-width="1"/>
+  <circle cx="235" cy="150" r="2.5" fill="#9fb0cc"/>
+  <text x="150" y="140" class="lbl"><tspan font-weight="700">N</tspan> bore centres <tspan class="m" font-style="italic">p&#7522;</tspan> (3-D)</text>
+
+  <!-- centroid -->
+  <circle cx="410" cy="350" r="6.5" fill="#e8a33d" stroke="#fff" stroke-width="1.5"/>
+  <text x="398" y="345" class="m" font-size="16" font-weight="700" fill="#b9781f">c</text>
+
+  <!-- RED modelled axis lying in the plate (diagonal, distinct from u/v) -->
+  <line x1="248" y1="278" x2="572" y2="422" stroke="#d6455a" stroke-width="5" marker-end="url(#red)"/>
+  <text x="250" y="268" class="lbl" fill="#b23349" font-style="italic">modelled axis (1,0,0)</text>
+  <text x="585" y="430" class="cap" fill="#d6455a">axis &#10007;</text>
+  <text x="585" y="449" class="lbl" fill="#b23349">lies IN the plate</text>
+
+  <!-- GREEN normal out of plane -->
+  <line x1="410" y1="350" x2="470" y2="228" stroke="#1f9d6b" stroke-width="5" marker-end="url(#grn)"/>
+  <text x="476" y="226" class="m" font-size="20" font-weight="700" fill="#187a53">n&#770; &#10003;</text>
+  <text x="476" y="247" class="m" font-size="15" fill="#187a53">= v(&#955;&#8321;)  &#8869; plane</text>
+
+  <!-- BLUE in-plane layout axes -->
+  <line x1="410" y1="350" x2="505" y2="333" stroke="#2b6cb0" stroke-width="2.5" marker-end="url(#blu)"/>
+  <text x="509" y="336" class="m" font-size="15" fill="#2b6cb0" font-style="italic">u&#770;</text>
+  <line x1="410" y1="350" x2="452" y2="452" stroke="#2b6cb0" stroke-width="2.5" marker-end="url(#blu)"/>
+  <text x="455" y="465" class="m" font-size="15" fill="#2b6cb0" font-style="italic">v&#770;</text>
+
+  <!-- compute chips, tucked in the empty lower-left, leader to centroid -->
+  <line x1="150" y1="452" x2="404" y2="352" stroke="#d9c39a" stroke-width="1"/>
+  <text x="34" y="440" class="chip" font-weight="700" fill="#12203a">compute</text>
+  <text x="34" y="468" class="m" font-size="18">&#9312; c = (1/N) &#931; p&#7522;</text>
+  <text x="34" y="500" class="m" font-size="18">&#9313; M = &#931; d d&#7488;<tspan class="lbl" dx="8">d = p&#7522;&#8722;c</tspan></text>
+  <text x="34" y="532" class="m" font-size="18">&#9314; M = V &#923; V&#7488;</text>
+  <text x="34" y="556" class="code">Jacobi rotations &#8594; &#955;&#8321;&#8804;&#955;&#8322;&#8804;&#955;&#8323;</text>
+
+  <!-- projection formula, under the plate -->
+  <rect x="230" y="560" width="480" height="40" rx="8" fill="#eef4fb" stroke="#c5d6ee"/>
+  <text x="248" y="586" class="m" font-size="18">&#9315; flatten (isometry):  x&#7522; = (p&#7522;&#8722;c)&#183;u&#770;,   z&#7522; = (p&#7522;&#8722;c)&#183;v&#770;</text>
+
+  <!-- ============ RESULT INSETS (right) ============ -->
+  <!-- trap -->
+  <rect x="748" y="92" width="422" height="212" rx="12" fill="#fdf2f4" stroke="#d6455a" stroke-width="1.5"/>
+  <rect x="748" y="92" width="422" height="34" rx="12" fill="#d6455a"/><rect x="748" y="110" width="422" height="16" fill="#d6455a"/>
+  <text x="959" y="115" text-anchor="middle" class="tag">FLATTEN ALONG THE AXIS &#10007;</text>
+  <line x1="800" y1="205" x2="1118" y2="205" stroke="#c98996" stroke-width="1.2"/>
+  <g fill="#8a1f33"><circle cx="928" cy="205" r="7"/><circle cx="944" cy="205" r="7"/><circle cx="960" cy="205" r="7"/><circle cx="976" cy="205" r="7"/><circle cx="992" cy="205" r="7"/><circle cx="1008" cy="205" r="7"/></g>
+  <text x="959" y="250" text-anchor="middle" class="m" font-size="19" font-weight="700" fill="#b23349">spacing &#215; 1/&#8730;2 &#8776; 0.71</text>
+  <text x="959" y="278" text-anchor="middle" class="lbl" fill="#b23349">holes bunch &#8594; merge / "too close" / under-count</text>
+
+  <!-- fix -->
+  <rect x="748" y="322" width="422" height="212" rx="12" fill="#eefaf4" stroke="#1f9d6b" stroke-width="1.5"/>
+  <rect x="748" y="322" width="422" height="34" rx="12" fill="#1f9d6b"/><rect x="748" y="340" width="422" height="16" fill="#1f9d6b"/>
+  <text x="959" y="345" text-anchor="middle" class="tag">PROJECT ONTO u&#770;, v&#770; &#10003;</text>
+  <g fill="#0f5c3c"><circle cx="880" cy="410" r="7"/><circle cx="960" cy="410" r="7"/><circle cx="1040" cy="410" r="7"/><circle cx="880" cy="475" r="7"/><circle cx="960" cy="475" r="7"/><circle cx="1040" cy="475" r="7"/></g>
+  <line x1="880" y1="440" x2="960" y2="440" stroke="#187a53" stroke-width="1.2" marker-start="url(#grnB)" marker-end="url(#grnB)"/>
+  <line x1="960" y1="440" x2="1040" y2="440" stroke="#187a53" stroke-width="1.2" marker-start="url(#grnB)" marker-end="url(#grnB)"/>
+  <text x="920" y="435" text-anchor="middle" class="m" font-size="14" fill="#187a53" font-style="italic">d</text>
+  <text x="1000" y="435" text-anchor="middle" class="m" font-size="14" fill="#187a53" font-style="italic">d</text>
+  <text x="959" y="512" text-anchor="middle" class="m" font-size="17" font-weight="700" fill="#187a53">true spacing preserved</text>
+
+  <!-- ============ GATE STRIP (bottom, full width) ============ -->
+  <rect x="30" y="622" width="1140" height="94" rx="12" fill="#fffaf0" stroke="#e8a33d" stroke-width="1.5"/>
+  <text x="52" y="652" class="cap" fill="#12203a">The conditioning gate</text>
+  <text x="232" y="652" class="lbl">&#8212; reject a bad selection with a message, never silently drop to a global-axis projection.</text>
+  <text x="52" y="688" class="m" font-size="19">SpanRatio = &#955;&#8322;/&#955;&#8323;</text>
+  <text x="230" y="688" class="lbl" fill="#b23349" font-weight="700">&#60; 1e&#8722;6 &#8594; collinear (a line) &#10007;</text>
+  <text x="500" y="688" class="lbl">&#8226;</text>
+  <text x="524" y="688" class="m" font-size="19">Flatness = &#955;&#8321;/&#955;&#8323;</text>
+  <text x="690" y="688" class="lbl" fill="#b23349" font-weight="700">&#8805; 1e&#8722;3 &#8594; not coplanar (two faces) &#10007;</text>
+  <text x="1000" y="688" class="lbl" fill="#187a53" font-weight="700">else &#8594; genuinely 2-D &#10003;</text>
+  <text x="1150" y="708" text-anchor="end" class="code">lib\fastener_layout.ps1 &#183; FL-BestFitNormal / FL-Eigen3Sym</text>
+</svg>

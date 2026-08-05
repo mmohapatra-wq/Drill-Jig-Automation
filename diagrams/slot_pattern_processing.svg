@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1560" viewBox="0 0 1240 1560" font-family="'Segoe UI', Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#37474f"/>
+    </marker>
+    <marker id="arrowR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c0392b"/>
+    </marker>
+    <filter id="sh" x="-4%" y="-4%" width="108%" height="112%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0d2b52" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      .hdr   { fill:#ffffff; font-size:24px; font-weight:700; }
+      .step  { fill:#dbeafe; font-size:13px; font-weight:700; letter-spacing:1px; }
+      .body  { fill:#1a2733; font-size:15.5px; }
+      .mono  { font-family:'Consolas','Courier New',monospace; fill:#0d2540; font-size:14.5px; }
+      .cap   { fill:#3a4a5a; font-size:12.5px; }
+      .note  { fill:#5d4200; font-size:12.5px; }
+      .noteh { fill:#7a4f00; font-size:13px; font-weight:700; }
+      .arlbl { fill:#37474f; font-size:12.5px; font-style:italic; }
+      .decis { fill:#ffffff; font-size:14px; font-weight:700; }
+    </style>
+  </defs>
+
+  <rect width="1240" height="1560" fill="#f5f8fc"/>
+
+  <!-- ===== Title ===== -->
+  <rect x="40" y="26" width="1160" height="72" rx="10" fill="#0d2b52"/>
+  <text x="66" y="62" class="hdr">Slot Pattern Processing</text>
+  <text x="66" y="86" fill="#9fc0ec" font-size="14.5">Chip-relief slots: one drawn seed &#8594; many hands-free patterns &#8212; lib\orthogrid.ps1 + lib\drilljig_core.ps1</text>
+  <text x="1174" y="70" text-anchor="end" fill="#5b82b8" font-size="13" font-family="'Consolas',monospace">pure plan + canary-gated driver</text>
+
+  <!-- ===== INPUT ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="126" width="1120" height="96" rx="10" fill="#ffffff" stroke="#00695c" stroke-width="1.5"/>
+    <rect x="60" y="126" width="1120" height="34" rx="10" fill="#00695c"/>
+    <rect x="60" y="146" width="1120" height="14" fill="#00695c"/>
+  </g>
+  <text x="80" y="149" class="step">INPUT &#183; hole rows</text>
+  <text x="80" y="188" class="mono">Rows[]  each row = one line of holes to relieve, carrying CrossCoord (its position across the slot axis)</text>
+  <text x="80" y="212" class="cap">One rectangular slot spans each row of holes; the goal is to place all slots by DRAWING only ONE and patterning the rest.</text>
+
+  <line x1="620" y1="222" x2="620" y2="262" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ===== PLAN: Get-SlotSeedPatterns ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="264" width="1120" height="330" rx="10" fill="#ffffff" stroke="#1565c0" stroke-width="1.5"/>
+    <rect x="60" y="264" width="1120" height="34" rx="10" fill="#1565c0"/>
+    <rect x="60" y="284" width="1120" height="14" fill="#1565c0"/>
+  </g>
+  <text x="80" y="287" class="step">PLAN (pure) &#183; Get-SlotSeedPatterns</text>
+  <text x="560" y="287" fill="#bbdefb" font-size="13" font-weight="700">1 seed &#8594; 1 regular pattern + N accommodation patterns</text>
+
+  <text x="80" y="326" class="mono">1.  keep rows with a numeric CrossCoord, sort ascending   (skip malformed: the [double]$null &#8594; 0.0 trap)</text>
+  <text x="80" y="352" class="mono">2.  SeedRow = lowest-cross row       offsets[i] = row[i].Cross &#8722; seedX     (all &gt; 0, ascending)</text>
+  <text x="80" y="386" class="body"><tspan font-weight="700">3.  REGULAR pattern</tspan> = the single from-seed pitch g whose consecutive multiples g, 2g, 3g&#8230;</text>
+  <text x="108" y="408" class="body">land on the MOST rows. A pattern may only span PRESENT consecutive multiples</text>
+  <text x="108" y="430" class="body">(else it drops a slot on an empty position).  Tie &#8594; the finer (smaller) pitch wins.</text>
+  <text x="80" y="464" class="body"><tspan font-weight="700">4.  ACCOMMODATION</tspan> &#8212; every row NOT covered by the regular pattern becomes its OWN</text>
+  <text x="108" y="486" class="body">count-2 pattern (seed + that one row): a distinct &#8220;second pattern&#8221; per stray row.</text>
+
+  <rect x="80" y="506" width="1082" height="72" rx="8" fill="#eef5ff" stroke="#1565c0" stroke-width="1"/>
+  <text x="96" y="528" class="body" font-weight="700">Result</text>
+  <text x="200" y="528" class="mono" font-size="14">draws = 1 (always)</text>
+  <text x="470" y="528" class="mono" font-size="14">patterns = 1 regular + (# stray rows)</text>
+  <text x="96" y="552" class="cap">Each Pattern = { Increment (pitch), Count (instances incl. the seed leader), Offsets[], Kind: 'regular' | 'accommodation' }.</text>
+  <text x="96" y="570" class="cap">Fully-even layout &#8594; a single regular pattern, zero accommodations. Pure &amp; never throws.</text>
+
+  <line x1="620" y1="594" x2="620" y2="634" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="632" y="618" class="arlbl">plan drives the live loop below</text>
+
+  <!-- ===== EXECUTE: seed cut ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="636" width="1120" height="150" rx="10" fill="#ffffff" stroke="#6a1b9a" stroke-width="1.5"/>
+    <rect x="60" y="636" width="1120" height="34" rx="10" fill="#6a1b9a"/>
+    <rect x="60" y="656" width="1120" height="14" fill="#6a1b9a"/>
+  </g>
+  <text x="80" y="659" class="step">EXECUTE &#183; seed slot (drawn once) &#183; Invoke-VerifiedSeedCut</text>
+  <text x="80" y="698" class="body">Open the sketch on the seed row &#8594; operator draws ONE rectangle &#8594; fire the cut (Build-CutFinishMacro).</text>
+  <text x="80" y="724" class="body">Ask the operator: did it cut INTO the plate at the right depth?  If no &#8594; undo + TOGGLE flip + redraw once.</text>
+  <text x="80" y="756" class="cap">The correct cut DIRECTION can't be known offline, so it's verified ONCE; the confirmed Flip is reused for every pattern. Captures the seed's FeatId.</text>
+
+  <line x1="620" y1="786" x2="620" y2="826" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ===== LOOP header ===== -->
+  <rect x="60" y="828" width="1120" height="34" rx="8" fill="#37474f"/>
+  <text x="80" y="851" fill="#ffffff" font-size="13.5" font-weight="700" letter-spacing="1px">FOR EACH pattern in plan.Patterns  (regular first, then accommodations)</text>
+
+  <!-- ===== EXECUTE: Select-FeatureById ===== -->
+  <g filter="url(#sh)">
+    <rect x="80" y="880" width="1080" height="120" rx="10" fill="#ffffff" stroke="#1976d2" stroke-width="1.5"/>
+    <rect x="80" y="880" width="1080" height="30" rx="10" fill="#1976d2"/>
+    <rect x="80" y="896" width="1080" height="14" fill="#1976d2"/>
+  </g>
+  <text x="98" y="901" class="step">A &#183; Select-FeatureById(SeedFeatId)</text>
+  <text x="470" y="901" fill="#bbdefb" font-size="12.5" font-weight="700">re-select the seed hands-free (no tree click)</text>
+  <text x="98" y="936" class="mono" font-size="14">GetItemById &#8594; CreateModelItemSelection &#8594; buffer.Clear() &#8594; AddSelection</text>
+  <text x="98" y="962" class="cap">Cascades candidate ProgIDs until one builds a selection; then VERIFIES the seed's id is actually in the selection buffer.</text>
+  <text x="98" y="984" class="cap">Replaces the old manual &#8220;click the seed in the model tree&#8221; step. Returns false if the id never lands in the buffer.</text>
+
+  <line x1="620" y1="1000" x2="620" y2="1040" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ===== EXECUTE: Invoke-SlotPatternFromSeed ===== -->
+  <g filter="url(#sh)">
+    <rect x="80" y="1042" width="1080" height="140" rx="10" fill="#ffffff" stroke="#2e7d32" stroke-width="1.5"/>
+    <rect x="80" y="1042" width="1080" height="30" rx="10" fill="#2e7d32"/>
+    <rect x="80" y="1058" width="1080" height="14" fill="#2e7d32"/>
+  </g>
+  <text x="98" y="1063" class="step">B &#183; Invoke-SlotPatternFromSeed</text>
+  <text x="440" y="1063" fill="#c8e6c9" font-size="12.5" font-weight="700">fire ONE pattern, then prove the model changed</text>
+  <text x="98" y="1098" class="mono" font-size="14">stamp = Model.VersionStamp  &#8594;  RunMacro(Build-SlotPatternMacro: DirDatumId, Count, Spacing, Flip)</text>
+  <text x="98" y="1124" class="mono" font-size="14">Changed = Wait-ModelModified(stamp)          &#8592; the CANARY</text>
+  <text x="98" y="1152" class="cap">Re-patterning the already-patterned seed adds a new sketch + slot without erasing earlier ones, so one fire per plan pattern accumulates all slots.</text>
+  <text x="98" y="1172" class="cap">Returns { Selected; Changed; Reason }. Success = (Selected AND Changed).</text>
+
+  <!-- decision -->
+  <g filter="url(#sh)">
+    <path d="M 620 1210 L 830 1268 L 620 1326 L 410 1268 Z" fill="#fff3cd" stroke="#e0a800" stroke-width="1.5"/>
+  </g>
+  <text x="620" y="1262" text-anchor="middle" fill="#5d4200" font-size="14" font-weight="700">Selected AND</text>
+  <text x="620" y="1282" text-anchor="middle" fill="#5d4200" font-size="14" font-weight="700">Changed ?</text>
+  <line x1="620" y1="1182" x2="620" y2="1208" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- yes path -->
+  <line x1="410" y1="1268" x2="250" y2="1268" stroke="#2e7d32" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="330" y="1258" text-anchor="middle" fill="#2e7d32" font-size="13" font-weight="700">YES</text>
+  <g filter="url(#sh)">
+    <rect x="70" y="1234" width="180" height="70" rx="10" fill="#e8f5e9" stroke="#2e7d32" stroke-width="1.5"/>
+  </g>
+  <text x="160" y="1264" text-anchor="middle" fill="#1b5e20" font-size="13.5" font-weight="700">slot placed</text>
+  <text x="160" y="1286" text-anchor="middle" fill="#2e7d32" font-size="12.5">next pattern &#8594;</text>
+
+  <!-- no path -->
+  <line x1="830" y1="1268" x2="990" y2="1268" stroke="#c0392b" stroke-width="2" marker-end="url(#arrowR)"/>
+  <text x="910" y="1258" text-anchor="middle" fill="#c0392b" font-size="13" font-weight="700">NO</text>
+  <g filter="url(#sh)">
+    <rect x="990" y="1226" width="180" height="86" rx="10" fill="#fdeaea" stroke="#c0392b" stroke-width="1.5"/>
+  </g>
+  <text x="1080" y="1252" text-anchor="middle" fill="#a02020" font-size="13" font-weight="700">FALLBACK</text>
+  <text x="1080" y="1274" text-anchor="middle" fill="#7a1e1e" font-size="12">prompt operator to</text>
+  <text x="1080" y="1291" text-anchor="middle" fill="#7a1e1e" font-size="12">reselect the seed</text>
+  <text x="1080" y="1306" text-anchor="middle" fill="#7a1e1e" font-size="12">(proven manual path)</text>
+
+  <!-- canary caution -->
+  <rect x="70" y="1360" width="1100" height="150" rx="10" fill="#fff8e1" stroke="#f0ad00" stroke-width="1.2"/>
+  <text x="92" y="1388" class="noteh" font-size="14">The canary must NOT assume success on a can't-read / no-change signal</text>
+  <text x="92" y="1416" class="note" font-size="13.5">A VersionStamp that can't be read, or a stamp that didn't move, is a MISS &#8212; it falls back to the manual reselect. It NEVER guesses the pattern succeeded.</text>
+  <text x="92" y="1444" class="note" font-size="13.5">This is why (Selected AND Changed) is required together: Select-FeatureById proves the seed is in the buffer, Wait-ModelModified proves the cut actually landed.</text>
+  <text x="92" y="1478" class="note" font-size="13"><tspan font-weight="700">LIVE-UNVERIFIED edge:</tspan> whether ProCmdGeomPattern honors a raw-COM-selected FEATURE on this build (proven for rounds, not yet for the pattern) &#8212;</text>
+  <text x="92" y="1498" class="note" font-size="13">hence the canary + fallback rather than trusting the fire blindly.</text>
+</svg>

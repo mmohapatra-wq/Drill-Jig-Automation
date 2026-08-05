@@ -465,16 +465,24 @@ function global:Set-BushLengthPick {
     param($Context, [double]$LenValue, [string]$LenLabel)
     $Context.BushLenValue = [double]$LenValue
     $Context.BushLenLabel = [string]$LenLabel
+    # NO-BUSHING flag (METAL -> PFD, user 2026-08-04) -- PARITY with drilljig-gui.cmd. In the
+    # CURVED GUI this branch is currently DEAD: the curved walk resolves METAL -> PFD via the
+    # simpler Get-FixedOdSpec fallback (BushingLength=$null, thickness derived by the chip-
+    # clearance step), never a NoBushing PendingSpec. Kept identical so the two verbatim copies
+    # do not drift, and correct should the curved walk ever adopt the OD-card no-bushing flow.
+    $noBush = ($null -ne $Context.PendingSpec -and $Context.PendingSpec.NoBushing)
     if ($Context.BushCustom) {
         if ($null -eq $Context.BushCustomOd) { return 'noop' }
-        $pick = Resolve-CustomOdPick -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel)
+        $pick = if ($noBush) { Resolve-NoBushingPick -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel) }
+                else          { Resolve-CustomOdPick   -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel) }
         [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
         $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
         return 'done'
     }
     if ($Context.BushOdFirst) {
         if ($null -eq $Context.BushOD) { return 'noop' }
-        $pick = Resolve-OdBushingPick -OdGroup $Context.BushOD -Length ([double]$LenValue) -LenLabel ([string]$LenLabel)
+        $pick = if ($noBush) { Resolve-NoBushingPick -OD ([double]$Context.BushOD.OD) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushOD.ODLabel) }
+                else          { Resolve-OdBushingPick -OdGroup $Context.BushOD -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) }
         [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
         $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
         return 'done'

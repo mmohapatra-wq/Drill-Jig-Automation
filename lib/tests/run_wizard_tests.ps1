@@ -606,6 +606,67 @@ Assert-True "odgroups: empty rows -> 0 groups, no throw" (@($odgEmpty).Count -eq
 Assert-True "odlen: OD 0.5  -> recommend 1/2 (idx 0)" ((Get-BushingLengthOptions -Id 0.5).PreselectIndex -eq 0)
 Assert-True "odlen: OD 0.75 -> recommend 3/4 (idx 1)" ((Get-BushingLengthOptions -Id 0.75).PreselectIndex -eq 1)
 
+# ----------------------------------------------------------------------------
+# NO-BUSHING fixed-OD choice (user 2026-08-04): METAL -> PFD drills DIRECTLY through
+# the plate -- no sleeve, no removable bushing. Get-FixedOdChoiceSpec recognizes the
+# leaf and makes a CATALOG-LESS OD-first spec; Get-FixedOdGroups synthesizes the OD
+# cards (no catalog rows); Resolve-NoBushingPick builds a no-bushing pick.
+# ----------------------------------------------------------------------------
+Write-Host ""
+Write-Host "  -- core: NO-BUSHING fixed-OD choice (METAL -> PFD, 2026-08-04) --" -ForegroundColor White
+$pfdLabel = 'Hole OD fixed at 3/4 in -- no bushing (PFD direct); or custom OD'
+# 1) It is NOT a catalog spec (must not match the sleeve/removable catalogs) ...
+Assert-True "nobush: PFD label is NOT a catalog spec"      ($null -eq (Get-CatalogSpec -Label $pfdLabel))
+# ... but Get-FixedOdSpec still reads 0.75 (console/curved fallback resolves the OD).
+Assert-True "nobush: PFD label Get-FixedOdSpec -> 0.75"    (Approx (Get-FixedOdSpec -Label $pfdLabel) 0.75)
+# 2) Get-FixedOdChoiceSpec: sentinel 'no bushing' + OD 3/4 -> catalog-less OD spec.
+$choice = Get-FixedOdChoiceSpec -Label $pfdLabel
+Assert-True "nobush: choice spec resolved"                 ($null -ne $choice)
+Assert-True "nobush: choice spec File is null (catalog-less)" ($null -eq $choice.File)
+Assert-True "nobush: choice spec NoBushing flag set"       ([bool]$choice.NoBushing)
+Assert-True "nobush: choice spec OD filter = 0.75"         (@($choice.Filters[0].Values).Count -eq 1 -and (Approx ([double]$choice.Filters[0].Values[0]) 0.75))
+Assert-True "nobush: choice spec is OD-first (Test-OdFirstSpec)" ([bool](Test-OdFirstSpec -Spec $choice))
+# a label WITHOUT the 'no bushing' sentinel is not a choice spec (guards false positives).
+Assert-True "nobush: non-sentinel label -> null"          ($null -eq (Get-FixedOdChoiceSpec -Label 'all 3/4 ID sleeves'))
+Assert-True "nobush: null label -> null (no throw)"        ($null -eq (Get-FixedOdChoiceSpec -Label $null))
+# a two-OD no-bushing label yields both ODs, ascending.
+$choice2 = Get-FixedOdChoiceSpec -Label 'no bushing: hole OD 1/2 or 3/4'
+Assert-True "nobush: two-OD label -> 2 ODs ascending"      (@($choice2.Filters[0].Values).Count -eq 2 -and (Approx ([double]$choice2.Filters[0].Values[0]) 0.5) -and (Approx ([double]$choice2.Filters[0].Values[1]) 0.75))
+# 3) Get-FixedOdGroups: synthesize OD cards from bare ODs, no catalog rows.
+$fg = Get-FixedOdGroups -ODs @($choice.Filters[0].Values)
+Assert-True "nobush: fixed groups -> 1 group"             (@($fg).Count -eq 1)
+Assert-True "nobush: fixed group OD = 0.75"               (Approx ([double]$fg[0].OD) 0.75)
+Assert-True "nobush: fixed group label is fraction 3/4"   ($fg[0].ODLabel -eq '3/4')
+Assert-True "nobush: fixed group has NO catalog rows"     (@($fg[0].Rows).Count -eq 0)
+$fgEmpty = Get-FixedOdGroups -ODs @()
+Assert-True "nobush: empty ODs -> 0 groups, no throw"     (@($fgEmpty).Count -eq 0)
+# 4) Resolve-NoBushingPick: OD = hole, Length = plate thickness, ID '(no bushing)', no PN.
+$npk = Resolve-NoBushingPick -OD 0.75 -Length 0.75 -LenLabel '3/4' -OdLabel '3/4'
+Assert-True "nobush: pick OD carried (0.75 = hole)"       (Approx ([double]$npk.OD) 0.75)
+Assert-True "nobush: pick ID is (no bushing)"             ($npk.ID -eq '(no bushing)')
+Assert-True "nobush: pick length is the chosen 0.75"      (Approx ([double]$npk.Length) 0.75)
+Assert-True "nobush: pick PartNumber flags no bushing"    ($npk.PartNumber -match '(?i)no bushing|n/a')
+Assert-True "nobush: pick EasyName says No bushing"       ($npk.EasyName -match '(?i)no bushing')
+# 5) ConvertTo-FracLabel: decimal -> machinist fraction, /32 grid; decimal fallback off-grid.
+Assert-True "fraclabel: 0.75 -> 3/4"                       ((ConvertTo-FracLabel 0.75) -eq '3/4')
+Assert-True "fraclabel: 0.5 -> 1/2"                        ((ConvertTo-FracLabel 0.5) -eq '1/2')
+Assert-True "fraclabel: 1.0 -> 1"                          ((ConvertTo-FracLabel 1.0) -eq '1')
+Assert-True "fraclabel: 1.375 -> 1 3/8"                    ((ConvertTo-FracLabel 1.375) -eq '1 3/8')
+Assert-True "fraclabel: 0.6 (off-grid) -> decimal 0.6"     ((ConvertTo-FracLabel 0.6) -eq '0.6')
+# 6) Set-BushLengthPick NoBushing branch (OD-first): resolves a no-bushing pick, 'done'.
+if (Get-Command Set-BushLengthPick -ErrorAction SilentlyContinue) {
+    $nbctx = @{ TreeNode=[pscustomobject]@{ label=$pfdLabel }
+                TreeDone=$false; PendingSpec=@{ File=$null; NoBushing=$true; Filters=@(@{Column='OD';Values=@(0.75)}) }
+                BushStage='len'; BushOdFirst=$true; BushOD=$fg[0]; BushID=$null; BushCustom=$false; BushCustomOd=$null
+                Picks=[System.Collections.ArrayList]::new() }
+    $rNb = Set-BushLengthPick -Context $nbctx -LenValue 0.75 -LenLabel '3/4'
+    Assert-True "nobush: Set-BushLengthPick returns done"  ($rNb -eq 'done')
+    Assert-True "nobush: Set-BushLengthPick recorded a pick" (@($nbctx.Picks).Count -eq 1)
+    Assert-True "nobush: recorded pick is no-bushing"      ([string]$nbctx.Picks[0].BushingID -eq '(no bushing)')
+    Assert-True "nobush: recorded pick thickness = 0.75"   (Approx ([double]$nbctx.Picks[0].BushingLength) 0.75)
+    Assert-True "nobush: Set-BushLengthPick set TreeDone"  ([bool]$nbctx.TreeDone)
+}
+
 # Resolve-OdBushingPick: ID unspecified, OD = drilled hole, length = chosen value.
 $og075 = $odg | Where-Object { (Approx $_.OD 0.75) } | Select-Object -First 1
 $pkOd  = Resolve-OdBushingPick -OdGroup $og075 -Length 0.75 -LenLabel '3/4'
@@ -883,6 +944,7 @@ $coreFns = @('Initialize-DrilljigCore','New-OffsetPlane','Set-PlaneOffset','Set-
              'Get-BushingLengthOptions','Get-IdOdOptions','Resolve-BushingPickRow','Resolve-BushingLengthInput',
              'Test-OdFirstSpec','Get-OdGroups','Resolve-OdBushingPick',
              'Resolve-CustomOdInput','Resolve-CustomOdPick',
+             'Get-FixedOdChoiceSpec','Get-FixedOdGroups','Resolve-NoBushingPick','ConvertTo-FracLabel',
              'Select-FeatureById','Invoke-SlotPatternFromSeed',
              'Build-CsysFromPlanesMacro','Get-CsysShowMacro','Resolve-IndexHolePlanes','Read-IndexSelectionIds','Invoke-IndexCsys',
              'Get-HolesRelativeToIndex','Export-IndexHoleCsv','Build-CsysOffsetPointsMacro','Invoke-CsysOffsetPoints',
@@ -1014,26 +1076,31 @@ if (-not $wfLoaded) {
             & $script:capOnPick $i $script:capOpts[$i] $ctx $fakeWiz | Out-Null
             $pnl.Dispose()
         }
-        # ID-FIRST metal->PFD SLEEVE flow (user 2026-07-23): Q1=0 (Metal) / Q2=0 (PFD) now
-        # lands on the "3/4 ID sleeves" outcome, which is ID-FILTERED -> the PFD path shows
-        # ID cards (only 3/4), then the standardized length; the single OD auto-resolves.
-        # So after the outcome the walk fires: ID pick -> length -> completes.
+        # NO-BUSHING metal->PFD flow (user 2026-08-04): Q1=0 (Metal) / Q2=0 (PFD) now lands on
+        # the "Hole OD fixed at 3/4 -- no bushing" outcome. PFD drills DIRECTLY through the plate
+        # (no sleeve, no removable bushing), so Get-FixedOdChoiceSpec makes a CATALOG-LESS OD-first
+        # spec: ONE OD card (3/4) + a "Custom hole OD..." card -> the standardized plate-thickness
+        # menu -> completes (no OD tie-break, no bushing, no part number). So the walk fires:
+        # OD pick (3/4, card 0) -> length/thickness -> completes.
         $threw = $false
         try {
             & $fire 0   # Q1 material (Metal)
-            & $fire 0   # Q2 PFD -> outcome -> catalog (ID-first sleeve, 3/4 ID only)
+            & $fire 0   # Q2 PFD -> outcome -> catalog-less no-bushing OD-first spec (3/4 only)
             if ($null -ne $ctx.PendingSpec) {
-                & $fire 0   # ID pick (3/4 is the ONLY ID; card index 0, customod is index 1)
-                & $fire 0   # length -> single OD auto-resolves -> completes here
+                & $fire 0   # OD pick (3/4 is the ONLY OD; card index 0, customod is index 1)
+                & $fire 0   # thickness -> completes here (no OD tie-break on the OD-first path)
             }
         } catch { $threw = $true; Write-Host ("       threw: {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
         Assert-True "tree OnPick walk does not throw (no null-index)" (-not $threw)
-        Assert-True "metal->PFD is ID-first sleeve (BushOdFirst false)" (-not $ctx.BushOdFirst)
-        Assert-True "tree walk set BushID (metal->PFD sleeve, ID chosen)" ($null -ne $ctx.BushID)
-        Assert-True "tree walk left BushOD null (sleeve is ID-first)" ($null -eq $ctx.BushOD)
-        Assert-True "tree walk resolved a bushing pick" ($ctx.Picks.Count -gt 0)
-        Assert-True "tree walk pick is a Sleeve (headless render)" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -match '(?i)sleeve')
-        Assert-True "tree walk pick has a real ID (not (any))" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -notmatch 'ID \(any\)')
+        Assert-True "metal->PFD is OD-first no-bushing (BushOdFirst true)" ([bool]$ctx.BushOdFirst)
+        Assert-True "tree walk set BushOD (metal->PFD OD chosen)" ($null -ne $ctx.BushOD)
+        Assert-True "tree walk left BushID null (no-bushing is OD-first)" ($null -eq $ctx.BushID)
+        Assert-True "tree walk resolved a pick" ($ctx.Picks.Count -gt 0)
+        Assert-True "metal->PFD pick is NO BUSHING" ($ctx.Picks[$ctx.Picks.Count-1].Bushing -match '(?i)no bushing')
+        Assert-True "metal->PFD pick BushingID is (no bushing)" ([string]$ctx.Picks[$ctx.Picks.Count-1].BushingID -eq '(no bushing)')
+        Assert-True "metal->PFD pick has no real part number" ($ctx.Picks[$ctx.Picks.Count-1].PartNumber -match '(?i)n/a|no bushing')
+        Assert-True "metal->PFD hole OD is 3/4" ([math]::Abs([double]$ctx.Picks[$ctx.Picks.Count-1].HoleDiameter - 0.75) -lt 1e-6) ("got $($ctx.Picks[$ctx.Picks.Count-1].HoleDiameter)")
+        Assert-True "metal->PFD carries a plate thickness (BushingLength > 0)" ($null -ne $ctx.Picks[$ctx.Picks.Count-1].BushingLength -and [double]$ctx.Picks[$ctx.Picks.Count-1].BushingLength -gt 0)
         Assert-True "tree walk completed (BushStage cleared)" ($null -eq $ctx.BushStage)
         Assert-True "tree walk set TreeDone" ([bool]$ctx.TreeDone)
         Assert-True "resolved HoleDiameter > 0" ($ctx.Picks.Count -gt 0 -and [double]$ctx.Picks[$ctx.Picks.Count-1].HoleDiameter -gt 0)

@@ -74,6 +74,31 @@ function ConvertTo-Decimal {
     return $null
 }
 
+# Turn a decimal inch value into a machinist fraction label ("0.75" -> "3/4",
+# "0.5" -> "1/2", "1.375" -> "1 3/8"), snapping to the /32 grid; falls back to a
+# trimmed decimal when it is not a clean fraction. Pure. global: so a GUI closure
+# (e.g. Get-FixedOdGroups' card labels) can resolve it. Used for SYNTHESIZED labels
+# where there is no catalog EasyName to pull the fraction from (Get-FracLabel needs one).
+function global:ConvertTo-FracLabel {
+    param([double]$Value)
+    if ([double]::IsNaN($Value) -or [double]::IsInfinity($Value) -or $Value -le 0) { return ('{0:0.###}' -f $Value) }
+    $whole = [math]::Floor($Value)
+    $frac  = $Value - $whole
+    $den = 32
+    $num = [math]::Round($frac * $den)
+    if ($num -eq 0)  { return ('{0}' -f [int]$whole) }
+    if ($num -eq $den) { return ('{0}' -f ([int]$whole + 1)) }
+    # reduce num/den by their GCD
+    $a = [int]$num; $b = [int]$den
+    while ($b -ne 0) { $t = $b; $b = $a % $b; $a = $t }
+    $g = [int]$a
+    if ($g -gt 1) { $num = [int]($num / $g); $den = [int]($den / $g) }
+    # only trust the fraction if it reconstructs the value (i.e. it WAS on the /32 grid)
+    if ([math]::Abs(($whole + $num / $den) - $Value) -gt 1e-6) { return ('{0:0.###}' -f $Value) }
+    if ($whole -gt 0) { return ('{0} {1}/{2}' -f [int]$whole, [int]$num, [int]$den) }
+    return ('{0}/{1}' -f [int]$num, [int]$den)
+}
+
 # Validate an operator-entered chip-relief SLOT DEPTH (inches). PURE (no COM/state)
 # so both front-ends validate a typed depth the same way and it is unit-testable.
 # The slot depth doubles as the plate EXTRUDE PAD: plate = bushingLen + slotDepth,
@@ -272,6 +297,73 @@ function Get-FixedOdSpec {
     if ($Label -notmatch '(?i)\bOD\b') { return $null }
     if ($Label -match '(?i)\bOD\b[^0-9]*(\d+(?:/\d+)?(?:\.\d+)?)') { return (ConvertTo-Decimal $matches[1]) }
     return $null
+}
+
+# ============================================================================
+# NO-BUSHING FIXED-OD CHOICE (user 2026-08-04): METAL -> PFD drills DIRECTLY through
+# the jig plate -- NO sleeve, NO removable bushing is pressed in, so the drilled hole
+# OD is simply the fixed size (3/4") with a Custom-OD option. This is DIFFERENT from
+# Get-FixedOdSpec (which resolves the OD immediately, no UI): the GUIs reuse the proven
+# OD-FIRST card machinery (an OD card + a "Custom hole OD..." card -> the standardized
+# length menu, which sets the plate thickness) but resolve to a NO-BUSHING pick (no
+# part number, ID '(no bushing)'). The three helpers below drive that branch; they are
+# `function global:` so the GUI closures resolve them (same rule as Get-OdGroups et al.).
+# The console walkers (jig_tree.ps1 / jiginator) do NOT use these -- their METAL->PFD
+# leaf still parses via Get-FixedOdSpec into the simpler immediate no-bushing pick.
+# ============================================================================
+
+# Recognize the METAL->PFD "no bushing, fixed hole OD" leaf and return a synthetic,
+# CATALOG-LESS OD-first spec { File = $null; Filters = @(@{Column='OD'; Values=@(<od>...)}); NoBushing = $true },
+# or $null if the label is not such a leaf. Sentinel = the phrase "no bushing"; the
+# fixed OD(s) are every fraction/decimal token in the label (3/4 -> 0.75). File is $null
+# (no catalog backs a bare drilled hole) -- the GUI synthesizes the OD cards via
+# Get-FixedOdGroups. Test-OdFirstSpec returns TRUE for this spec (it carries an OD
+# filter), so the GUI enters the OD-first sub-flow. Pure.
+function global:Get-FixedOdChoiceSpec {
+    param([string]$Label)
+    if (-not $Label) { return $null }
+    if ($Label -notmatch '(?i)no\s+bushing') { return $null }   # sentinel: the leaf declares NO bushing
+    $ods = @()
+    foreach ($m in ([regex]'(\d+(?:/\d+)?(?:\.\d+)?)').Matches($Label)) {
+        $v = ConvertTo-Decimal $m.Groups[1].Value
+        if ($null -ne $v -and -not [double]::IsNaN([double]$v) -and -not [double]::IsInfinity([double]$v) -and [double]$v -gt 0) { $ods += [double]$v }
+    }
+    $ods = @($ods | Select-Object -Unique | Sort-Object)
+    if ($ods.Count -eq 0) { return $null }
+    return @{ File = $null; Filters = @(@{ Column = 'OD'; Values = @($ods) }); NoBushing = $true }
+}
+
+# Synthesize OD groups (shaped like Get-OdGroups' output, but with NO catalog Rows) from
+# a bare list of OD diameters -- the catalog-less analog used by the no-bushing PFD path.
+# Each -> @{ OD; ODLabel; Rows = @() }, ascending. ODLabel is the machinist fraction for
+# the value (Get-FracLabel with a null EasyName falls back to the decimal string). Pure.
+# global: so a GUI OnPick .GetNewClosure() can call it (same as Get-OdGroups).
+function global:Get-FixedOdGroups {
+    param([double[]]$ODs)
+    $out = @()
+    foreach ($od in (@($ODs) | Sort-Object)) {
+        $lbl = ConvertTo-FracLabel ([double]$od)   # synthesized -> derive the fraction from the value
+        $out += [pscustomobject]@{ OD = [double]$od; ODLabel = [string]$lbl; Rows = @() }
+    }
+    return ,@($out)
+}
+
+# Build the pick object for a NO-BUSHING drilled hole (METAL -> PFD). The drill runs
+# straight through the plate: there is no sleeve/removable bushing, so ID is '(no bushing)'
+# and there is no part number. .OD is the (fixed or custom) drilled hole; .Length is the
+# chosen plate thickness (-> STAGE 2 SIDE offset). The EasyName keeps Get-FracLabel's
+# OD/Lg parse working (used by callers that echo the pick). Pure. global: so the GUI's
+# card OnPick / "Use this length" .GetNewClosure() handlers resolve it.
+function global:Resolve-NoBushingPick {
+    param([double]$OD, [double]$Length, [string]$LenLabel, [string]$OdLabel = $null)
+    $odLbl = if ([string]::IsNullOrWhiteSpace($OdLabel)) { ('{0:0.###}' -f [double]$OD) } else { [string]$OdLabel }
+    return [pscustomobject]@{
+        EasyName   = ("No bushing (PFD direct) | hole OD {0} x {1} plate" -f $odLbl, $LenLabel)
+        OD         = [double]$OD
+        ID         = '(no bushing)'
+        Length     = [double]$Length
+        PartNumber = '(n/a -- no bushing, direct drill)'
+    }
 }
 
 # Load a catalog file and apply a spec's filters, returning the matching rows

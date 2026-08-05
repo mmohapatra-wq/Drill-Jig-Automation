@@ -32,6 +32,32 @@
   </div>
 </section>
 
+<section class="block">
+  <h2 class="sec">Curved Drill Jig &mdash; MK1 Aft Structure &mdash; <code>030-101-0002-001</code></h2>
+  <p>The first jig in this handbook that leaves the flat wizard behind. This plate is <em>not</em> flat &mdash; it follows the conformal curvature of the aft-structure skin, so it was started in <code>drilljig3d-gui</code> rather than the flat wizard. Partway along its length the plate steps up in height to hug a shoulder in the part, and the comb of chip-relief slots runs the full length between the two guide-hole columns.</p>
+  <div class="shots">
+    <figure class="shot"><img loading="lazy" alt="Long curved comb drill jig isolated on a dark background, two rows of counterbored bushing seats, with a stepped change in plate height partway along and chip-relief slots combed along the bottom edge" data-shot="ex-curved-aft-1.png"><figcaption><b>1 &middot; Plate alone</b> &mdash; the bare comb, gently curved end to end. Two columns of counterbored bushing seats track the drill pattern; note the step partway along where the plate rises to meet a shoulder in the skin, and the chip-relief slots running the full length between the hole columns.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="The same curved drill jig seated on the aft structure with guide bushings dropped into the holes and fasteners installed clamping it down, the underlying skin faintly visible beneath" data-shot="ex-curved-aft-2.png"><figcaption><b>2 &middot; Seated on the part</b> &mdash; bushings dropped into the seats and fasteners run down to clamp the plate to the skin. The aft structure is just visible underneath &mdash; the plate sits flush across both the curve and the stepped shoulder.</figcaption></figure>
+  </div>
+  <div class="callout tip">
+    <div class="t">The one adjustment that made it possible</div>
+    Unlike the flat examples, the starting geometry here is a conformal surface offset &mdash; the wizard&rsquo;s curved path wraps the plate to the skin before a single hole is placed. The only manual edit in the sketcher was the stepped height change to clear the shoulder; everything else came off the curved path as-generated.
+  </div>
+</section>
+
+<section class="block">
+  <h2 class="sec">Star Stiffener &mdash; <code>030-101-0270-001</code></h2>
+  <p>Where three stiffener arms radiate from a common node, the drilling all happens at a single Y-junction &mdash; and every hole leans in toward the vertex. This jig is a wide chevron that bridges two of the arms at once, carrying two angled hole regions that converge on the point where the arms meet. It came off the wizard as a rough V and needed only a little hand-work in the sketcher to square the guide columns to each arm&rsquo;s true axis.</p>
+  <div class="shots">
+    <figure class="shot"><img loading="lazy" alt="Yellow chevron jig seated at the star junction where three grey stiffener arms meet, spanning two of them" data-shot="ex-star-stiffener-1.png"><figcaption><b>1 &middot; Seated at the node</b> &mdash; the jig bridges two arms of the star intersection, guide holes on its face aimed down each arm toward the shared vertex.</figcaption></figure>
+    <figure class="shot"><img loading="lazy" alt="Front view of the chevron jig alone, showing vertical chip-relief slots between hole columns and two diagonal hole rows angling toward the center" data-shot="ex-star-stiffener-2.png"><figcaption><b>2 &middot; Chevron, front view</b> &mdash; the M-like outline with chip-relief slots channeling vertically between the guide-hole columns and two diagonal rows raking down to the center point.</figcaption></figure>
+  </div>
+  <div class="callout tip">
+    <div class="t">Slots are a rigidity dial &mdash; tune them by hand</div>
+    The chip-relief slots are parametric sketch features, so once the wizard lays them down you can widen, narrow, or shorten them right in the Creo sketcher. On a small chevron like this the web of material left between slots is what actually carries load &mdash; it is what keeps the plate from flexing while you lean on the drill. To stiffen the plate: narrow each slot so more web remains beside it, trim the slot depth so the slot cuts less deep into the plate, or delete a slot or two entirely and leave fewer, wider webs between the guide-hole columns. Every one of those moves trades a little chip clearance for a stiffer plate that resists flex and holds each hole&rsquo;s true position through the cut. Conversely, if chips are packing and binding the bit, widen or deepen a slot &mdash; but only as far as the web between slots can still carry the drilling load without the plate springing. Treat slot width, depth, and web spacing as a deliberate rigidity-versus-clearance tradeoff you control after the wizard runs, not a fixed part of the geometry.
+  </div>
+</section>
+
 <div class="callout info">
   <div class="t">Try it on your part</div>
   If your job looks more like these than like a plain rectangle, still start in <code>drilljig-gui</code> &mdash; let it place the holes, bushings, and slots &mdash; then reshape the plate or add a locating feature by hand. The wizard does the tedious layout math; you keep full control of the outline.

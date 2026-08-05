@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="1500" viewBox="0 0 1240 1500" font-family="'Segoe UI', Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#37474f"/>
+    </marker>
+    <filter id="sh" x="-4%" y="-4%" width="108%" height="112%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0d2b52" flood-opacity="0.18"/>
+    </filter>
+    <style>
+      .hdr   { fill:#ffffff; font-size:20px; font-weight:700; }
+      .step  { fill:#c8e0ff; font-size:13px; font-weight:700; letter-spacing:1px; }
+      .body  { fill:#1a2733; font-size:15.5px; }
+      .mono  { font-family:'Consolas','Courier New',monospace; fill:#0d2540; font-size:15px; }
+      .monod { font-family:'Consolas','Courier New',monospace; fill:#6a4a00; font-size:13.5px; }
+      .cap   { fill:#3a4a5a; font-size:13px; }
+      .note  { fill:#5d4200; font-size:13px; }
+      .noteh { fill:#7a4f00; font-size:13px; font-weight:700; }
+      .arlbl { fill:#37474f; font-size:12.5px; font-style:italic; }
+    </style>
+  </defs>
+
+  <rect width="1240" height="1500" fill="#f5f8fc"/>
+
+  <!-- ===== Title ===== -->
+  <rect x="40" y="26" width="1160" height="72" rx="10" fill="#0d2b52"/>
+  <text x="66" y="62" class="hdr" font-size="24">Index Hole Parsing</text>
+  <text x="66" y="86" fill="#9fc0ec" font-size="14.5">Change-of-basis from two index holes into a local jig frame &#8212; lib\index_frame.ps1 + lib\orthogrid_points.ps1</text>
+  <text x="1174" y="70" text-anchor="end" fill="#5b82b8" font-size="13" font-family="'Consolas',monospace">pure math &#183; never throws</text>
+
+  <!-- ===== Stage 0: INPUT ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="126" width="760" height="150" rx="10" fill="#ffffff" stroke="#00695c" stroke-width="1.5"/>
+    <rect x="60" y="126" width="760" height="34" rx="10" fill="#00695c"/>
+    <rect x="60" y="146" width="760" height="14" fill="#00695c"/>
+  </g>
+  <text x="80" y="149" class="step">READ FROM CREO</text>
+  <text x="330" y="149" fill="#b2dfdb" font-size="13" font-weight="700">each hole = a CYLINDER, read via its AXIS</text>
+  <text x="80" y="188" class="mono">A1, A2   axis ORIGIN points of index hole 1 &amp; 2</text>
+  <text x="80" y="212" class="mono">D1, D2   bore DIRECTIONS of index hole 1 &amp; 2</text>
+  <text x="80" y="236" class="mono">AllDirs  every hole's bore direction (for a low-noise Zhat)</text>
+  <text x="80" y="262" class="cap">Why the axis and not a plane normal? On this Creo build a PLANE descriptor's normal reads null;</text>
+  <text x="80" y="279" class="cap" font-size="12">a cylinder's axis direction reads reliably &#8212; so &#8220;up&#8221; = the average of the trustworthy bore axes.</text>
+
+  <!-- callout: input -->
+  <rect x="852" y="150" width="330" height="104" rx="8" fill="#fff8e1" stroke="#f0ad00" stroke-width="1.2"/>
+  <text x="870" y="174" class="noteh">Invariance guarantee</text>
+  <text x="870" y="196" class="note">A bore's axis ORIGIN may sit anywhere</text>
+  <text x="870" y="213" class="note">along the hole (top / bottom / any height).</text>
+  <text x="870" y="230" class="note">Because Xhat, Yhat &#8869; Zhat, sliding an</text>
+  <text x="870" y="247" class="note">origin along Zhat changes only z &#8212; (x,y) hold.</text>
+
+  <line x1="440" y1="276" x2="440" y2="316" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ===== Stage 1: Get-IndexFrame ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="318" width="760" height="248" rx="10" fill="#ffffff" stroke="#1565c0" stroke-width="1.5"/>
+    <rect x="60" y="318" width="760" height="34" rx="10" fill="#1565c0"/>
+    <rect x="60" y="338" width="760" height="14" fill="#1565c0"/>
+  </g>
+  <text x="80" y="341" class="step">STEP 1 &#183; Get-IndexFrame</text>
+  <text x="430" y="341" fill="#bbdefb" font-size="13" font-weight="700">build an orthonormal right-handed frame</text>
+  <text x="80" y="384" class="mono">Zhat = normalize( &#931; sign-aligned bore directions )</text>
+  <text x="80" y="416" class="mono">v    = (A2 &#8722; A1) &#8722; ((A2&#8722;A1)&#183;Zhat) Zhat</text>
+  <text x="80" y="448" class="mono">Xhat = v / |v|</text>
+  <text x="80" y="480" class="mono">Yhat = Zhat &#215; Xhat</text>
+  <text x="80" y="512" class="mono">O    = A1</text>
+  <text x="500" y="384" class="cap" font-size="12.5">&#8592; "up"; every dir sign-aligned to D1</text>
+  <text x="500" y="416" class="cap" font-size="12.5">&#8592; in-plane part of the 1&#8594;2 vector</text>
+  <text x="500" y="448" class="cap" font-size="12.5">&#8592; primary axis, points 1&#8594;2</text>
+  <text x="500" y="480" class="cap" font-size="12.5">&#8592; +X right, +Y left, +Z up</text>
+  <text x="500" y="512" class="cap" font-size="12.5">&#8592; frame origin = index hole 1</text>
+  <text x="80" y="546" class="cap">Sign-aligning each direction to D1 before summing stops an anti-parallel descriptor return from cancelling Zhat.</text>
+
+  <!-- callout: guards -->
+  <rect x="852" y="360" width="330" height="150" rx="8" fill="#fdeaea" stroke="#d05353" stroke-width="1.2"/>
+  <text x="870" y="384" fill="#a02020" font-size="13" font-weight="700">Degeneracy guards &#8594; Valid=false</text>
+  <text x="870" y="408" fill="#7a1e1e" font-size="12.5" font-family="'Consolas',monospace">|&#931; dirs| &lt; ZTol</text>
+  <text x="1000" y="408" fill="#7a1e1e" font-size="12">bores cancel &#8594; no Zhat</text>
+  <text x="870" y="432" fill="#7a1e1e" font-size="12.5" font-family="'Consolas',monospace">|v| &lt; VTol</text>
+  <text x="1000" y="432" fill="#7a1e1e" font-size="12">holes axially collinear</text>
+  <text x="870" y="456" fill="#7a1e1e" font-size="12">&#8594; X axis indeterminate</text>
+  <text x="870" y="484" fill="#7a1e1e" font-size="12">A compute helper NEVER throws &#8212; it</text>
+  <text x="870" y="501" fill="#7a1e1e" font-size="12">returns Valid=false + Errors[] instead.</text>
+
+  <line x1="440" y1="566" x2="440" y2="606" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ===== Stage 2: ConvertTo-IndexCoords ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="608" width="760" height="150" rx="10" fill="#ffffff" stroke="#1976d2" stroke-width="1.5"/>
+    <rect x="60" y="608" width="760" height="34" rx="10" fill="#1976d2"/>
+    <rect x="60" y="628" width="760" height="14" fill="#1976d2"/>
+  </g>
+  <text x="80" y="631" class="step">STEP 2 &#183; ConvertTo-IndexCoords</text>
+  <text x="470" y="631" fill="#bbdefb" font-size="13" font-weight="700">express every hole P in the frame</text>
+  <text x="80" y="672" class="mono">R = P &#8722; A1</text>
+  <text x="80" y="702" class="mono">x = R&#183;Xhat    y = R&#183;Yhat    z = R&#183;Zhat</text>
+  <text x="80" y="738" class="cap">Returns { X; Y; Z; AtOrigin }. AtOrigin flags |R| &#8776; 0 (P is index hole 1). (X,Y) are invariant to</text>
+  <text x="80" y="754" class="cap" font-size="12">the read height along each bore &#8212; exact for parallel bores, leak bounded by ~s&#183;sin&#952; otherwise.</text>
+
+  <line x1="440" y1="758" x2="440" y2="798" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ===== Stage 3: Test-IndexFrameValid ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="800" width="760" height="170" rx="10" fill="#ffffff" stroke="#6a1b9a" stroke-width="1.5"/>
+    <rect x="60" y="800" width="760" height="34" rx="10" fill="#6a1b9a"/>
+    <rect x="60" y="820" width="760" height="14" fill="#6a1b9a"/>
+  </g>
+  <text x="80" y="823" class="step">STEP 3 &#183; Test-IndexFrameValid</text>
+  <text x="470" y="823" fill="#e1bee7" font-size="13" font-weight="700">gate &#8212; prove the frame before trusting coords</text>
+  <text x="80" y="862" class="body"><tspan font-weight="700">(a) Orthonormality</tspan> &#8212; each axis unit-length, mutually &#8869;, right-handed; residuals &lt; Tol.</text>
+  <text x="80" y="890" class="body"><tspan font-weight="700">(b) Fixed points</tspan> (load-bearing):</text>
+  <text x="330" y="890" class="mono">A1 &#8594; (0, 0, 0)</text>
+  <text x="520" y="890" class="mono">A2 &#8594; (+d, 0, 0), d &gt; 0</text>
+  <text x="80" y="918" class="cap">Confirms the frame is both anchored at hole 1 AND oriented 1&#8594;2 along +X, without trusting any intermediate value.</text>
+  <text x="80" y="950" class="note"><tspan class="noteh">WARN (advisory, not a failure): </tspan>AxisAngleDeg &gt; 0.05&#176; &#8594; bores non-parallel; (x,y) invariance degrades &#8212; verify the plate is flat.</text>
+
+  <line x1="440" y1="970" x2="440" y2="1010" stroke="#37474f" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="452" y="994" class="arlbl">frame OK &#8594; feed the grid builder</text>
+
+  <!-- ===== Stage 4: Get-IndexDirectionalPlanePlan ===== -->
+  <g filter="url(#sh)">
+    <rect x="60" y="1012" width="1122" height="270" rx="10" fill="#ffffff" stroke="#2e7d32" stroke-width="1.5"/>
+    <rect x="60" y="1012" width="1122" height="34" rx="10" fill="#2e7d32"/>
+    <rect x="60" y="1032" width="1122" height="14" fill="#2e7d32"/>
+  </g>
+  <text x="80" y="1035" class="step">STEP 4 &#183; Get-IndexDirectionalPlanePlan</text>
+  <text x="520" y="1035" fill="#c8e6c9" font-size="13" font-weight="700">rank holes off the index &#8594; grid pitch planes</text>
+  <text x="80" y="1076" class="mono">rank DISTINCT X coords ascending &#8594; N = 1 .. Nx        (Z coords likewise &#8594; 1 .. Nz)</text>
+  <text x="80" y="1104" class="mono">IndexNX / IndexNZ  = the index hole's own column / row</text>
+  <text x="80" y="1132" class="mono">RelN = N &#8722; IndexN            Direction = sign(RelN)  &#8712; { &#8722;1, 0, +1 }</text>
+  <text x="80" y="1160" class="mono">IsIndex = (RelN == 0)        &#8594; reuse the anchor plane (no new plane for the index's own line)</text>
+  <text x="80" y="1196" class="body"><tspan font-weight="700">Build each plane off CSYS_PAT_DEF at its ABSOLUTE coordinate</tspan> &#8212; the model axes, which are reliable.</text>
+
+  <rect x="80" y="1212" width="1082" height="56" rx="8" fill="#fdeaea" stroke="#d05353" stroke-width="1.2"/>
+  <text x="96" y="1234" fill="#a02020" font-size="13" font-weight="700">Root cause this replaced:</text>
+  <text x="300" y="1234" fill="#7a1e1e" font-size="12.5">planes were built off the INTERSECTED index csys at a signed offset. That csys's axes are derived from</text>
+  <text x="96" y="1254" fill="#7a1e1e" font-size="12.5">plane normals that read null &#8594; the &#177; side is non-deterministic &#8594; interior-index holes scatter, same every run. Absolute-coord ranking removes the sign entirely.</text>
+</svg>

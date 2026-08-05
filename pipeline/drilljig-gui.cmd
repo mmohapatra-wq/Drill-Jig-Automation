@@ -466,6 +466,10 @@ function global:Set-BushLengthPick {
     param($Context, [double]$LenValue, [string]$LenLabel)
     $Context.BushLenValue = [double]$LenValue
     $Context.BushLenLabel = [string]$LenLabel
+    # NO-BUSHING flag (METAL -> PFD, user 2026-08-04): the pending spec declares no bushing.
+    # BOTH the custom-OD and OD-first branches resolve to a NO-BUSHING pick (Resolve-NoBushingPick)
+    # instead of a bushing pick when this is set -- the "length" is the plate thickness.
+    $noBush = ($null -ne $Context.PendingSpec -and $Context.PendingSpec.NoBushing)
     # CUSTOM-OD path (user 2026-07-23): the operator typed an arbitrary hole OD (no catalog
     # SKU behind it). $Context.BushCustomOd holds the typed diameter; resolve via
     # Resolve-CustomOdPick (ID '(custom)', PartNumber flags verify) and finish. This MUST be
@@ -473,17 +477,20 @@ function global:Set-BushLengthPick {
     # the ID-null guard below would no-op and the pick would silently drop.
     if ($Context.BushCustom) {
         if ($null -eq $Context.BushCustomOd) { return 'noop' }
-        $pick = Resolve-CustomOdPick -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel)
+        $pick = if ($noBush) { Resolve-NoBushingPick -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel) }
+                else          { Resolve-CustomOdPick   -OD ([double]$Context.BushCustomOd) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushCustomOdLabel) }
         [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
         $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
         return 'done'
     }
-    # OD-FIRST metal path (user 2026-07-22): no ID was chosen (the drilled hole IS the
-    # removable bushing's OD). $Context.BushOD holds the chosen OD group; resolve via
-    # Resolve-OdBushingPick (ID unspecified) and finish -- there is never an OD tie-break.
+    # OD-FIRST path (user 2026-07-22): no ID was chosen (the drilled hole IS the OD).
+    # $Context.BushOD holds the chosen OD group; resolve via Resolve-OdBushingPick (removable
+    # bushing, ID unspecified) OR Resolve-NoBushingPick (METAL -> PFD, no bushing) and finish
+    # -- there is never an OD tie-break on this path.
     if ($Context.BushOdFirst) {
         if ($null -eq $Context.BushOD) { return 'noop' }
-        $pick = Resolve-OdBushingPick -OdGroup $Context.BushOD -Length ([double]$LenValue) -LenLabel ([string]$LenLabel)
+        $pick = if ($noBush) { Resolve-NoBushingPick -OD ([double]$Context.BushOD.OD) -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) -OdLabel ([string]$Context.BushOD.ODLabel) }
+                else          { Resolve-OdBushingPick -OdGroup $Context.BushOD -Length ([double]$LenValue) -LenLabel ([string]$LenLabel) }
         [void]$Context.Picks.Add([pscustomobject]@{ HoleDiameter=[double]$pick.OD; BushingID=$pick.ID; BushingLength=[double]$pick.Length; Bushing=$pick.EasyName; PartNumber=$pick.PartNumber; Outcome=$Context.TreeNode.label })
         $Context.PendingSpec = $null; $Context.BushStage = $null; $Context.TreeDone = $true
         return 'done'
@@ -1802,11 +1809,19 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
             $active = if ($c.Picks.Count -gt 0) { $c.Picks[$c.Picks.Count - 1] } else { $null }
             $y = 8
             if ($null -ne $active) {
-                $y = (Add-Para $panel "Bushing selected:" $y 0 'gray' $true).Bottom + 4
+                # NO-BUSHING leaf (METAL -> PFD, user 2026-08-04): the drill runs straight through
+                # the plate, so relabel "Bushing length" -> "Plate thickness", skip the "verify a
+                # bushing exists" warning, and skip the bushing schematic (there is none to draw).
+                $isNoBush = ([string]$active.BushingID -eq '(no bushing)')
+                $selHdr = if ($isNoBush) { "Hole selected (no bushing -- PFD direct drill):" } else { "Bushing selected:" }
+                $y = (Add-Para $panel $selHdr $y 0 'gray' $true).Bottom + 4
                 $y = (Add-Para $panel ([string]$active.Bushing) $y 0 '' $true).Bottom + 6
                 $dia = [double]$active.HoleDiameter
                 $line = ("Hole diameter (= OD): {0}`"" -f $dia)
-                if ($null -ne $active.BushingLength) { $line += ("    Bushing length: {0}`"" -f [double]$active.BushingLength) }
+                if ($null -ne $active.BushingLength) {
+                    $lenWord = if ($isNoBush) { 'Plate thickness' } else { 'Bushing length' }
+                    $line += ("    {0}: {1}`"" -f $lenWord, [double]$active.BushingLength)
+                }
                 $y = (Add-Para $panel $line $y 0 'green').Bottom + 6
                 if ($active.PartNumber -and $active.PartNumber -notmatch 'n/a|unspecified') {
                     $y = (Add-Para $panel ("Part number: {0}" -f $active.PartNumber) $y 0 'gray').Bottom + 6
@@ -1815,6 +1830,7 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
 
                 # CUSTOM-OD warning (user 2026-07-23): a typed hole OD has no catalog bushing
                 # behind it -- remind the operator to verify a real drill bushing / sleeve exists.
+                # Not shown for the no-bushing leaf (there is deliberately no bushing to verify).
                 if ([string]$active.BushingID -eq '(custom)') {
                     $y = (Add-Para $panel ([char]0x26A0 + " Custom hole OD -- verify a drill bushing / bushing sleeve at this OD actually exists before machining.") $y 0 'yellow' $true).Bottom + 10
                 }
@@ -1835,7 +1851,7 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                     # metal removable = '(any)'; custom OD = '(verify)' (no catalog bushing behind it).
                     $bsIdLabel = if ([string]$active.BushingID -eq '(custom)') { '(verify)' } else { '(any)' }
                 }
-                if ($bsOD -gt 0 -and $bsLen -gt 0 -and $bsIdVal -gt 0) {
+                if ($bsOD -gt 0 -and $bsLen -gt 0 -and $bsIdVal -gt 0 -and -not $isNoBush) {
                     $bsLabel = [string]$active.Bushing
                     # DRILL BUSHINGS are headed; SLEEVES are headless (user 2026-07-22). A
                     # representative head (no dimension) is drawn so the two are not confused.
@@ -1976,21 +1992,27 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
         # exists at more than one OD (ODCount > 1) -> then the OD tie-breaker card set is
         # shown. OD is the drilled jig hole, so it is never silently chosen.
         if ($null -ne $c.PendingSpec) {
-            $rows = Get-CatalogRows -Spec $c.PendingSpec
-            if ($rows.Count -eq 0) {
+            # CATALOG-LESS no-bushing spec (METAL -> PFD, user 2026-08-04): File is $null --
+            # there is no sleeve/removable catalog behind a bare drilled hole, so do NOT read
+            # rows; the OD cards are SYNTHESIZED from the spec's OD filter (Get-FixedOdGroups).
+            $noBush = [bool]$c.PendingSpec.NoBushing
+            $catalogLess = ($null -eq $c.PendingSpec.File)
+            $rows = if ($catalogLess) { @() } else { Get-CatalogRows -Spec $c.PendingSpec }
+            if (-not $catalogLess -and $rows.Count -eq 0) {
                 Add-Para $panel "No catalog rows match this branch. (file: $(Split-Path $c.PendingSpec.File -Leaf))" 8 40 'Firebrick'
                 $c.PendingSpec = $null; $c.TreeDone = $true
                 return
             }
-            # OD-FIRST metal path (user 2026-07-22): METAL -> Hand Drill is OD-filtered
-            # (only 1/2" & 3/4" ODs). The drilled hole IS the removable bushing's OD, so show
-            # OD cards (no ID question), then the standardized length. Persist the OD groups in
-            # $c.BushOdGroups (never a Build-local -- the captured-variable rule). (METAL -> PFD
-            # is no longer OD-first -- user 2026-07-23 changed its leaf to "3/4 ID sleeves".)
+            # OD-FIRST path (user 2026-07-22): the drilled hole IS the OD, so show OD cards (no
+            # ID question), then the standardized length. Used by METAL -> Hand Drill (removable
+            # bushings, OD-filtered from bushings_drill.csv) AND METAL -> PFD (no bushing: the OD
+            # list is synthesized, no catalog). Persist the OD groups in $c.BushOdGroups (never a
+            # Build-local -- the captured-variable rule).
             if ($c.BushOdFirst) {
-                $c.BushOdGroups = Get-OdGroups -Rows $rows
+                $c.BushOdGroups = if ($catalogLess) { Get-FixedOdGroups -ODs @($c.PendingSpec.Filters[0].Values) } else { Get-OdGroups -Rows $rows }
                 if ($c.BushStage -eq 'od1' -or $null -eq $c.BushStage) {
-                    $hdrB = (Add-Para $panel "Select removable bushing OD:" $walkTop 0 $null $true).Bottom
+                    $odHdr = if ($noBush) { 'Select hole OD (no bushing -- PFD drills directly through the plate):' } else { 'Select removable bushing OD:' }
+                    $hdrB = (Add-Para $panel $odHdr $walkTop 0 $null $true).Bottom
                     $opts = @()
                     foreach ($og in $c.BushOdGroups) { $opts += @{ Title = ('OD ' + $og.ODLabel); Subtitle = ("-> hole {0:0.###}`"" -f $og.OD) } }
                     # trailing "Custom hole OD..." card (user 2026-07-23): type any diameter.
@@ -2135,8 +2157,10 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 $preIdx = [int]$lenOpt.PreselectIndex
                 if (-not $c.BushLenIsCustom) {
                     # FIXED menu: {1/2, 3/4, 1, Custom...} with the ID/OD recommendation marked.
+                    # No-bushing (METAL -> PFD): the "length" IS the plate thickness -- relabel.
+                    $lenNoun = if ($noBush) { 'plate thickness' } else { 'bushing length' }
                     $recTxt = if ($preIdx -ge 0) { ("recommended for {0} {1}" -f $bushKind, $recLabel) } else { '' }
-                    $hdrB = (Add-Para $panel ("{0} {1}  ->  select bushing length:" -f $bushKind, $recLabel) $walkTop 0 $null $true).Bottom
+                    $hdrB = (Add-Para $panel ("{0} {1}  ->  select {2}:" -f $bushKind, $recLabel, $lenNoun) $walkTop 0 $null $true).Bottom
                     if ($preIdx -ge 0) { $hdrB = (Add-Para $panel ([char]0x2713 + (" {0}`" is standard for a {1}`" {2} -- recommended." -f $lenOpt.Options[$preIdx].Label, $recLabel, $bushKind)) ($hdrB + 4) 0 'green').Bottom }
                     $opts = @()
                     for ($li = 0; $li -lt @($lenOpt.Options).Count; $li++) {
@@ -2284,8 +2308,15 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                     # (OD-filtered) spec starts the OD-first sub-flow ('od1', no ID question);
                     # a 3D-print sleeve (ID-filtered) spec starts the ID-first sub-flow ('id').
                     if ($next.kind -eq 'outcome') {
-                        $spec = Get-CatalogSpec -Label $next.label
-                        if ($spec) {
+                        # NO-BUSHING fixed-OD leaf (METAL -> PFD, user 2026-08-04) FIRST: it
+                        # reuses the OD-first card machinery but is catalog-less + resolves to a
+                        # no-bushing pick. Checked BEFORE Get-CatalogSpec/Get-FixedOdSpec.
+                        $choice = Get-FixedOdChoiceSpec -Label $next.label
+                        $spec = if ($choice) { $null } else { Get-CatalogSpec -Label $next.label }
+                        if ($choice) {
+                            $cc.PendingSpec = $choice; $cc.BushOdFirst = $true; $cc.BushStage = 'od1'
+                        }
+                        elseif ($spec) {
                             $cc.PendingSpec = $spec
                             if (Test-OdFirstSpec -Spec $spec) { $cc.BushOdFirst = $true;  $cc.BushStage = 'od1' }
                             else                              { $cc.BushOdFirst = $false; $cc.BushStage = 'id' }
@@ -2302,6 +2333,12 @@ $treeStep = New-WizardStep -Key 'tree' -Title 'Bushing & hole size' -Stage 'Bush
                 return
             }
             'outcome' {
+                # NO-BUSHING fixed-OD leaf (METAL -> PFD) FIRST -- catalog-less OD-first cards.
+                $choice = Get-FixedOdChoiceSpec -Label $node.label
+                if ($choice) {
+                    $c.PendingSpec = $choice; $c.BushOdFirst = $true; $c.BushStage = 'od1'
+                    $wiz.Rerender(); return
+                }
                 $spec = Get-CatalogSpec -Label $node.label
                 if ($spec) {
                     $c.PendingSpec = $spec
